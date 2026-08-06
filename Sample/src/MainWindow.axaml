@@ -1,0 +1,48 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="900" d:DesignHeight="600"
+        x:Class="OpenFrameTransport.Sample.MainWindow"
+        Title="Open Frame Transport Sample"
+        Width="900" Height="600">
+    <Grid Margin="12" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,*" ColumnDefinitions="*">
+
+        <TextBlock x:Name="ListenAddressText" Grid.Row="0" Margin="0,0,0,8"
+                   Text="Listening on: (starting…)" FontWeight="Bold" />
+
+        <Grid Grid.Row="1" Margin="0,0,0,8" ColumnDefinitions="Auto,140,Auto,100" RowDefinitions="Auto">
+            <TextBlock Grid.Column="0" Text="Host:" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <TextBox x:Name="HostBox" Grid.Column="1" Text="127.0.0.1" />
+            <TextBlock Grid.Column="2" Text="Port:" VerticalAlignment="Center" Margin="12,0,6,0" />
+            <TextBox x:Name="PortBox" Grid.Column="3" PlaceholderText="e.g. 5000" />
+        </Grid>
+
+        <Grid Grid.Row="2" Margin="0,0,0,8" ColumnDefinitions="Auto,120,Auto,*,60">
+            <TextBlock Grid.Column="0" Text="Priority:" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <NumericUpDown x:Name="PriorityBox" Grid.Column="1" Minimum="0" Maximum="1000" Value="0" Increment="1" />
+            <TextBlock Grid.Column="2" Text="Simulated lag (ms):" VerticalAlignment="Center" Margin="12,0,6,0" />
+            <Slider x:Name="LagSlider" Grid.Column="3" Minimum="0" Maximum="2000" Value="0"
+                    ValueChanged="OnLagSliderValueChanged" VerticalAlignment="Center" />
+            <TextBlock x:Name="LagValueText" Grid.Column="4" Text="0 ms" VerticalAlignment="Center" Margin="6,0,0,0" />
+        </Grid>
+
+        <Grid Grid.Row="3" Margin="0,0,0,8" ColumnDefinitions="Auto,*">
+            <TextBlock Grid.Column="0" Text="Message:" VerticalAlignment="Top" Margin="0,4,6,0" />
+            <TextBox x:Name="MessageBox" Grid.Column="1" AcceptsReturn="True" Height="60"
+                     TextWrapping="Wrap" PlaceholderText="Type a message to send" />
+        </Grid>
+
+        <Grid Grid.Row="4" Margin="0,0,0,8" ColumnDefinitions="Auto,120,*,Auto">
+            <TextBlock Grid.Column="0" Text="Pad to size (bytes):" VerticalAlignment="Center" Margin="0,0,6,0" />
+            <NumericUpDown x:Name="PadToSizeBox" Grid.Column="1" Minimum="0" Maximum="10000000" Value="0" Increment="1024" />
+            <TextBlock Grid.Column="2" Text="(0 = don't pad; use a large value with lag to see priority interrupt a big transfer)"
+                       VerticalAlignment="Center" Margin="12,0,0,0" Opacity="0.7" TextWrapping="Wrap" />
+            <Button x:Name="SendButton" Grid.Column="3" Content="Send" Click="OnSendClick" />
+        </Grid>
+
+        <TextBlock Grid.Row="5" Margin="0,0,0,4" Text="Activity log:" FontWeight="Bold" />
+
+        <ListBox x:Name="LogList" Grid.Row="6" />
+    </Grid>
+</Window>

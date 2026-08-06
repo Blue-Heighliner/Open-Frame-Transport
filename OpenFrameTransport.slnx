@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/Core/">
+    <Project Path="Core/OpenFrameTransport.csproj" />
+  </Folder>
+  <Folder Name="/Tests/">
+    <Project Path="Tests/OpenFrameTransport.Tests.csproj" />
+  </Folder>
+  <Folder Name="/Sample/">
+    <Project Path="Sample/OpenFrameTransport.Sample.csproj" />
+  </Folder>
+</Solution>
