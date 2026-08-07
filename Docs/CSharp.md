@@ -14,20 +14,21 @@ covers the C#-specific API in detail, with examples.
 - `OftConnectOptions`, `OftHostOptions`, `OftPeerOptions` — per-role options records, all deriving
   shared settings (`Info`, `MaxPacketDataSize`, `RekeyInterval`, `SecurityMode`, `PollInterval`,
   `PollTimeout`) from `OftConnectionOptions`.
-- `OftSecurityMode` — `Insecure` / `Secure` / `Authentication` / `DualAuthentication` (see
-  [OFT.md §9](OFT.md#9-security-modes)).
-- `OftReceivedEventArgs`, `OftDisconnectedEventArgs`, `OftConnectedEventArgs` — event data types.
-
-All events (`IOftConnection.Received`/`.Disconnected`, `IOftListener.Connected`, `IOftPeer.Received`)
-are backed by a buffering implementation that holds onto anything raised before the event's
-first-ever subscriber attaches, then delivers the backlog to that subscriber immediately on
-subscription (see [Architecture.md](Architecture.md#where-a-ports-flow-differs-from-this)) — there is
-no connect-time message-loss race to guard against manually in C#.
+- `OftSecurityMode` — `Trusted` / `Secure` / `ServerAuthentication` / `DualAuthentication` (see
+  [OFT.md §9](OFT.md#9-security-modes)). `ServerAuthentication` is rejected by
+  `IOftPeerFactory.Create` — a peer has no client/server delineation, so use `DualAuthentication`
+  instead.
+- `IOftConnection.ReceivedHandler`/`.DisconnectedHandler`, `IOftListener.ConnectedHandler`,
+  `IOftPeer.ReceivedHandler` — single-slot `Action<T>` properties assigned directly (no handler-object
+  interface to implement), one per notification kind. Assigning a new value (including `null`) always
+  replaces any previous one, and each notification kind is assigned independently of the others.
+  `IOftPeer` has no `DisconnectedHandler`/`ConnectedHandler` of its own — see its own type doc comment
+  for why.
 
 ## Client/server example
 
 ```csharp
-using OpenFrameTransport;
+using BlueHeighliner.OpenFrameTransport;
 
 // --- Server side ---
 IOftHoster hoster = new OftHoster();
@@ -40,11 +41,11 @@ OftHostOptions hostOptions = new()
 
 IOftListener listener = await hoster.Host(new IPEndPoint(IPAddress.Any, 5000), hostOptions);
 
-listener.Connected += (_, e) =>
+listener.ConnectedHandler = connection =>
 {
-    e.Connection.Received += (_, receivedArgs) =>
+    connection.ReceivedHandler = data =>
     {
-        string text = Encoding.UTF8.GetString(receivedArgs.Data.Span);
+        string text = Encoding.UTF8.GetString(data.Memory.Span);
         Console.WriteLine($"Received: {text}");
     };
 };
@@ -68,9 +69,9 @@ await connection.Send(Encoding.UTF8.GetBytes("hello"), priority: 0);
 ## Peer-to-peer example
 
 ```csharp
-using OpenFrameTransport;
+using BlueHeighliner.OpenFrameTransport;
 
-IOftPeerFactory peerFactory = new OftPeerFactory(new OftConnector(), new OftHoster());
+IOftPeerFactory peerFactory = new OftPeerFactory();
 
 IOftPeer peer = peerFactory.Create(new OftPeerOptions
 {
@@ -78,9 +79,9 @@ IOftPeer peer = peerFactory.Create(new OftPeerOptions
     SecurityMode = OftSecurityMode.Secure,
 });
 
-peer.Received += (_, e) =>
+peer.ReceivedHandler = (connection, data) =>
 {
-    string text = Encoding.UTF8.GetString(e.Data.Span);
+    string text = Encoding.UTF8.GetString(data.Memory.Span);
     Console.WriteLine($"Received: {text}");
 };
 
@@ -92,6 +93,12 @@ await peer.Send("127.0.0.1", 5001, Encoding.UTF8.GetBytes("hello"), priority: 0)
 
 await peer.DisposeAsync();
 ```
+
+`IOftPeer.ReceivedHandler`'s `connection` argument is only for replying on the same connection a
+message arrived on — a peer deliberately exposes no other way to enumerate, look up, or be notified
+about the individual connections it holds (there is no `IOftPeer.DisconnectedHandler`/
+`ConnectedHandler`): connection lifecycle is the peer's own implementation detail, transparently
+managed (reconnecting, evicting, etc.) behind `Send`.
 
 ## Sending with pooled memory
 
@@ -108,16 +115,17 @@ payload.CopyTo(owner.Memory.Span);
 await connection.Send(owner, priority: 5);
 ```
 
-Received data (`OftReceivedEventArgs.Data`) is likewise pooled and `IDisposable`; disposing it
-promptly returns the memory to its pool, though this is optional (skipping it just means the memory
-isn't reused, with no correctness impact):
+`ReceivedHandler`/`IOftPeer.ReceivedHandler` deliver received data as an `IMemoryOwner<byte>`
+directly — it's pooled, and the callback owns it: disposing it promptly returns the memory to its
+pool, though this is optional (skipping it just means the memory isn't reused, with no correctness
+impact):
 
 ```csharp
-connection.Received += (_, e) =>
+connection.ReceivedHandler = data =>
 {
-    using (e)
+    using (data)
     {
-        Process(e.Data.Span);
+        Process(data.Memory.Span);
     }
 };
 ```
@@ -151,28 +159,29 @@ OftConnectOptions options = new() { Info = "my-client", RekeyInterval = TimeSpan
 ```
 
 `Rekey()` is a no-op (returns a completed task immediately) if the connection was established with
-`OftSecurityMode.Insecure` — there's no TLS session to rekey. `IOftPeer.Rekey()`/`.Disconnect()` act
+`OftSecurityMode.Trusted` — there's no TLS session to rekey. `IOftPeer.Rekey()`/`.Disconnect()` act
 on every connection the peer currently holds, both inbound and outbound, at once.
 
 ## Security modes
 
 ```csharp
-// Authentication (one-way TLS): the server presents a real certificate.
+// ServerAuthentication (one-way TLS): the server presents a real certificate.
 OftHostOptions hostOptions = new()
 {
     Info = "my-server",
-    SecurityMode = OftSecurityMode.Authentication,
+    SecurityMode = OftSecurityMode.ServerAuthentication,
     ServerCertificate = myServerCertificate, // X509Certificate2
 };
 
 OftConnectOptions connectOptions = new()
 {
     Info = "my-client",
-    SecurityMode = OftSecurityMode.Authentication,
+    SecurityMode = OftSecurityMode.ServerAuthentication,
     ServerCertificateValidation = (sender, cert, chain, errors) => /* custom validation */ true,
 };
 
-// DualAuthentication (mutual TLS): the client also presents a certificate.
+// DualAuthentication (mutual TLS): the client also presents a certificate. The only authenticating
+// mode IOftPeer supports — ServerAuthentication above is only valid for IOftConnector/IOftHoster.
 OftConnectOptions mutualOptions = new()
 {
     Info = "my-client",
@@ -181,10 +190,10 @@ OftConnectOptions mutualOptions = new()
 };
 ```
 
-`ServerCertificateValidation`/`ClientCertificateValidation` are only consulted under `Authentication`/
-`DualAuthentication`; under `Secure`, the peer's ephemeral certificate is accepted unconditionally
-regardless of any callback supplied. See [OFT.md §9](OFT.md#9-security-modes) for the full semantics
-of each mode.
+`ServerCertificateValidation`/`ClientCertificateValidation` are only consulted under
+`ServerAuthentication`/`DualAuthentication`; under `Secure`, the peer's ephemeral certificate is
+accepted unconditionally regardless of any callback supplied. See
+[OFT.md §9](OFT.md#9-security-modes) for the full semantics of each mode.
 
 ## Dependency injection
 
@@ -194,7 +203,7 @@ of each mode.
 
 ```csharp
 using Microsoft.Extensions.DependencyInjection;
-using OpenFrameTransport;
+using BlueHeighliner.OpenFrameTransport;
 
 ServiceCollection services = new();
 services.AddOpenFrameTransport();
@@ -203,6 +212,9 @@ ServiceProvider provider = services.BuildServiceProvider();
 IOftConnector connector = provider.GetRequiredService<IOftConnector>();
 IOftPeerFactory peerFactory = provider.GetRequiredService<IOftPeerFactory>();
 ```
+
+Without an IoC container, `new OftPeerFactory()` (no arguments) builds a factory backed by a plain
+`OftConnector`/`OftHoster`, equivalent to `new OftPeerFactory(new OftConnector(), new OftHoster())`.
 
 ## Testing and coverage
 

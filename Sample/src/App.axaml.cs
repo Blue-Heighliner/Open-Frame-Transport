@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Sample;
+namespace BlueHeighliner.OpenFrameTransport.Sample;
 
 /// <summary>
 /// The sample application. Creates the single <see cref="MainWindow"/> on startup.

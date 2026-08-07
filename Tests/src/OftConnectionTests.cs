@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class OftConnectionTests
 {
@@ -56,39 +56,36 @@ public sealed class OftConnectionTests
     }
 
     [Fact]
-    public async Task Received_Unsubscribed_NoLongerInvoked()
+    public async Task Received_HandlerReassignedToNull_IgnoresFutureNotifications()
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
         int invocationCount = 0;
-        EventHandler<OftReceivedEventArgs> handler = (_, _) => invocationCount++;
-        pair.ServerConnection.Received += handler;
-        pair.ServerConnection.Received -= handler;
+        pair.ServerConnection.ReceivedHandler = _ => invocationCount++;
+        pair.ServerConnection.ReceivedHandler = null;
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        await pair.ClientConnection.Send("ignored"u8.ToArray()).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        await pair.ClientConnection.Send("hello"u8.ToArray()).WaitAsync(OftTestHarness.DefaultTimeout);
-        await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
+        await pair.ClientConnection.Send("after"u8.ToArray()).WaitAsync(OftTestHarness.DefaultTimeout);
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+
+        Assert.Equal("after"u8.ToArray(), data.Memory.ToArray());
         Assert.Equal(0, invocationCount);
     }
 
     [Fact]
-    public async Task Disconnected_Unsubscribed_NoLongerInvoked()
+    public async Task Disconnected_HandlerReassignedToNull_IgnoresNotification()
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
         int invocationCount = 0;
-        EventHandler<OftDisconnectedEventArgs> handler = (_, _) => invocationCount++;
-        pair.ServerConnection.Disconnected += handler;
-        pair.ServerConnection.Disconnected -= handler;
-
-        TaskCompletionSource<OftDisconnectedEventArgs> disconnected = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Disconnected += (_, args) => disconnected.TrySetResult(args);
+        pair.ServerConnection.DisconnectedHandler = _ => invocationCount++;
+        pair.ServerConnection.DisconnectedHandler = null;
 
         await pair.ServerConnection.Disconnect();
-        await disconnected.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
         Assert.Equal(0, invocationCount);
     }

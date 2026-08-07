@@ -1,10 +1,9 @@
 # Open Frame Transport — C
 
 A C implementation of [OFT](OFT.md) under [`Ports/C/`](../Ports/C). See
-[Architecture.md](Architecture.md) for how its components relate to the other ports (notably: the
-`on_established` callback pattern used here to avoid a connect-time message-loss race, the blocking
-call style, and manual memory ownership); this document covers the C-specific API in detail, with
-examples. See [`include/oft/oft.h`](../Ports/C/include/oft/oft.h) and
+[Architecture.md](Architecture.md) for how its components relate to the other ports (notably the
+blocking call style and manual memory ownership); this document covers the C-specific API in detail,
+with examples. See [`include/oft/oft.h`](../Ports/C/include/oft/oft.h) and
 [`include/oft/oft_peer.h`](../Ports/C/include/oft/oft_peer.h) for the full API reference in
 doc-comment form.
 
@@ -19,10 +18,12 @@ This port targets Linux/POSIX and depends only on OpenSSL and pthreads.
   above.
 - `oft_peer` — the peer-to-peer convenience layer. `oft_peer_create(&options)`.
 - `oft_connect_options`, `oft_host_options`, `oft_peer_options` — per-role plain structs.
-- `enum oft_security_mode` — `OFT_SECURITY_MODE_INSECURE` / `_SECURE` / `_AUTHENTICATION` /
-  `_DUAL_AUTHENTICATION` (see [OFT.md §9](OFT.md#9-security-modes)).
-- `oft_received_callback`, `oft_disconnected_callback`, `oft_connected_callback`,
-  `oft_connection_established_callback` — function-pointer callback types.
+- `enum oft_security_mode` — `OFT_SECURITY_MODE_TRUSTED` / `_SECURE` / `_SERVER_AUTHENTICATION` /
+  `_DUAL_AUTHENTICATION` (see [OFT.md §9](OFT.md#9-security-modes)). `_SERVER_AUTHENTICATION` makes
+  `oft_peer_create()` return `NULL` — a peer has no client/server delineation, so use
+  `_DUAL_AUTHENTICATION` instead.
+- `oft_received_callback`, `oft_disconnected_callback`, `oft_connected_callback` — function-pointer
+  callback types.
 - `oft_send_handle`-equivalent: `oft_connection_send()` writes a `uint64_t` message id out-parameter,
   used with `oft_connection_wait()`/`oft_connection_cancel()` instead of a returned handle object.
 
@@ -68,7 +69,7 @@ int main(void) {
     connect_options.security_mode = OFT_SECURITY_MODE_SECURE;
 
     oft_connection *connection = oft_connect(
-            "127.0.0.1", 5000, &connect_options, NULL, NULL, NULL, error_buffer, sizeof(error_buffer));
+            "127.0.0.1", 5000, &connect_options, NULL, error_buffer, sizeof(error_buffer));
     if (!connection) {
         fprintf(stderr, "oft_connect failed: %s\n", error_buffer);
         return 1;
@@ -86,23 +87,6 @@ int main(void) {
 
 `options` may be `NULL` on both `oft_connect()`/`oft_host()` to use defaults (`OFT_SECURITY_MODE_SECURE`,
 empty `info`, 1 KiB max packet size, 1000ms/5000ms poll interval/timeout).
-
-### Avoiding the connect-time message-loss race
-
-The example above registers `on_received` inside `on_connected` — safe because that callback runs
-before the accepted connection starts processing inbound packets. On the connect side, use
-`oft_connect()`'s `on_established` parameter for the same guarantee if the peer might reply the
-instant the connection is up:
-
-```c
-static void on_established(oft_connection *connection, void *user_data) {
-    oft_connection_set_received_callback(connection, on_received, user_data);
-}
-
-oft_connection *connection = oft_connect(
-        "127.0.0.1", 5000, &connect_options, NULL,
-        on_established, NULL, error_buffer, sizeof(error_buffer));
-```
 
 ## Peer-to-peer example
 
@@ -127,6 +111,13 @@ oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, /* priority 
 
 oft_peer_close(peer);
 ```
+
+`oft_peer_set_received_callback()`'s `connection` argument is only for replying on the same
+connection a message arrived on — a peer deliberately exposes no other way to enumerate, look up, or
+be notified about the individual connections it holds (there is no
+`oft_peer_set_disconnected_callback()`/`oft_peer_set_connected_callback()`): connection lifecycle is
+the peer's own implementation detail, transparently managed (reconnecting, evicting, etc.) behind
+`oft_peer_send()`.
 
 ## Waiting for delivery and cancellation
 
@@ -158,7 +149,7 @@ options.rekey_interval_ms = 10 * 60 * 1000;
 ```
 
 `oft_connection_rekey()` is a no-op (returns `OFT_OK` immediately) if the connection was established
-with `OFT_SECURITY_MODE_INSECURE` — there's no TLS session to rekey. `oft_peer_rekey()`/
+with `OFT_SECURITY_MODE_TRUSTED` — there's no TLS session to rekey. `oft_peer_rekey()`/
 `oft_peer_disconnect()` act on every connection the peer currently holds, both inbound and outbound,
 at once.
 
@@ -167,29 +158,31 @@ at once.
 ```c
 SSL_CTX *server_ctx = ...; /* carries your server certificate + private key */
 
-/* Authentication (one-way TLS): the server presents a real certificate. */
+/* Server authentication (one-way TLS): the server presents a real certificate. */
 oft_host_options host_options = {0};
 host_options.info = "my-server";
-host_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 oft_listener *listener = oft_host("0.0.0.0", 5000, &host_options, server_ctx, error_buffer, sizeof(error_buffer));
 
 SSL_CTX *client_ctx = ...; /* configured to trust the server's certificate */
 oft_connect_options connect_options = {0};
 connect_options.info = "my-client";
-connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 oft_connection *connection = oft_connect(
-        "127.0.0.1", 5000, &connect_options, client_ctx, NULL, NULL, error_buffer, sizeof(error_buffer));
+        "127.0.0.1", 5000, &connect_options, client_ctx, error_buffer, sizeof(error_buffer));
 
-/* DualAuthentication (mutual TLS): the client's ssl_ctx must also carry its own certificate. */
+/* Dual authentication (mutual TLS): the client's ssl_ctx must also carry its own certificate. The
+ * only authenticating mode oft_peer supports - server authentication above is only valid for
+ * oft_connect()/oft_host(). */
 SSL_CTX *mutual_client_ctx = ...; /* carries both a client certificate and trust configuration */
 oft_connect_options mutual_options = {0};
 mutual_options.info = "my-client";
 mutual_options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
 oft_connection *mutual_connection = oft_connect(
-        "127.0.0.1", 5000, &mutual_options, mutual_client_ctx, NULL, NULL, error_buffer, sizeof(error_buffer));
+        "127.0.0.1", 5000, &mutual_options, mutual_client_ctx, error_buffer, sizeof(error_buffer));
 ```
 
-`ssl_ctx` is required (non-`NULL`) for `OFT_SECURITY_MODE_AUTHENTICATION` and
+`ssl_ctx` is required (non-`NULL`) for `OFT_SECURITY_MODE_SERVER_AUTHENTICATION` and
 `OFT_SECURITY_MODE_DUAL_AUTHENTICATION` on both `oft_host()` and `oft_connect()`. Under
 `OFT_SECURITY_MODE_SECURE`, a caller-supplied `ssl_ctx` passed to `oft_host()` is accepted but
 ignored (the listener generates its own throwaway identity once, reused for every connection it

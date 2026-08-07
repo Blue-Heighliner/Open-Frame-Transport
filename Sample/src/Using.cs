@@ -1,4 +1,5 @@
 global using System;
+global using System.Buffers;
 global using System.Collections.Generic;
 global using System.Collections.ObjectModel;
 global using System.Net;
@@ -16,4 +17,4 @@ global using Avalonia.Controls.Primitives;
 global using Avalonia.Interactivity;
 global using Avalonia.Markup.Xaml;
 global using Avalonia.Threading;
-global using OpenFrameTransport;
+global using BlueHeighliner.OpenFrameTransport;

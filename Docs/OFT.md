@@ -284,30 +284,34 @@ setting (`SecurityMode` in the reference implementation, see [Architecture.md](A
 rather than something negotiated on the wire — both sides must be configured compatibly for a given
 connection, or the exchange fails outright:
 
-- **Insecure** — skips TLS entirely: step 2 of the establishment sequence in §1 (the TLS handshake)
+- **Trusted** — skips TLS entirely: step 2 of the establishment sequence in §1 (the TLS handshake)
   is omitted, and step 3 (the hail exchange) happens directly on the raw TCP connection instead, as
   soon as it's formed. Every part of the protocol layered on top — framing (§2), the hail (§3), and
   packets (§4-§7) — is unchanged; OFT simply runs directly on TCP rather than on TLS-over-TCP. This
   mode is intended for trusted, private networks (e.g. same-host or same-VPC deployments already
   gated by other means) or for testing, where TLS's setup cost or certificate management isn't worth
-  paying. It forfeits all of TLS's guarantees: an insecure connection has no confidentiality (the
+  paying. It forfeits all of TLS's guarantees: a trusted-mode connection has no confidentiality (the
   whole exchange, hails and every packet, is plaintext on the wire), no integrity protection against
   tampering, and no authentication of either side's identity. Because rekeying (§8) is fundamentally
-  a TLS-session operation, an insecure connection also has nothing to rekey — attempting to rekey one
-  is a no-op.
+  a TLS-session operation, a trusted-mode connection also has nothing to rekey — attempting to rekey
+  one is a no-op.
 - **Secure** (the default) — TLS provides confidentiality and integrity but no authentication of
   either side. The accepting side uses a throwaway certificate it generates internally rather than
   one supplied by the caller, and the connecting side accepts whatever certificate it's presented
   with unconditionally, since there's nothing meaningful to validate an ephemeral certificate
   against.
-- **Authentication** — traditional one-way TLS: the accepting side must supply a real certificate,
-  which the connecting side validates normally (a caller-supplied callback, or default certificate
-  chain/hostname validation).
-- **Dual authentication** — mutual TLS: everything `Authentication` requires, plus the connecting
-  side must also supply its own certificate(s), which the accepting side requests and validates.
+- **Server authentication** — traditional one-way TLS: the accepting side must supply a real
+  certificate, which the connecting side validates normally (a caller-supplied callback, or default
+  certificate chain/hostname validation). Not a valid mode for a peer component (see
+  [Architecture.md](Architecture.md)): a peer makes both outbound and inbound connections
+  interchangeably, with no fixed client/server delineation, so it cannot express a one-sided
+  authentication requirement — use dual authentication instead.
+- **Dual authentication** — mutual TLS: everything server authentication requires, plus the
+  connecting side must also supply its own certificate(s), which the accepting side requests and
+  validates. The only authenticating mode a peer supports.
 
 If the two sides are configured with mismatched modes — say, one side sends a TLS `ClientHello`
-while the other is configured for `Insecure` and expects a plaintext `Hail` first, or vice versa —
+while the other is configured for `Trusted` and expects a plaintext `Hail` first, or vice versa —
 there is no way for either side to detect this cleanly and report a helpful error. Each side simply
 sees bytes that don't parse as whatever it was expecting, and closes the connection.
 

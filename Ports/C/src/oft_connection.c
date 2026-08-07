@@ -2,6 +2,7 @@
 #include "oft_connection_internal.h"
 #include "oft_ephemeral_ssl_ctx.h"
 #include "oft_event.h"
+#include "oft_event_buffer.h"
 #include "oft_frame.h"
 #include "oft_wire.h"
 
@@ -62,6 +63,18 @@ typedef struct {
     size_t chunk_count;
     size_t chunk_capacity;
 } oft_inbound_buffer;
+
+/* The dispatch target attached to received_buffer below. */
+typedef struct {
+    oft_received_callback callback;
+    void *user_data;
+} oft_received_target;
+
+/* The dispatch target attached to disconnected_buffer below. */
+typedef struct {
+    oft_disconnected_callback callback;
+    void *user_data;
+} oft_disconnected_target;
 
 struct oft_connection {
     int fd;
@@ -135,12 +148,18 @@ struct oft_connection {
     pthread_t send_thread;
     int threads_started;
 
-    pthread_mutex_t callback_lock;
-    oft_received_callback received_callback;
-    void *received_callback_user_data;
-    oft_disconnected_callback disconnected_listeners[OFT_MAX_LISTENERS];
-    void *disconnected_listener_user_data[OFT_MAX_LISTENERS];
-    size_t disconnected_listener_count;
+    /* Holds every received message until oft_connection_set_received_callback() is first called
+     * with a non-NULL callback, then flushes that backlog to it, in order, before it becomes the
+     * live target for anything received afterward - see oft_event_buffer's own doc comment.
+     * received_target is the live target attached to received_buffer - embedded rather than
+     * heap-allocated since there is only ever one at a time. */
+    oft_event_buffer received_buffer;
+    oft_received_target received_target;
+
+    /* Same buffering guarantee as received_buffer above, applied to the one-shot disconnected
+     * notification instead of a stream of messages. */
+    oft_event_buffer disconnected_buffer;
+    oft_disconnected_target disconnected_target;
 };
 
 /* ---- Small helpers ---- */
@@ -176,6 +195,9 @@ static void ignore_sigpipe(void) {
     signal(SIGPIPE, SIG_IGN);
 }
 
+static void free_received_buffer_item(void *item);
+static void free_disconnected_buffer_item(void *item);
+
 static oft_connection *connection_alloc(int fd, SSL_CTX *ssl_ctx, int owns_ssl_ctx, int is_client, const char *target_host,
                                          int require_client_cert, size_t max_packet_data_size, long rekey_interval_ms,
                                          int insecure, long poll_interval_ms, long poll_timeout_ms) {
@@ -205,9 +227,10 @@ static oft_connection *connection_alloc(int fd, SSL_CTX *ssl_ctx, int owns_ssl_c
     pthread_mutex_init(&connection->receipt_lock, NULL);
     pthread_mutex_init(&connection->rekey_queue_lock, NULL);
     pthread_mutex_init(&connection->timestamp_lock, NULL);
-    pthread_mutex_init(&connection->callback_lock, NULL);
     atomic_init(&connection->closed, 0);
     atomic_init(&connection->has_pending_inbound_message, 0);
+    oft_event_buffer_init(&connection->received_buffer, free_received_buffer_item);
+    oft_event_buffer_init(&connection->disconnected_buffer, free_disconnected_buffer_item);
 
     return connection;
 }
@@ -531,17 +554,78 @@ int oft_connection_rekey(oft_connection *connection) {
 
 /* ---- Message send path ---- */
 
-static void raise_received(oft_connection *connection, uint8_t *data, size_t length) {
-    pthread_mutex_lock(&connection->callback_lock);
-    oft_received_callback callback = connection->received_callback;
-    void *user_data = connection->received_callback_user_data;
-    pthread_mutex_unlock(&connection->callback_lock);
+/* An item buffered on received_buffer. */
+typedef struct {
+    oft_connection *connection;
+    uint8_t *data;
+    size_t length;
+} oft_received_buffer_item;
 
-    if (callback) {
-        callback(connection, data, length, user_data);
+static void free_received_buffer_item(void *item) {
+    oft_received_buffer_item *received = item;
+    free(received->data);
+    free(received);
+}
+
+static void dispatch_received_buffer_item(void *user_data, void *item) {
+    oft_received_target *target = user_data;
+    oft_received_buffer_item *received = item;
+
+    if (target->callback) {
+        target->callback(received->connection, received->data, received->length, target->user_data);
     } else {
-        free(data);
+        free(received->data);
     }
+
+    free(received);
+}
+
+static void raise_received(oft_connection *connection, uint8_t *data, size_t length) {
+    oft_received_buffer_item *received = malloc(sizeof(oft_received_buffer_item));
+    if (!received) {
+        free(data);
+        return;
+    }
+
+    received->connection = connection;
+    received->data = data;
+    received->length = length;
+    oft_event_buffer_raise(&connection->received_buffer, received);
+}
+
+/* An item buffered on disconnected_buffer. */
+typedef struct {
+    oft_connection *connection;
+    char *error_message;
+} oft_disconnected_buffer_item;
+
+static void free_disconnected_buffer_item(void *item) {
+    oft_disconnected_buffer_item *disconnected = item;
+    free(disconnected->error_message);
+    free(disconnected);
+}
+
+static void dispatch_disconnected_buffer_item(void *user_data, void *item) {
+    oft_disconnected_target *target = user_data;
+    oft_disconnected_buffer_item *disconnected = item;
+
+    if (target->callback) {
+        target->callback(disconnected->connection, disconnected->error_message, target->user_data);
+    }
+
+    free(disconnected->error_message);
+    free(disconnected);
+}
+
+static void raise_disconnected(oft_connection *connection, const char *error_message) {
+    oft_disconnected_buffer_item *disconnected = malloc(sizeof(oft_disconnected_buffer_item));
+    if (!disconnected) {
+        return;
+    }
+
+    disconnected->connection = connection;
+    disconnected->error_message = error_message ? strdup(error_message) : NULL;
+    oft_event_buffer_raise(&connection->disconnected_buffer, disconnected);
 }
 
 static int send_next_packet(oft_connection *connection, oft_pending_message *message) {
@@ -990,11 +1074,12 @@ static int complete_handshake(oft_connection *connection, const char *info, char
 
 /*
  * Starts this connection's background threads: the receive loop (which begins delivering inbound
- * messages to its received callback), the send loop, and (if configured) the automatic rekey
- * timer. Deliberately not part of complete_handshake(): oft_host()'s accept loop and oft_connect()
- * call this only after they've invoked their connected callback / on_established (if any), so that
- * no inbound message can be delivered before a callback reacting to that has had a chance to call
- * oft_connection_set_received_callback().
+ * messages and the disconnected notification to its callbacks), the send loop, and (if configured)
+ * the automatic rekey timer. Safe to call immediately after establishment, with no need to wait for
+ * a caller to call oft_connection_set_received_callback()/oft_connection_set_disconnected_callback()
+ * first: received_buffer/disconnected_buffer each hold onto everything raised until a non-NULL
+ * callback is first assigned, so nothing is ever lost between establishment and that call - see
+ * oft_event_buffer's own doc comment.
  */
 void oft_connection_start_processing(oft_connection *connection) {
     pthread_create(&connection->receive_thread, NULL, receive_loop, connection);
@@ -1015,7 +1100,7 @@ void oft_connection_start_processing(oft_connection *connection) {
 oft_connection *oft_connection_establish_as_client(
         int fd, const char *target_host, SSL_CTX *ssl_ctx, const oft_connect_options *options,
         char *error_buffer, size_t error_buffer_size) {
-    int insecure = options->security_mode == OFT_SECURITY_MODE_INSECURE;
+    int insecure = options->security_mode == OFT_SECURITY_MODE_TRUSTED;
 
     /* Under OFT_SECURITY_MODE_SECURE this connection accepts whatever certificate the accepting
      * side presents unconditionally (there's nothing meaningful to validate an ephemeral
@@ -1069,14 +1154,15 @@ oft_connection *oft_connection_establish_as_client(
 oft_connection *oft_connection_establish_as_server(
         int fd, SSL_CTX *ssl_ctx, const oft_host_options *options,
         char *error_buffer, size_t error_buffer_size) {
-    int insecure = options->security_mode == OFT_SECURITY_MODE_INSECURE;
+    int insecure = options->security_mode == OFT_SECURITY_MODE_TRUSTED;
     int require_client_cert = options->security_mode == OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
 
     /* By this point ssl_ctx is always resolved for OFT_SECURITY_MODE_SECURE: oft_host() has
      * already replaced it with a listener-lifetime ephemeral context; for
-     * AUTHENTICATION/DUAL_AUTHENTICATION, it's the caller-supplied one, already validated non-NULL
-     * by oft_host() before this is ever reached. Never owned by the connection itself - the
-     * listener (or, in AUTHENTICATION/DUAL_AUTHENTICATION mode, the caller) owns it. */
+     * OFT_SECURITY_MODE_SERVER_AUTHENTICATION/OFT_SECURITY_MODE_DUAL_AUTHENTICATION, it's the
+     * caller-supplied one, already validated non-NULL by oft_host() before this is ever reached.
+     * Never owned by the connection itself - the listener (or, in
+     * SERVER_AUTHENTICATION/DUAL_AUTHENTICATION mode, the caller) owns it. */
     oft_connection *connection = connection_alloc(
             fd, ssl_ctx, 0, 0, NULL, require_client_cert,
             options->max_packet_data_size, options->rekey_interval_ms,
@@ -1198,40 +1284,15 @@ void oft_connection_cancel(oft_connection *connection, uint64_t message_id) {
 }
 
 void oft_connection_set_received_callback(oft_connection *connection, oft_received_callback callback, void *user_data) {
-    pthread_mutex_lock(&connection->callback_lock);
-    connection->received_callback = callback;
-    connection->received_callback_user_data = user_data;
-    pthread_mutex_unlock(&connection->callback_lock);
+    connection->received_target.callback = callback;
+    connection->received_target.user_data = user_data;
+    oft_event_buffer_attach(&connection->received_buffer, callback ? dispatch_received_buffer_item : NULL, &connection->received_target);
 }
 
-int oft_connection_add_disconnected_listener(oft_connection *connection, oft_disconnected_callback callback, void *user_data) {
-    pthread_mutex_lock(&connection->callback_lock);
-    if (connection->disconnected_listener_count == OFT_MAX_LISTENERS) {
-        pthread_mutex_unlock(&connection->callback_lock);
-        return OFT_ERROR;
-    }
-
-    connection->disconnected_listeners[connection->disconnected_listener_count] = callback;
-    connection->disconnected_listener_user_data[connection->disconnected_listener_count] = user_data;
-    connection->disconnected_listener_count++;
-    pthread_mutex_unlock(&connection->callback_lock);
-    return OFT_OK;
-}
-
-void oft_connection_remove_disconnected_listener(oft_connection *connection, oft_disconnected_callback callback, void *user_data) {
-    pthread_mutex_lock(&connection->callback_lock);
-    for (size_t i = 0; i < connection->disconnected_listener_count; i++) {
-        if (connection->disconnected_listeners[i] == callback && connection->disconnected_listener_user_data[i] == user_data) {
-            for (size_t j = i; j + 1 < connection->disconnected_listener_count; j++) {
-                connection->disconnected_listeners[j] = connection->disconnected_listeners[j + 1];
-                connection->disconnected_listener_user_data[j] = connection->disconnected_listener_user_data[j + 1];
-            }
-
-            connection->disconnected_listener_count--;
-            break;
-        }
-    }
-    pthread_mutex_unlock(&connection->callback_lock);
+void oft_connection_set_disconnected_callback(oft_connection *connection, oft_disconnected_callback callback, void *user_data) {
+    connection->disconnected_target.callback = callback;
+    connection->disconnected_target.user_data = user_data;
+    oft_event_buffer_attach(&connection->disconnected_buffer, callback ? dispatch_disconnected_buffer_item : NULL, &connection->disconnected_target);
 }
 
 const char *oft_connection_remote_info(oft_connection *connection) {
@@ -1352,19 +1413,7 @@ static void close_connection(oft_connection *connection, const char *error_messa
     shutdown(connection->fd, SHUT_RDWR);
     close(connection->fd);
 
-    oft_disconnected_callback callbacks[OFT_MAX_LISTENERS];
-    void *user_data_values[OFT_MAX_LISTENERS];
-    size_t count;
-
-    pthread_mutex_lock(&connection->callback_lock);
-    count = connection->disconnected_listener_count;
-    memcpy(callbacks, connection->disconnected_listeners, count * sizeof(oft_disconnected_callback));
-    memcpy(user_data_values, connection->disconnected_listener_user_data, count * sizeof(void *));
-    pthread_mutex_unlock(&connection->callback_lock);
-
-    for (size_t i = 0; i < count; i++) {
-        callbacks[i](connection, error_message, user_data_values[i]);
-    }
+    raise_disconnected(connection, error_message);
 }
 
 void oft_connection_disconnect(oft_connection *connection) {
@@ -1425,13 +1474,17 @@ void oft_connection_close(oft_connection *connection) {
     free(connection->target_host);
     free(connection->remote_info);
 
+    /* Safe now too, for the same reason as above: the receive thread (the only thread that ever
+     * calls oft_event_buffer_raise on these buffers) has fully exited. */
+    oft_event_buffer_destroy(&connection->received_buffer);
+    oft_event_buffer_destroy(&connection->disconnected_buffer);
+
     pthread_mutex_destroy(&connection->outbound_lock);
     sem_destroy(&connection->send_signal);
     sem_destroy(&connection->write_permit);
     pthread_mutex_destroy(&connection->receipt_lock);
     pthread_mutex_destroy(&connection->rekey_queue_lock);
     pthread_mutex_destroy(&connection->timestamp_lock);
-    pthread_mutex_destroy(&connection->callback_lock);
 
     free(connection);
 }

@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Sample;
+namespace BlueHeighliner.OpenFrameTransport.Sample;
 
 /// <summary>
 /// Entry point for the OFT sample application.

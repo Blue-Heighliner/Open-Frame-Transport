@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 /// <summary>
 /// Drives the OFT wire protocol directly (bypassing <see cref="IOftConnector"/>) to exercise how a
@@ -17,7 +17,7 @@ public sealed class ProtocolViolationTests
     {
         await using TrackedListener listener = await TrackedListener.Start(new IPEndPoint(IPAddress.Loopback, 0), CreateServerOptions());
         bool established = false;
-        listener.Connected += (_, _) => established = true;
+        listener.OnConnectedExtra = _ => established = true;
 
         (TcpClient tcpClient, SslStream sslStream, OftFrameStream frameStream) = await OftTestHarness.RawConnect(listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
         using (tcpClient)
@@ -35,7 +35,7 @@ public sealed class ProtocolViolationTests
     {
         await using TrackedListener listener = await TrackedListener.Start(new IPEndPoint(IPAddress.Loopback, 0), CreateServerOptions());
         bool established = false;
-        listener.Connected += (_, _) => established = true;
+        listener.OnConnectedExtra = _ => established = true;
 
         (TcpClient tcpClient, SslStream sslStream, _) = await OftTestHarness.RawConnect(listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
         sslStream.Dispose();
@@ -51,7 +51,7 @@ public sealed class ProtocolViolationTests
     {
         await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), CreateServerOptions());
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => serverConnectionSource.TrySetResult(args.Connection);
+        listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
         (TcpClient tcpClient, SslStream sslStream, OftFrameStream frameStream) = await OftTestHarness.RawConnect(listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
         using (tcpClient)
@@ -62,15 +62,15 @@ public sealed class ProtocolViolationTests
             Assert.NotNull(serverHail);
 
             IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-            TaskCompletionSource<OftDisconnectedEventArgs> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            serverConnection.Disconnected += (_, args) => closedSource.TrySetResult(args);
+            TaskCompletionSource<Exception?> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            serverConnection.DisconnectedHandler = exception => closedSource.TrySetResult(exception);
 
             // Control 2 (Completion) with nothing in flight on any priority channel: a protocol
             // violation the receiver must detect (see Docs/OFT.md §4.4).
             await frameStream.Write(new Packet { Control = 2, Data = ByteString.Empty }, CancellationToken.None).WaitAsync(OftTestHarness.DefaultTimeout);
 
-            OftDisconnectedEventArgs closedArgs = await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-            Assert.IsType<InvalidOperationException>(closedArgs.Exception);
+            Exception? closedException = await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+            Assert.IsType<InvalidOperationException>(closedException);
         }
     }
 
@@ -79,7 +79,7 @@ public sealed class ProtocolViolationTests
     {
         await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), CreateServerOptions());
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => serverConnectionSource.TrySetResult(args.Connection);
+        listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
         (TcpClient tcpClient, SslStream sslStream, OftFrameStream frameStream) = await OftTestHarness.RawConnect(listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
         using (tcpClient)
@@ -91,7 +91,7 @@ public sealed class ProtocolViolationTests
             IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
             TaskCompletionSource<bool> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            serverConnection.Disconnected += (_, _) =>
+            serverConnection.DisconnectedHandler = _ =>
             {
                 closedSource.TrySetResult(true);
                 throw new InvalidOperationException("Disconnected handler misbehaving on purpose.");
@@ -114,7 +114,7 @@ public sealed class ProtocolViolationTests
     {
         await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), CreateServerOptions());
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => serverConnectionSource.TrySetResult(args.Connection);
+        listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
         (TcpClient tcpClient, SslStream sslStream, OftFrameStream frameStream) = await OftTestHarness.RawConnect(listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
         using (tcpClient)
@@ -124,14 +124,14 @@ public sealed class ProtocolViolationTests
             await frameStream.ReadHail(CancellationToken.None).WaitAsync(OftTestHarness.DefaultTimeout);
 
             IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-            TaskCompletionSource<OftDisconnectedEventArgs> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-            serverConnection.Disconnected += (_, args) => closedSource.TrySetResult(args);
+            TaskCompletionSource<Exception?> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            serverConnection.DisconnectedHandler = exception => closedSource.TrySetResult(exception);
 
             // Control 3 (Cancellation) with nothing in flight: also a protocol violation.
             await frameStream.Write(new Packet { Control = 3, Data = ByteString.Empty }, CancellationToken.None).WaitAsync(OftTestHarness.DefaultTimeout);
 
-            OftDisconnectedEventArgs closedArgs = await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-            Assert.IsType<InvalidOperationException>(closedArgs.Exception);
+            Exception? closedException = await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+            Assert.IsType<InvalidOperationException>(closedException);
         }
     }
 }

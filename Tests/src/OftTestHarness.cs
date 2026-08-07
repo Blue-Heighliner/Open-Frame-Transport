@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 /// <summary>
 /// A connected client/server pair, both established against each other, for use in tests.
@@ -33,7 +33,7 @@ internal sealed class TrackedListener : IAsyncDisposable
     private TrackedListener(IOftListener listener)
     {
         this.listener = listener;
-        listener.Connected += this.OnConnected;
+        listener.ConnectedHandler = this.OnConnected;
     }
 
     public static async Task<TrackedListener> Start(IPEndPoint listenEndPoint, OftHostOptions? options = null, CancellationToken cancellationToken = default) =>
@@ -52,33 +52,43 @@ internal sealed class TrackedListener : IAsyncDisposable
         }
     }
 
-    public event EventHandler<OftConnectedEventArgs>? Connected
-    {
-        add => this.listener.Connected += value;
-        remove => this.listener.Connected -= value;
-    }
+    /// <summary>
+    /// Called whenever this listener accepts a new connection, in addition to this type's own
+    /// tracking of <see cref="Connections"/>.
+    /// </summary>
+    public Action<IOftConnection>? OnConnectedExtra { get; set; }
 
-    private void OnConnected(object? sender, OftConnectedEventArgs args)
+    /// <summary>
+    /// Called whenever a connection this listener accepted disconnects, in addition to this type's
+    /// own tracking of <see cref="Connections"/> - since each such connection's
+    /// <see cref="IOftConnection.DisconnectedHandler"/> is already used internally for that tracking
+    /// (and is single-slot), a test that needs its own per-connection disconnected notification goes
+    /// through this property instead of assigning the connection's
+    /// <see cref="IOftConnection.DisconnectedHandler"/> directly.
+    /// </summary>
+    public Action<IOftConnection, Exception?>? OnConnectionDisconnectedExtra { get; set; }
+
+    private void OnConnected(IOftConnection connection)
     {
         lock (this.connectionsLock)
         {
-            this.connections.Add(args.Connection);
+            this.connections.Add(connection);
         }
 
-        args.Connection.Disconnected += (_, _) =>
+        connection.DisconnectedHandler = exception =>
         {
             lock (this.connectionsLock)
             {
-                this.connections.Remove(args.Connection);
+                this.connections.Remove(connection);
             }
+
+            this.OnConnectionDisconnectedExtra?.Invoke(connection, exception);
         };
+
+        this.OnConnectedExtra?.Invoke(connection);
     }
 
-    public async ValueTask DisposeAsync()
-    {
-        this.listener.Connected -= this.OnConnected;
-        await this.listener.DisposeAsync();
-    }
+    public async ValueTask DisposeAsync() => await this.listener.DisposeAsync();
 }
 
 /// <summary>
@@ -92,11 +102,11 @@ internal static class OftTestHarness
     public static async Task<OftPair> Establish(
         int maxPacketDataSize = 16384,
         TimeSpan? rekeyInterval = null,
-        OftSecurityMode securityMode = OftSecurityMode.Authentication,
+        OftSecurityMode securityMode = OftSecurityMode.ServerAuthentication,
         TimeSpan? pollInterval = null,
         TimeSpan? pollTimeout = null)
     {
-        bool needsServerCertificate = securityMode is OftSecurityMode.Authentication or OftSecurityMode.DualAuthentication;
+        bool needsServerCertificate = securityMode is OftSecurityMode.ServerAuthentication or OftSecurityMode.DualAuthentication;
 
         OftHostOptions hostOptions = new()
         {
@@ -114,7 +124,7 @@ internal static class OftTestHarness
         IOftListener listener = await hoster.Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
 
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => serverConnectionSource.TrySetResult(args.Connection);
+        listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
         OftConnectOptions connectOptions = new()
         {
@@ -188,10 +198,10 @@ internal static class OftTestHarness
     }
 
     /// <summary>
-    /// Dials a raw, TLS-less connection to a local insecure OFT server, so a test can drive the OFT
-    /// wire protocol directly over plain TCP.
+    /// Dials a raw, TLS-less connection to a local <see cref="OftSecurityMode.Trusted"/> OFT server,
+    /// so a test can drive the OFT wire protocol directly over plain TCP.
     /// </summary>
-    public static async Task<(TcpClient TcpClient, OftFrameStream FrameStream)> RawConnectInsecure(int port, CancellationToken cancellationToken = default)
+    public static async Task<(TcpClient TcpClient, OftFrameStream FrameStream)> RawConnectTrusted(int port, CancellationToken cancellationToken = default)
     {
         TcpClient tcpClient = new();
         await tcpClient.ConnectAsync("127.0.0.1", port, cancellationToken).ConfigureAwait(false);

@@ -31,19 +31,20 @@ typedef struct {
 
     /* Used to authenticate this peer, for both inbound and outbound connections. Not owned by the
      * peer; the caller must free it after the peer is closed. Required (non-NULL) for
-     * OFT_SECURITY_MODE_AUTHENTICATION and OFT_SECURITY_MODE_DUAL_AUTHENTICATION; unused under
-     * OFT_SECURITY_MODE_SECURE and OFT_SECURITY_MODE_INSECURE. */
+     * OFT_SECURITY_MODE_DUAL_AUTHENTICATION (the only authenticating mode a peer supports - see
+     * `security_mode` below); unused under OFT_SECURITY_MODE_SECURE and OFT_SECURITY_MODE_TRUSTED. */
     SSL_CTX *ssl_ctx;
 
     size_t max_packet_data_size;
 
     /* When > 0, every connection automatically rekeys its TLS session on this interval. Ignored
-     * entirely when `security_mode` is OFT_SECURITY_MODE_INSECURE. */
+     * entirely when `security_mode` is OFT_SECURITY_MODE_TRUSTED. */
     long rekey_interval_ms;
 
     /* The security mode connections are established under (see Docs/OFT.md §9). 0 (the default
      * value of this field, and of a zero-initialized oft_peer_options) is
-     * OFT_SECURITY_MODE_SECURE. */
+     * OFT_SECURITY_MODE_SECURE. OFT_SECURITY_MODE_SERVER_AUTHENTICATION is not a valid value here -
+     * see its own documentation for why - and oft_peer_create() returns NULL if it's set. */
     enum oft_security_mode security_mode;
 
     /* How often each connection sends an empty Poll packet to its peer as a liveness signal, once
@@ -72,7 +73,12 @@ typedef struct {
     long eviction_check_interval_ms;
 } oft_peer_options;
 
-/* Creates a peer using the given options. The options are copied; ssl_ctx is not (see oft_peer_close). */
+/*
+ * Creates a peer using the given options. The options are copied; ssl_ctx is not (see
+ * oft_peer_close). Returns NULL if options->security_mode is
+ * OFT_SECURITY_MODE_SERVER_AUTHENTICATION (not a valid mode for a peer - see its own
+ * documentation for why) or on allocation failure.
+ */
 oft_peer *oft_peer_create(const oft_peer_options *options);
 
 /*
@@ -92,7 +98,17 @@ void oft_peer_stop(oft_peer *peer);
 /* The local port being listened on once oft_peer_open() has completed, or 0 if the peer isn't currently listening. */
 int oft_peer_local_port(oft_peer *peer);
 
-/* Registers the (single) received listener for this peer, covering every connection it holds. Not safe to call concurrently with itself. */
+/*
+ * Assigns the (single) callback invoked for every message received on any connection this peer
+ * holds, both inbound and outbound, replacing any previously assigned one. Pass NULL to clear it.
+ * Not safe to call concurrently with itself. Same buffering guarantee as
+ * oft_connection_set_received_callback(): nothing received before this is first called with a
+ * non-NULL callback is lost. The connection passed to callback is only for replying on the same
+ * connection a message arrived on - this peer otherwise deliberately exposes no way to enumerate,
+ * look up, or be notified about the individual connections it holds (e.g. no disconnected
+ * callback): connection lifecycle is this peer's own implementation detail, transparently managed
+ * (reconnecting, evicting, etc.) behind oft_peer_send().
+ */
 void oft_peer_set_received_callback(oft_peer *peer, oft_received_callback callback, void *user_data);
 
 /*

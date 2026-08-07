@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package oft;
 
-option csharp_namespace = "OpenFrameTransport.Proto";
+option csharp_namespace = "BlueHeighliner.OpenFrameTransport.Proto";
 
 // Sent immediately after the TLS session is established (or, with TLS
 // disabled, immediately after the raw TCP connection is formed - see

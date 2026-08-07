@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// <inheritdoc cref="IOftPeer" />
@@ -17,7 +17,7 @@ internal sealed class OftPeer : IOftPeer
     private readonly List<IOftConnection> inboundConnections = [];
     private readonly object inboundLock = new();
 
-    private readonly OftBufferedEvent<OftReceivedEventArgs> receivedEvent;
+    private readonly OftBufferedHandlerSlot<Action<IOftConnection, IMemoryOwner<byte>>> receivedSlot = new();
 
     private IOftListener? listener;
     private readonly object listenerLock = new();
@@ -42,7 +42,6 @@ internal sealed class OftPeer : IOftPeer
         this.connectOptions = connectOptions;
         this.hoster = hoster;
         this.hostOptions = hostOptions;
-        this.receivedEvent = new OftBufferedEvent<OftReceivedEventArgs>(this);
 
         this.evictionTimer = new Timer(_ => this.RunEviction(), null, options.EvictionCheckInterval, options.EvictionCheckInterval);
     }
@@ -60,17 +59,31 @@ internal sealed class OftPeer : IOftPeer
     }
 
     /// <inheritdoc />
-    public event EventHandler<OftReceivedEventArgs>? Received
+    public Action<IOftConnection, IMemoryOwner<byte>>? ReceivedHandler
     {
-        add => this.receivedEvent.Subscribe(value);
-        remove => this.receivedEvent.Unsubscribe(value);
+        get => this.receivedSlot.Handler;
+        set => this.receivedSlot.Handler = value;
     }
 
     /// <inheritdoc />
     public async Task Open(IPEndPoint listenEndPoint, CancellationToken cancellationToken = default)
     {
         IOftListener opened = await this.hoster.Host(listenEndPoint, this.hostOptions, cancellationToken).ConfigureAwait(false);
-        opened.Connected += this.OnInboundConnected;
+        opened.ConnectedHandler = connection =>
+        {
+            lock (this.inboundLock)
+            {
+                this.inboundConnections.Add(connection);
+            }
+
+            this.TrackConnection(connection, tracked =>
+            {
+                lock (this.inboundLock)
+                {
+                    this.inboundConnections.Remove(tracked);
+                }
+            });
+        };
 
         lock (this.listenerLock)
         {
@@ -90,7 +103,6 @@ internal sealed class OftPeer : IOftPeer
 
         if (currentListener is not null)
         {
-            currentListener.Connected -= this.OnInboundConnected;
             await currentListener.DisposeAsync().ConfigureAwait(false);
         }
     }
@@ -130,7 +142,7 @@ internal sealed class OftPeer : IOftPeer
         await this.evictionTimer.DisposeAsync().ConfigureAwait(false);
         await this.Close().ConfigureAwait(false);
 
-        this.receivedEvent.DisposeBuffered();
+        this.receivedSlot.DisposeBuffered();
     }
 
     private Task<IOftConnection> GetOrCreateConnection(string host, int port, CancellationToken cancellationToken)
@@ -172,46 +184,39 @@ internal sealed class OftPeer : IOftPeer
 
     private async Task<IOftConnection> Connect(string host, int port, CancellationToken cancellationToken)
     {
-        // Subscribing after this.connector.Connect returns is safe here, unlike the old
-        // onEstablished-callback workaround it replaced: Received/Disconnected are backed by
-        // OftBufferedEvent, so nothing the connection raised in the meantime is lost (see
-        // README.md and OftBufferedEvent's own doc comment).
+        // Assigning ReceivedHandler/DisconnectedHandler after this.connector.Connect returns is safe:
+        // they're backed by OftBufferedHandlerSlot, so nothing the connection raised in the meantime
+        // is lost (see README.md and OftBufferedHandlerSlot's own doc comment).
         IOftConnection connection = await this.connector.Connect(host, port, this.connectOptions, cancellationToken).ConfigureAwait(false);
 
-        connection.Received += this.OnMessageReceived;
-        connection.Disconnected += (_, _) =>
+        this.TrackConnection(connection, tracked =>
         {
             lock (this.outboundLock)
             {
                 if (this.outboundConnections.TryGetValue((host, port), out Task<IOftConnection>? current) &&
-                    current.IsCompletedSuccessfully && current.Result == connection)
+                    current.IsCompletedSuccessfully && current.Result == tracked)
                 {
                     this.outboundConnections.Remove((host, port));
                 }
             }
-        };
+        });
 
         return connection;
     }
 
-    private void OnInboundConnected(object? sender, OftConnectedEventArgs args)
+    /// <summary>
+    /// Forwards a tracked connection's received messages to this peer's own
+    /// <see cref="ReceivedHandler"/>, and runs <paramref name="onDisconnectedTrackingCleanup"/> when
+    /// it disconnects to untrack it (from <see cref="outboundConnections"/> or
+    /// <see cref="inboundConnections"/> as appropriate) — this peer has no external disconnected
+    /// notification of its own to forward to (see <see cref="IOftPeer.ReceivedHandler"/>'s own doc
+    /// comment for why).
+    /// </summary>
+    private void TrackConnection(IOftConnection connection, Action<IOftConnection> onDisconnectedTrackingCleanup)
     {
-        lock (this.inboundLock)
-        {
-            this.inboundConnections.Add(args.Connection);
-        }
-
-        args.Connection.Received += this.OnMessageReceived;
-        args.Connection.Disconnected += (_, _) =>
-        {
-            lock (this.inboundLock)
-            {
-                this.inboundConnections.Remove(args.Connection);
-            }
-        };
+        connection.ReceivedHandler = data => this.receivedSlot.Raise(callback => callback(connection, data), discardedDisposable: data);
+        connection.DisconnectedHandler = _ => onDisconnectedTrackingCleanup(connection);
     }
-
-    private void OnMessageReceived(object? sender, OftReceivedEventArgs args) => this.receivedEvent.Raise(args);
 
     /// <summary>
     /// Every connection this peer currently holds, both outbound (only those that have finished

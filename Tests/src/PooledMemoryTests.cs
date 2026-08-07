@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class PooledMemoryTests
 {
@@ -26,16 +26,16 @@ public sealed class PooledMemoryTests
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "hello"u8.ToArray();
         TrackedMemoryOwner owner = new(payload);
 
         await pair.ClientConnection.Send(owner, priority: 1);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
         Assert.Equal(1, owner.DisposeCount);
     }
 
@@ -44,16 +44,16 @@ public sealed class PooledMemoryTests
     {
         await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = [.. Enumerable.Range(0, 1000).Select(i => (byte)i)];
         TrackedMemoryOwner owner = new(payload);
 
         await pair.ClientConnection.Send(owner, priority: 4);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
         Assert.Equal(1, owner.DisposeCount);
     }
 
@@ -123,21 +123,21 @@ public sealed class PooledMemoryTests
     }
 
     [Fact]
-    public async Task ReceivedEventArgs_Dispose_IsSafeAndIdempotent()
+    public async Task ReceivedData_Dispose_IsSafeAndIdempotent()
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "hello"u8.ToArray();
         await pair.ClientConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        byte[] copy = args.Data.ToArray();
+        IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        byte[] copy = data.Memory.ToArray();
 
-        args.Dispose();
-        args.Dispose();
+        data.Dispose();
+        data.Dispose();
 
         Assert.Equal(payload, copy);
     }
@@ -146,7 +146,7 @@ public sealed class PooledMemoryTests
     public async Task Peer_Send_WithMemoryOwner_DeliveredAndOwnerDisposed()
     {
         // Subscribed at the peer level so it covers every connection the peer ever holds, rather
-        // than a specific IOftConnection obtained via Connected after the fact.
+        // than a specific IOftConnection obtained via ConnectedHandler after the fact.
         OftPeerFactory factory = new(new OftConnector(), new OftHoster());
         await using IOftPeer listeningPeer = factory.Create(new OftPeerOptions
         {
@@ -156,8 +156,8 @@ public sealed class PooledMemoryTests
         });
         await listeningPeer.Open(new IPEndPoint(IPAddress.Loopback, 0));
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listeningPeer.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        listeningPeer.ReceivedHandler = (_, data) => received.TrySetResult(data);
 
         await using IOftPeer caller = factory.Create(new OftPeerOptions
         {
@@ -170,8 +170,8 @@ public sealed class PooledMemoryTests
 
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, owner).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
         Assert.Equal(1, owner.DisposeCount);
     }
 }

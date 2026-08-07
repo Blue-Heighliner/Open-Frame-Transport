@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class OftSecurityModeTests
 {
@@ -9,14 +9,14 @@ public sealed class OftSecurityModeTests
         // throwaway certificate internally, and the connecting side accepts it unconditionally.
         await using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Secure);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "hello under secure mode"u8.ToArray();
         await pair.ClientConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -56,7 +56,7 @@ public sealed class OftSecurityModeTests
         await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
 
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => serverConnectionSource.TrySetResult(args.Connection);
+        listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
         OftConnectOptions connectOptions = new()
         {
@@ -71,13 +71,13 @@ public sealed class OftSecurityModeTests
             .WaitAsync(OftTestHarness.DefaultTimeout);
         await using IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        serverConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "hello under mutual tls"u8.ToArray();
         await clientConnection.Send(payload).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 }

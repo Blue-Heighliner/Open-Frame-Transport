@@ -1,8 +1,8 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// The client side of an OFT connection's TLS 1.3 handshake (see Docs/OFT.md §1). Under
-/// <see cref="OftSecurityMode.Authentication"/>/<see cref="OftSecurityMode.DualAuthentication"/>,
+/// <see cref="OftSecurityMode.ServerAuthentication"/>/<see cref="OftSecurityMode.DualAuthentication"/>,
 /// validates the server's certificate — via a caller-supplied
 /// <see cref="RemoteCertificateValidationCallback"/> if one was configured, or .NET's standard
 /// chain/hostname validation otherwise (see <see cref="OftTlsCertificates"/>) — and, if the server

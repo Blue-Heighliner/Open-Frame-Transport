@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 /// <summary>
 /// Generates throwaway self-signed certificates for exercising TLS handshakes in tests.

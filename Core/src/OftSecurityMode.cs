@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// How a connection (or an <see cref="IOftPeer"/>'s connections) uses TLS. Not negotiated on the
@@ -9,9 +9,10 @@ public enum OftSecurityMode
 {
     /// <summary>
     /// No TLS at all: hails are sent directly over the raw TCP connection as soon as it's formed
-    /// (see Docs/OFT.md §9). No confidentiality, integrity, or authentication of either side.
+    /// (see Docs/OFT.md §9). No confidentiality, integrity, or authentication of either side. Only
+    /// appropriate on a network already trusted by other means (see Docs/OFT.md §9).
     /// </summary>
-    Insecure,
+    Trusted,
 
     /// <summary>
     /// TLS provides encryption (and integrity) in transit, but no authentication of either side's
@@ -26,14 +27,16 @@ public enum OftSecurityMode
     /// TLS provides both encryption and authentication of the server's identity: the server must
     /// present its own certificate via <see cref="OftHostOptions.ServerCertificate"/>, and the
     /// connecting side validates it normally (via a caller-supplied validation callback, or the
-    /// default .NET chain/hostname validation). The client is not authenticated.
+    /// default .NET chain/hostname validation). The client is not authenticated. Not a valid mode
+    /// for <see cref="IOftPeer"/>, which has no client/server delineation and so cannot express a
+    /// one-sided authentication requirement (use <see cref="DualAuthentication"/> instead).
     /// </summary>
-    Authentication,
+    ServerAuthentication,
 
     /// <summary>
     /// Mutual TLS: both sides authenticate each other. In addition to everything
-    /// <see cref="Authentication"/> requires, the connecting side must present a certificate via
-    /// <see cref="OftConnectOptions.ClientCertificates"/>, and the accepting side requests and
+    /// <see cref="ServerAuthentication"/> requires, the connecting side must present a certificate
+    /// via <see cref="OftConnectOptions.ClientCertificates"/>, and the accepting side requests and
     /// validates it.
     /// </summary>
     DualAuthentication,

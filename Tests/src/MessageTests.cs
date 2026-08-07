@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class MessageTests
 {
@@ -7,14 +7,14 @@ public sealed class MessageTests
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "hello"u8.ToArray();
         await pair.ClientConnection.Send(payload, priority: 7);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -22,13 +22,13 @@ public sealed class MessageTests
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         await pair.ClientConnection.Send(ReadOnlyMemory<byte>.Empty);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(0, args.Data.Length);
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(0, data.Memory.Length);
     }
 
     [Fact]
@@ -36,14 +36,14 @@ public sealed class MessageTests
     {
         await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = [.. Enumerable.Range(0, 1000).Select(i => (byte)i)];
         await pair.ClientConnection.Send(payload, priority: 3);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -51,14 +51,14 @@ public sealed class MessageTests
     {
         await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = [.. Enumerable.Range(0, 16).Select(i => (byte)i)];
         await pair.ClientConnection.Send(payload, priority: 2);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -66,14 +66,14 @@ public sealed class MessageTests
     {
         await using OftPair pair = await OftTestHarness.Establish();
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ClientConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "from server"u8.ToArray();
         await pair.ServerConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -83,14 +83,17 @@ public sealed class MessageTests
 
         List<int> receivedOrder = [];
         TaskCompletionSource<bool> bothReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) =>
+        pair.ServerConnection.ReceivedHandler = data =>
         {
-            lock (receivedOrder)
+            using (data)
             {
-                receivedOrder.Add(args.Data.Length);
-                if (receivedOrder.Count == 2)
+                lock (receivedOrder)
                 {
-                    bothReceived.TrySetResult(true);
+                    receivedOrder.Add(data.Memory.Length);
+                    if (receivedOrder.Count == 2)
+                    {
+                        bothReceived.TrySetResult(true);
+                    }
                 }
             }
         };
@@ -115,7 +118,11 @@ public sealed class MessageTests
 
         using CancellationTokenSource cts = new();
         TaskCompletionSource<bool> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, _) => received.TrySetResult(true);
+        pair.ServerConnection.ReceivedHandler = data =>
+        {
+            data.Dispose();
+            received.TrySetResult(true);
+        };
 
         cts.Cancel();
         Task sendTask = pair.ClientConnection.Send("should not arrive"u8.ToArray(), cancellationToken: cts.Token);
@@ -141,13 +148,13 @@ public sealed class MessageTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sendTask);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] followUp = "still alive"u8.ToArray();
         await pair.ClientConnection.Send(followUp);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(followUp, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(followUp, data.Memory.ToArray());
     }
 }

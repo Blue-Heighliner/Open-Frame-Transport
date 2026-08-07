@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Sample;
+namespace BlueHeighliner.OpenFrameTransport.Sample;
 
 /// <summary>
 /// Creates and caches one <see cref="LagRelay"/> per distinct send target, so repeated sends to the

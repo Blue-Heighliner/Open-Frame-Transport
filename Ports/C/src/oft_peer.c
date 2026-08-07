@@ -44,7 +44,7 @@ struct oft_peer {
     pthread_mutex_t inbound_lock;
     oft_peer_inbound_node *inbound_connections;
 
-    pthread_mutex_t callback_lock;
+    pthread_mutex_t received_callback_lock;
     oft_received_callback received_callback;
     void *received_callback_user_data;
 
@@ -69,10 +69,10 @@ static long timespec_diff_ms(const struct timespec *a, const struct timespec *b)
 }
 
 static void raise_received(oft_peer *peer, oft_connection *connection, uint8_t *data, size_t length) {
-    pthread_mutex_lock(&peer->callback_lock);
+    pthread_mutex_lock(&peer->received_callback_lock);
     oft_received_callback callback = peer->received_callback;
     void *user_data = peer->received_callback_user_data;
-    pthread_mutex_unlock(&peer->callback_lock);
+    pthread_mutex_unlock(&peer->received_callback_lock);
 
     if (callback) {
         callback(connection, data, length, user_data);
@@ -85,6 +85,9 @@ static void on_outbound_received(oft_connection *connection, uint8_t *data, size
     raise_received(user_data, connection, data, length);
 }
 
+/* No disconnected callback to forward to: this peer deliberately exposes no way to be notified
+ * about the individual connections it holds (see oft_peer_set_received_callback()'s own doc
+ * comment) - this only ever untracks the connection so it's no longer considered held. */
 static void on_outbound_disconnected(oft_connection *connection, const char *error_message, void *user_data) {
     (void)error_message;
     oft_peer *peer = user_data;
@@ -106,21 +109,21 @@ static void on_outbound_disconnected(oft_connection *connection, const char *err
     pthread_mutex_unlock(&peer->outbound_lock);
 }
 
-/* Passed to oft_connect() as on_established: registering these here, rather than after
- * oft_connect() returns, guarantees they're in place before the connection starts processing
- * inbound packets - otherwise a peer that replies the instant the connection is up could have its
- * first message delivered (and discarded, for lack of a callback) before oft_connect() ever
- * returns. */
-static void on_outbound_established(oft_connection *connection, void *user_data) {
-    oft_peer *peer = user_data;
+/* Registers this peer's own received/disconnected tracking on a newly established outbound
+ * connection. Called after oft_connect() returns rather than passed to it: the connection's own
+ * notifications are buffered (see oft_connection_set_received_callback/
+ * oft_connection_set_disconnected_callback), so there's no ordering requirement to satisfy by
+ * registering this any earlier. */
+static void track_outbound(oft_peer *peer, oft_connection *connection) {
     oft_connection_set_received_callback(connection, on_outbound_received, peer);
-    oft_connection_add_disconnected_listener(connection, on_outbound_disconnected, peer);
+    oft_connection_set_disconnected_callback(connection, on_outbound_disconnected, peer);
 }
 
 static void on_inbound_received(oft_connection *connection, uint8_t *data, size_t length, void *user_data) {
     raise_received(user_data, connection, data, length);
 }
 
+/* No disconnected callback to forward to - see on_outbound_disconnected()'s own comment. */
 static void on_inbound_disconnected(oft_connection *connection, const char *error_message, void *user_data) {
     (void)error_message;
     oft_peer *peer = user_data;
@@ -160,12 +163,19 @@ static void on_inbound_established(oft_listener *listener, oft_connection *conne
     pthread_mutex_unlock(&peer->inbound_lock);
 
     oft_connection_set_received_callback(connection, on_inbound_received, peer);
-    oft_connection_add_disconnected_listener(connection, on_inbound_disconnected, peer);
+    oft_connection_set_disconnected_callback(connection, on_inbound_disconnected, peer);
 }
 
 static void *eviction_loop(void *arg);
 
 oft_peer *oft_peer_create(const oft_peer_options *options) {
+    /* OFT_SECURITY_MODE_SERVER_AUTHENTICATION is not valid for a peer: a peer has no client/server
+     * delineation, so it cannot express a one-sided authentication requirement. Use
+     * OFT_SECURITY_MODE_DUAL_AUTHENTICATION instead. */
+    if (options->security_mode == OFT_SECURITY_MODE_SERVER_AUTHENTICATION) {
+        return NULL;
+    }
+
     oft_peer *peer = calloc(1, sizeof(oft_peer));
     if (!peer) {
         return NULL;
@@ -182,7 +192,7 @@ oft_peer *oft_peer_create(const oft_peer_options *options) {
 
     pthread_mutex_init(&peer->outbound_lock, NULL);
     pthread_mutex_init(&peer->inbound_lock, NULL);
-    pthread_mutex_init(&peer->callback_lock, NULL);
+    pthread_mutex_init(&peer->received_callback_lock, NULL);
     atomic_init(&peer->eviction_stop, 0);
     atomic_init(&peer->disposed, 0);
 
@@ -232,10 +242,10 @@ int oft_peer_local_port(oft_peer *peer) {
 }
 
 void oft_peer_set_received_callback(oft_peer *peer, oft_received_callback callback, void *user_data) {
-    pthread_mutex_lock(&peer->callback_lock);
+    pthread_mutex_lock(&peer->received_callback_lock);
     peer->received_callback = callback;
     peer->received_callback_user_data = user_data;
-    pthread_mutex_unlock(&peer->callback_lock);
+    pthread_mutex_unlock(&peer->received_callback_lock);
 }
 
 static oft_peer_outbound_node *get_or_connect(oft_peer *peer, const char *host, uint16_t port, char *error_buffer, size_t error_buffer_size) {
@@ -249,12 +259,13 @@ static oft_peer_outbound_node *get_or_connect(oft_peer *peer, const char *host, 
     }
 
     oft_connection *connection = oft_connect(
-            host, port, &peer->connect_options, peer->options.ssl_ctx,
-            on_outbound_established, peer, error_buffer, error_buffer_size);
+            host, port, &peer->connect_options, peer->options.ssl_ctx, error_buffer, error_buffer_size);
     if (!connection) {
         pthread_mutex_unlock(&peer->outbound_lock);
         return NULL;
     }
+
+    track_outbound(peer, connection);
 
     oft_peer_outbound_node *node = calloc(1, sizeof(oft_peer_outbound_node));
     if (!node) {
@@ -500,7 +511,7 @@ void oft_peer_close(oft_peer *peer) {
 
     pthread_mutex_destroy(&peer->outbound_lock);
     pthread_mutex_destroy(&peer->inbound_lock);
-    pthread_mutex_destroy(&peer->callback_lock);
+    pthread_mutex_destroy(&peer->received_callback_lock);
 
     free(peer->info_copy);
     free(peer);

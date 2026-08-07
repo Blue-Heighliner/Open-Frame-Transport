@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Options for an <see cref="IOftHoster"/>/<see cref="IOftListener"/>.
@@ -7,10 +7,10 @@ public sealed record OftHostOptions : OftConnectionOptions
 {
     /// <summary>
     /// The certificate the server authenticates itself with during the TLS handshake. Required when
-    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Authentication"/>
+    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.ServerAuthentication"/>
     /// or <see cref="OftSecurityMode.DualAuthentication"/>; unused under
     /// <see cref="OftSecurityMode.Secure"/> (an ephemeral certificate is generated instead) and
-    /// <see cref="OftSecurityMode.Insecure"/> (no TLS at all).
+    /// <see cref="OftSecurityMode.Trusted"/> (no TLS at all).
     /// </summary>
     public X509Certificate2? ServerCertificate { get; init; }
 

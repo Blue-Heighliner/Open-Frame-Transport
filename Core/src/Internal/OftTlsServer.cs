@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// The server side of an OFT connection's TLS 1.3 handshake (see Docs/OFT.md §1). Presents its own

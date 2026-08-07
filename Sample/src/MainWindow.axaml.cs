@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Sample;
+namespace BlueHeighliner.OpenFrameTransport.Sample;
 
 /// <summary>
 /// The sample's single window: hosts an <see cref="IOftListener"/> for inbound connections and uses
@@ -43,7 +43,7 @@ internal sealed partial class MainWindow : Window
         this.hostOptions = new OftHostOptions
         {
             Info = info,
-            SecurityMode = OftSecurityMode.Authentication,
+            SecurityMode = OftSecurityMode.ServerAuthentication,
             ServerCertificate = SampleCertificate.Create(),
             ClientCertificateValidation = acceptAnyCertificate,
             MaxPacketDataSize = maxPacketDataSize,
@@ -52,7 +52,7 @@ internal sealed partial class MainWindow : Window
         this.connectOptions = new OftConnectOptions
         {
             Info = info,
-            SecurityMode = OftSecurityMode.Authentication,
+            SecurityMode = OftSecurityMode.ServerAuthentication,
             ServerCertificateValidation = acceptAnyCertificate,
             MaxPacketDataSize = maxPacketDataSize,
         };
@@ -64,7 +64,7 @@ internal sealed partial class MainWindow : Window
     private async void OnWindowOpened(object? sender, EventArgs e)
     {
         this.listener = await this.hoster.Host(new IPEndPoint(IPAddress.Loopback, 0), this.hostOptions).ConfigureAwait(true);
-        this.listener.Connected += this.OnInboundConnected;
+        this.listener.ConnectedHandler = this.OnConnected;
         this.ListenAddressText.Text = $"Listening on: {this.listener.LocalEndPoint}";
     }
 
@@ -105,8 +105,7 @@ internal sealed partial class MainWindow : Window
             this.AppendLog($"Sending {payload.Length} byte(s) to {host}:{port} at priority {priority} (lag {this.lagMilliseconds} ms)...");
 
             // A fresh connection per send, closed again once it's done - the connector itself
-            // caches nothing (see IOftConnector), unlike the connection-reusing IOftPeer this
-            // sample used to send through.
+            // caches nothing (see IOftConnector), unlike the connection-reusing IOftPeer.
             await using IOftConnection connection = await this.connector.Connect(relay.RelayHost, relay.RelayPort, this.connectOptions).ConfigureAwait(true);
             await connection.Send(payload, priority).ConfigureAwait(true);
 
@@ -118,16 +117,20 @@ internal sealed partial class MainWindow : Window
         }
     }
 
-    private void OnInboundConnected(object? sender, OftConnectedEventArgs e)
+    private void OnConnected(IOftConnection connection)
     {
-        e.Connection.Received += this.OnConnectionReceived;
+        connection.ReceivedHandler = this.OnReceived;
     }
 
-    private void OnConnectionReceived(object? sender, OftReceivedEventArgs e)
+    private void OnReceived(IMemoryOwner<byte> data)
     {
-        string preview = DescribePayload(e.Data.Span);
+        using (data)
+        {
+            string preview = DescribePayload(data.Memory.Span);
+            int length = data.Memory.Length;
 
-        Dispatcher.UIThread.Post(() => this.AppendLog($"Received {e.Data.Length} byte(s): {preview}"));
+            Dispatcher.UIThread.Post(() => this.AppendLog($"Received {length} byte(s): {preview}"));
+        }
     }
 
     private void AppendLog(string entry)

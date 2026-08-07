@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Connects out to remote OFT endpoints.
@@ -47,11 +47,10 @@ public sealed class OftConnector : IOftConnector
             await tcpClient.ConnectAsync(host, port, cancellationToken).ConfigureAwait(false);
             OftConnection connection = await OftConnection.EstablishAsClient(tcpClient, host, options, cancellationToken).ConfigureAwait(false);
 
-            // Safe to start processing immediately: Received/Disconnected are backed by
-            // OftBufferedEvent, so nothing raised before the caller gets this connection back and
-            // subscribes is lost (see README.md and OftBufferedEvent's own doc comment) - there's no
-            // ordering requirement to satisfy here, unlike the old onEstablished-callback approach
-            // this replaced.
+            // Safe to start processing immediately: Handler is backed by OftBufferedHandlerSlot, so
+            // nothing raised before the caller gets this connection back and assigns a handler is
+            // lost (see README.md and OftBufferedHandlerSlot's own doc comment) - there's no ordering
+            // requirement to satisfy here.
             connection.StartProcessing();
             return connection;
         }

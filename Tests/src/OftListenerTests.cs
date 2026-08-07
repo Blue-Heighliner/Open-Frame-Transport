@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class OftListenerTests
 {
@@ -6,7 +6,7 @@ public sealed class OftListenerTests
     {
         Info = "server",
         ServerCertificate = TestCertificate.Create(),
-        SecurityMode = OftSecurityMode.Authentication,
+        SecurityMode = OftSecurityMode.ServerAuthentication,
     };
 
     private static IPEndPoint LoopbackEndPoint() => new(IPAddress.Loopback, 0);
@@ -25,13 +25,13 @@ public sealed class OftListenerTests
         IOftListener listener = await new OftHoster().Host(LoopbackEndPoint(), CreateOptions());
 
         TaskCompletionSource<IOftConnection> connectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => connectionSource.TrySetResult(args.Connection);
+        listener.ConnectedHandler = connection => connectionSource.TrySetResult(connection);
 
         IOftConnector connector = new OftConnector();
         await using IOftConnection clientConnection = await connector.Connect(
                 "127.0.0.1",
                 listener.LocalEndPoint.Port,
-                new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.Authentication, ServerCertificateValidation = (_, _, _, _) => true })
+                new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.ServerAuthentication, ServerCertificateValidation = (_, _, _, _) => true })
             .WaitAsync(OftTestHarness.DefaultTimeout);
 
         await using IOftConnection serverConnection = await connectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
@@ -41,14 +41,14 @@ public sealed class OftListenerTests
         // connection fully alive and usable.
         await listener.DisposeAsync();
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        serverConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "still alive"u8.ToArray();
         await clientConnection.Send(payload).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -56,7 +56,7 @@ public sealed class OftListenerTests
     {
         await using IOftListener listener = await new OftHoster().Host(LoopbackEndPoint(), CreateOptions());
         bool established = false;
-        listener.Connected += (_, _) => established = true;
+        listener.ConnectedHandler = _ => established = true;
 
         using (TcpClient rogue = new())
         {
@@ -72,7 +72,18 @@ public sealed class OftListenerTests
         await using IOftConnection connection = await connector.Connect(
                 "127.0.0.1",
                 listener.LocalEndPoint.Port,
-                new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.Authentication, ServerCertificateValidation = (_, _, _, _) => true })
+                new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.ServerAuthentication, ServerCertificateValidation = (_, _, _, _) => true })
             .WaitAsync(OftTestHarness.DefaultTimeout);
+    }
+
+    [Fact]
+    public async Task Host_WithPort_ListensOnAnyAddressAtTheGivenPort()
+    {
+        int port = OftTestHarness.ReserveFreePort();
+
+        await using IOftListener listener = await new OftHoster().Host(port);
+
+        Assert.Equal(IPAddress.Any, listener.LocalEndPoint.Address);
+        Assert.Equal(port, listener.LocalEndPoint.Port);
     }
 }

@@ -26,12 +26,6 @@
 extern "C" {
 #endif
 
-/* The maximum number of listeners that may be registered at once via
- * oft_connection_add_disconnected_listener(). Kept small and fixed to avoid dynamic allocation on
- * the hot path; a peer's own internal tracking listener counts against this limit alongside any the
- * application registers. */
-#define OFT_MAX_LISTENERS 8
-
 /* Return codes used throughout the public API. */
 enum oft_result {
     OFT_OK = 0,
@@ -47,8 +41,9 @@ enum oft_result {
  */
 enum oft_security_mode {
     /* No TLS at all: hails are sent directly over the raw TCP connection as soon as it's formed.
-     * No confidentiality, integrity, or authentication of either side. ssl_ctx is unused. */
-    OFT_SECURITY_MODE_INSECURE = 0,
+     * No confidentiality, integrity, or authentication of either side. ssl_ctx is unused. Only
+     * appropriate on a network already trusted by other means. */
+    OFT_SECURITY_MODE_TRUSTED = 0,
 
     /* TLS provides confidentiality and integrity but no authentication of either side. The
      * accepting side (oft_host()) uses a certificate it generates internally rather than one
@@ -59,12 +54,14 @@ enum oft_security_mode {
 
     /* Traditional one-way TLS: oft_host() requires a non-NULL ssl_ctx already configured with the
      * accepting side's certificate and private key. oft_connect()'s ssl_ctx validates it normally
-     * (via whatever verification the caller configured on that context). */
-    OFT_SECURITY_MODE_AUTHENTICATION = 2,
+     * (via whatever verification the caller configured on that context). Not a valid mode for
+     * oft_peer, which has no client/server delineation and so cannot express a one-sided
+     * authentication requirement (use OFT_SECURITY_MODE_DUAL_AUTHENTICATION instead). */
+    OFT_SECURITY_MODE_SERVER_AUTHENTICATION = 2,
 
-    /* Mutual TLS: everything OFT_SECURITY_MODE_AUTHENTICATION requires, plus oft_connect()'s
-     * ssl_ctx must also be configured with this side's own certificate and private key, which the
-     * accepting side requests and validates. */
+    /* Mutual TLS: everything OFT_SECURITY_MODE_SERVER_AUTHENTICATION requires, plus
+     * oft_connect()'s ssl_ctx must also be configured with this side's own certificate and private
+     * key, which the accepting side requests and validates. */
     OFT_SECURITY_MODE_DUAL_AUTHENTICATION = 3,
 };
 
@@ -84,16 +81,6 @@ typedef void (*oft_disconnected_callback)(oft_connection *connection, const char
 /* Called whenever an oft_listener accepts and establishes a new inbound connection. */
 typedef void (*oft_connected_callback)(oft_listener *listener, oft_connection *connection, void *user_data);
 
-/*
- * Called synchronously from within oft_connect(), with the established connection, before it
- * starts processing inbound packets - the only way to guarantee registering a received callback
- * (see oft_connection_set_received_callback) can never race the connection's own receive thread,
- * which otherwise could deliver (and silently drop, for lack of a callback) the peer's first
- * message before oft_connect() ever returns and the caller gets a chance to register one on the
- * returned connection instead.
- */
-typedef void (*oft_connection_established_callback)(oft_connection *connection, void *user_data);
-
 typedef struct {
     /* Opaque, application-controlled data sent to the peer in this side's hail (see Docs/OFT.md §3). Copied. */
     const char *info;
@@ -102,7 +89,7 @@ typedef struct {
     size_t max_packet_data_size;
 
     /* When > 0, the connection automatically rekeys its TLS session on this interval. 0 = disabled,
-     * or ignored entirely when `security_mode` is OFT_SECURITY_MODE_INSECURE. */
+     * or ignored entirely when `security_mode` is OFT_SECURITY_MODE_TRUSTED. */
     long rekey_interval_ms;
 
     /* The security mode this connection is established under (see Docs/OFT.md §9). 0 (the default
@@ -125,7 +112,7 @@ typedef struct {
     size_t max_packet_data_size;
 
     /* When > 0, the connection automatically rekeys its TLS session on this interval. 0 = disabled,
-     * or ignored entirely when `security_mode` is OFT_SECURITY_MODE_INSECURE. */
+     * or ignored entirely when `security_mode` is OFT_SECURITY_MODE_TRUSTED. */
     long rekey_interval_ms;
 
     /* The security mode connections are established under (see Docs/OFT.md §9). 0 (the default
@@ -173,24 +160,34 @@ void oft_connection_cancel(oft_connection *connection, uint64_t message_id);
  * Rekeys the connection's TLS session in place, without closing the underlying TCP connection (see
  * Docs/OFT.md §8). Blocks until the new session is established. If a rekey is already in progress,
  * joins it instead of starting a new one. Returns OFT_OK immediately (a no-op) if the connection
- * was established with OFT_SECURITY_MODE_INSECURE - there is no TLS session to rekey - or
+ * was established with OFT_SECURITY_MODE_TRUSTED - there is no TLS session to rekey - or
  * OFT_ERROR_CLOSED if the connection closes before the rekey completes.
  */
 int oft_connection_rekey(oft_connection *connection);
 
 /*
- * Registers the (single) received listener for this connection. Not safe to call concurrently with
- * itself. There is only ever one, unlike disconnected listeners: message data ownership passes to
- * exactly one callback (see oft_received_callback), so there is no way to usefully fan the same
- * buffer out to more than one listener.
+ * Assigns the (single) callback invoked whenever a complete application message has been received,
+ * replacing any previously assigned one. Pass NULL to clear it; a message received while cleared is
+ * simply dropped, not buffered for a later callback. Not safe to call concurrently with itself.
+ *
+ * Safe to call at any point after the connection is established, even well after it starts
+ * processing inbound packets: every message received before this is first called with a non-NULL
+ * callback is buffered and delivered to it, in order, before it becomes the live target for
+ * anything received afterward - there is no message-loss race to guard against by calling this
+ * before some other event.
  */
 void oft_connection_set_received_callback(oft_connection *connection, oft_received_callback callback, void *user_data);
 
-/* Registers a listener invoked once, when the connection closes for any reason. Up to OFT_MAX_LISTENERS may be registered. */
-int oft_connection_add_disconnected_listener(oft_connection *connection, oft_disconnected_callback callback, void *user_data);
-
-/* Unregisters a listener previously passed to oft_connection_add_disconnected_listener(). */
-void oft_connection_remove_disconnected_listener(oft_connection *connection, oft_disconnected_callback callback, void *user_data);
+/*
+ * Assigns the (single) callback invoked once, when the connection closes for any reason, replacing
+ * any previously assigned one. Pass NULL to clear it. Not safe to call concurrently with itself.
+ *
+ * Safe to call at any point after the connection is established: if the connection already closed
+ * before this is ever called with a non-NULL callback, the first such call is still notified,
+ * exactly like oft_connection_set_received_callback() - the same buffering guarantee, applied to
+ * this one-shot notification instead of a stream of messages.
+ */
+void oft_connection_set_disconnected_callback(oft_connection *connection, oft_disconnected_callback callback, void *user_data);
 
 /* The opaque, application-controlled data the peer sent in its hail (see Docs/OFT.md §3). Owned by the connection. */
 const char *oft_connection_remote_info(oft_connection *connection);
@@ -230,21 +227,20 @@ void oft_connection_close(oft_connection *connection);
  * established connection, or NULL on failure (with a message written to error_buffer, if given).
  *
  * options may be NULL to use default options. ssl_ctx is used to validate the accepting side's
- * certificate under OFT_SECURITY_MODE_AUTHENTICATION/OFT_SECURITY_MODE_DUAL_AUTHENTICATION (and,
+ * certificate under OFT_SECURITY_MODE_SERVER_AUTHENTICATION/OFT_SECURITY_MODE_DUAL_AUTHENTICATION (and,
  * under OFT_SECURITY_MODE_DUAL_AUTHENTICATION, must also be configured with this side's own
  * certificate and private key) - required (non-NULL) for both of those modes; unused under
- * OFT_SECURITY_MODE_SECURE and OFT_SECURITY_MODE_INSECURE. Not owned by this call; the caller must
+ * OFT_SECURITY_MODE_SECURE and OFT_SECURITY_MODE_TRUSTED. Not owned by this call; the caller must
  * free it whenever it's done being used for connecting (including after the returned connection is
  * closed).
  *
- * on_established, if non-NULL, is invoked with the connection (see
- * oft_connection_established_callback) before it starts processing inbound packets, so the caller
- * can register a received callback with a guarantee that no message will be delivered before it
- * does. May be NULL.
+ * The returned connection already started processing inbound packets by the time this returns -
+ * assigning a received/disconnected callback to it afterward (see
+ * oft_connection_set_received_callback/oft_connection_set_disconnected_callback) is always safe,
+ * with no message-loss race to guard against.
  */
 oft_connection *oft_connect(
         const char *host, uint16_t port, const oft_connect_options *options, SSL_CTX *ssl_ctx,
-        oft_connection_established_callback on_established, void *on_established_user_data,
         char *error_buffer, size_t error_buffer_size);
 
 /* ---- Hoster ---- */
@@ -256,10 +252,10 @@ oft_connection *oft_connect(
  *
  * options may be NULL to use default options. ssl_ctx must already be configured with the
  * accepting side's certificate and private key (e.g. via SSL_CTX_use_certificate_file /
- * SSL_CTX_use_PrivateKey_file) when options->security_mode is OFT_SECURITY_MODE_AUTHENTICATION or
+ * SSL_CTX_use_PrivateKey_file) when options->security_mode is OFT_SECURITY_MODE_SERVER_AUTHENTICATION or
  * OFT_SECURITY_MODE_DUAL_AUTHENTICATION (required, non-NULL, in both cases) - ignored under
  * OFT_SECURITY_MODE_SECURE (an internally generated certificate is used instead) and
- * OFT_SECURITY_MODE_INSECURE. Not owned by the listener; the caller must free it after the
+ * OFT_SECURITY_MODE_TRUSTED. Not owned by the listener; the caller must free it after the
  * listener is closed.
  */
 oft_listener *oft_host(
@@ -269,7 +265,18 @@ oft_listener *oft_host(
 /* The local port being listened on. */
 int oft_listener_local_port(oft_listener *listener);
 
-/* Registers the (single) connected listener for this listener. Not safe to call concurrently with itself. */
+/*
+ * Assigns the (single) callback invoked whenever a new inbound connection completes its handshake,
+ * replacing any previously assigned one. Pass NULL to clear it; a connection accepted while cleared
+ * is simply dropped (and closed), not buffered for a later callback. Not safe to call concurrently
+ * with itself.
+ *
+ * Safe to call at any point after oft_host() returns the listener, even well after connections
+ * start being accepted: every connection accepted before this is first called with a non-NULL
+ * callback is buffered and delivered to it, in order, before it becomes the live target for
+ * anything accepted afterward - there is no accept-before-subscribe race to guard against by
+ * calling this before some other event.
+ */
 void oft_listener_set_connected_callback(oft_listener *listener, oft_connected_callback callback, void *user_data);
 
 /*

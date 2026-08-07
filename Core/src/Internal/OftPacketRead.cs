@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// What <see cref="OftFrameStream.ReadPacketOrPoll"/> read.

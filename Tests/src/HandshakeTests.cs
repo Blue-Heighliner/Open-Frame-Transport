@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class HandshakeTests
 {
@@ -47,7 +47,7 @@ public sealed class HandshakeTests
             OftConnectOptions options = new()
             {
                 Info = "client",
-                SecurityMode = OftSecurityMode.Authentication,
+                SecurityMode = OftSecurityMode.ServerAuthentication,
                 ServerCertificateValidation = (_, _, _, _) => true,
             };
 

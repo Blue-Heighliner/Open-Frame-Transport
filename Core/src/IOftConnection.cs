@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// A single established OFT connection, as described in README.md. Instances are produced by
@@ -43,18 +43,28 @@ public interface IOftConnection : IAsyncDisposable
     bool HasPendingData { get; }
 
     /// <summary>
-    /// Raised whenever a complete application message has been received. Nothing raised before the
-    /// first subscriber ever attaches is lost — it's delivered to that first subscriber as soon as
-    /// it attaches (see README.md and <c>OftBufferedEvent</c>), since this connection may start
-    /// processing inbound packets before a caller has had a chance to subscribe.
+    /// Called whenever a complete application message has been received, with ownership of its
+    /// pooled payload — the callback must dispose it (returning its memory to its pool) once done
+    /// with it, e.g. via a <see langword="using"/> statement. <see langword="null"/> if no callback
+    /// is currently assigned. There is only ever one callback at a time — assigning a new value here
+    /// always replaces any previous one. The first time this is ever assigned a non-null value, it is
+    /// synchronously delivered, in order, every message received before that assignment (see
+    /// README.md), since this connection may start processing inbound packets — and therefore
+    /// receiving messages — before a caller has had a chance to assign a callback. Assigning
+    /// <see langword="null"/> afterward simply discards (without re-buffering, but still disposing)
+    /// any message received while no callback is assigned.
     /// </summary>
-    event EventHandler<OftReceivedEventArgs>? Received;
+    Action<IMemoryOwner<byte>>? ReceivedHandler { get; set; }
 
     /// <summary>
-    /// Raised once, when the connection closes for any reason. Buffered the same way
-    /// <see cref="Received"/> is — see its doc comment.
+    /// Called once, when this connection closes for any reason, with the exception that caused it to
+    /// close, or <see langword="null"/> if it closed cleanly (e.g. because <see cref="Disconnect"/>
+    /// was called). <see langword="null"/> if no callback is currently assigned. There is only ever
+    /// one callback at a time — assigning a new value here always replaces any previous one, and the
+    /// same buffering-until-first-non-null-assignment guarantee <see cref="ReceivedHandler"/> itself
+    /// makes applies here too (see README.md).
     /// </summary>
-    event EventHandler<OftDisconnectedEventArgs>? Disconnected;
+    Action<Exception?>? DisconnectedHandler { get; set; }
 
     /// <summary>
     /// Queues a message for sending at the given priority (see Docs/OFT.md §5-§7). Larger priority
@@ -98,7 +108,7 @@ public interface IOftConnection : IAsyncDisposable
     /// Requests a TLS 1.3 <c>KeyUpdate</c> (see Docs/OFT.md §8): fresh traffic keys for both
     /// directions, derived in place on the existing TLS session without a new handshake or any
     /// interruption to application traffic. A no-op if the connection was established with
-    /// <see cref="OftConnectionOptions.SecurityMode"/> set to <see cref="OftSecurityMode.Insecure"/>
+    /// <see cref="OftConnectionOptions.SecurityMode"/> set to <see cref="OftSecurityMode.Trusted"/>
     /// — there is no TLS session to rekey.
     /// </summary>
     /// <param name="cancellationToken">A token used to cancel the request before it's sent.</param>

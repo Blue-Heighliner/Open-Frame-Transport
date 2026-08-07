@@ -19,16 +19,15 @@ static const oft_connect_options *resolve_options(const oft_connect_options *opt
 
 oft_connection *oft_connect(
         const char *host, uint16_t port, const oft_connect_options *options, SSL_CTX *ssl_ctx,
-        oft_connection_established_callback on_established, void *on_established_user_data,
         char *error_buffer, size_t error_buffer_size) {
     oft_connect_options defaults;
     options = resolve_options(options, &defaults);
 
-    if ((options->security_mode == OFT_SECURITY_MODE_AUTHENTICATION ||
+    if ((options->security_mode == OFT_SECURITY_MODE_SERVER_AUTHENTICATION ||
          options->security_mode == OFT_SECURITY_MODE_DUAL_AUTHENTICATION) && !ssl_ctx) {
         if (error_buffer) {
             snprintf(error_buffer, error_buffer_size,
-                     "ssl_ctx is required when security_mode is OFT_SECURITY_MODE_AUTHENTICATION or OFT_SECURITY_MODE_DUAL_AUTHENTICATION");
+                     "ssl_ctx is required when security_mode is OFT_SECURITY_MODE_SERVER_AUTHENTICATION or OFT_SECURITY_MODE_DUAL_AUTHENTICATION");
         }
 
         return NULL;
@@ -83,14 +82,10 @@ oft_connection *oft_connect(
         return NULL;
     }
 
-    if (on_established) {
-        on_established(connection, on_established_user_data);
-    }
-
-    /* Started only now, after on_established has had a chance to register its own callbacks:
-     * starting any earlier risks the receive thread delivering (and discarding, for lack of a
-     * callback) this connection's first inbound message before the caller ever gets to see it -
-     * see oft_connection_established_callback's own comment. */
+    /* Safe to start processing immediately: the connection's received/disconnected notifications
+     * are buffered (see oft_connection_start_processing's own doc comment), so nothing raised
+     * before the caller gets this connection back and registers a callback is ever lost - there's
+     * no ordering requirement to satisfy here. */
     oft_connection_start_processing(connection);
     return connection;
 }

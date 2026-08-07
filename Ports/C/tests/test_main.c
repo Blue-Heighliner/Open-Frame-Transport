@@ -259,7 +259,7 @@ static int establish_pair(test_pair *pair, size_t max_packet_data_size, long rek
     host_options.info = "server";
     host_options.max_packet_data_size = max_packet_data_size;
     host_options.rekey_interval_ms = rekey_interval_ms;
-    host_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -279,12 +279,12 @@ static int establish_pair(test_pair *pair, size_t max_packet_data_size, long rek
     connect_options.info = "client";
     connect_options.max_packet_data_size = max_packet_data_size;
     connect_options.rekey_interval_ms = rekey_interval_ms;
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     int port = oft_listener_local_port(pair->listener);
     pair->client_connection = oft_connect(
             "127.0.0.1", (uint16_t)port, &connect_options, pair->client_ssl_ctx,
-            NULL, NULL, error_buffer, sizeof(error_buffer));
+            error_buffer, sizeof(error_buffer));
     if (!pair->client_connection) {
         fprintf(stderr, "oft_connect failed: %s\n", error_buffer);
         connection_capture_destroy(&accepted);
@@ -344,28 +344,22 @@ static void test_remote_endpoint_returns_the_peers_actual_address(void) {
     destroy_pair(&pair);
 }
 
-static void test_remove_disconnected_listener_stops_receiving_notifications(void) {
+static void test_disconnected_callback_reassigned_to_null_ignores_notification(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
     closed_capture unexpected;
     closed_capture_init(&unexpected);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(pair.server_connection, on_closed_capture, &unexpected) == OFT_OK);
-    oft_connection_remove_disconnected_listener(pair.server_connection, on_closed_capture, &unexpected);
-
-    closed_capture expected;
-    closed_capture_init(&expected);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(pair.server_connection, on_closed_capture, &expected) == OFT_OK);
+    oft_connection_set_disconnected_callback(pair.server_connection, on_closed_capture, &unexpected);
+    oft_connection_set_disconnected_callback(pair.server_connection, NULL, NULL);
 
     oft_connection_disconnect(pair.server_connection);
-    TEST_ASSERT(closed_capture_wait(&expected, 10) == 0);
 
     pthread_mutex_lock(&unexpected.mutex);
     TEST_ASSERT(unexpected.closed == 0);
     pthread_mutex_unlock(&unexpected.mutex);
 
     closed_capture_destroy(&unexpected);
-    closed_capture_destroy(&expected);
     destroy_pair(&pair);
 }
 
@@ -561,17 +555,11 @@ static void test_cancel_unknown_message_id_is_a_no_op(void) {
     destroy_pair(&pair);
 }
 
-static void on_disconnected_no_op(oft_connection *connection, const char *error_message, void *user_data) {
-    (void)connection;
-    (void)error_message;
-    (void)user_data;
-}
-
 static void test_remote_endpoint_returns_ipv6_address(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -584,10 +572,10 @@ static void test_remote_endpoint_returns_ipv6_address(void) {
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    connect_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     oft_connection *client_connection = oft_connect(
-            "::1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, NULL, NULL,
+            "::1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL,
             error_buffer, sizeof(error_buffer));
     TEST_ASSERT(client_connection != NULL);
 
@@ -606,18 +594,21 @@ static void test_remote_endpoint_returns_ipv6_address(void) {
     oft_listener_close(listener);
 }
 
-static void test_add_disconnected_listener_beyond_max_fails(void) {
+static void test_disconnected_callback_assigned_after_close_with_none_set_still_receives_it(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    /* OFT_MAX_LISTENERS is 8: the 9th registration must be rejected rather than overflow the
-     * connection's fixed-size listener arrays. */
-    for (int i = 0; i < 8; i++) {
-        TEST_ASSERT(oft_connection_add_disconnected_listener(pair.client_connection, on_disconnected_no_op, NULL) == OFT_OK);
-    }
+    /* No callback is assigned yet when this closes - the connection's disconnected notification
+     * would otherwise be lost forever, since close only ever happens once. */
+    oft_connection_disconnect(pair.client_connection);
 
-    TEST_ASSERT(oft_connection_add_disconnected_listener(pair.client_connection, on_disconnected_no_op, NULL) == OFT_ERROR);
+    closed_capture closed;
+    closed_capture_init(&closed);
+    oft_connection_set_disconnected_callback(pair.client_connection, on_closed_capture, &closed);
 
+    TEST_ASSERT(closed_capture_wait(&closed, 10) == 0);
+
+    closed_capture_destroy(&closed);
     destroy_pair(&pair);
 }
 
@@ -745,10 +736,10 @@ static void test_connect_nothing_listening_fails(void) {
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     char error_buffer[256];
-    oft_connection *connection = oft_connect("127.0.0.1", port, &connect_options, client_ctx, NULL, NULL, error_buffer, sizeof(error_buffer));
+    oft_connection *connection = oft_connect("127.0.0.1", port, &connect_options, client_ctx, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(connection == NULL);
 
     SSL_CTX_free(client_ctx);
@@ -759,7 +750,7 @@ static void test_connect_dns_resolution_failure_fails(void) {
      * needing genuine network access. */
     char error_buffer[256];
     oft_connection *connection = oft_connect(
-            "nonexistent.invalid", 12345, NULL, NULL, NULL, NULL, error_buffer, sizeof(error_buffer));
+            "nonexistent.invalid", 12345, NULL, NULL, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(connection == NULL);
 }
 
@@ -773,7 +764,7 @@ static void test_host_bind_failure_when_port_already_in_use(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     char first_error[256];
     oft_listener *first = oft_host("127.0.0.1", 0, &host_options, NULL, first_error, sizeof(first_error));
@@ -787,9 +778,9 @@ static void test_host_bind_failure_when_port_already_in_use(void) {
     oft_listener_close(first);
 }
 
-static void test_default_options_establish_insecure_connection(void) {
+static void test_default_options_establish_trusted_connection(void) {
     /* Passing NULL for both host and connect options exercises each side's own resolve_options
-     * default-fill path (zeroed defaults resolve to OFT_SECURITY_MODE_INSECURE), not just the
+     * default-fill path (zeroed defaults resolve to OFT_SECURITY_MODE_TRUSTED), not just the
      * explicitly-populated options struct every other test in this file uses. */
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -801,7 +792,7 @@ static void test_default_options_establish_insecure_connection(void) {
 
     char connect_error[256];
     oft_connection *client_connection = oft_connect(
-            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), NULL, NULL, NULL, NULL,
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), NULL, NULL,
             connect_error, sizeof(connect_error));
     TEST_ASSERT(client_connection != NULL);
 
@@ -829,12 +820,12 @@ static void test_connect_handshake_failure_does_not_leak_socket(void) {
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     char error_buffer[256];
     oft_connection *connection = oft_connect(
             "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, client_ctx,
-            NULL, NULL, error_buffer, sizeof(error_buffer));
+            error_buffer, sizeof(error_buffer));
     TEST_ASSERT(connection == NULL);
 
     SSL_CTX_free(client_ctx);
@@ -853,16 +844,12 @@ static void on_immediate_reply_established(oft_listener *listener, oft_connectio
     oft_connection_send(connection, (const uint8_t *)"immediate", 9, 0, NULL);
 }
 
-static void on_established_register_capture(oft_connection *connection, void *user_data) {
-    oft_connection_set_received_callback(connection, on_message_capture, user_data);
-}
-
-static void test_connect_on_established_callback_never_misses_a_message_sent_immediately(void) {
+static void test_connect_received_never_misses_a_message_sent_immediately(void) {
     SSL_CTX *server_ctx = test_create_server_context();
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     char error_buffer[256];
     oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, server_ctx, error_buffer, sizeof(error_buffer));
@@ -873,18 +860,20 @@ static void test_connect_on_established_callback_never_misses_a_message_sent_imm
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     message_capture capture;
     message_capture_init(&capture);
 
-    /* Registering via on_established, rather than after oft_connect() returns, is what
-     * guarantees this callback is attached before the connection's receive thread starts - without
-     * it, this test would be a race against the listener's immediate reply above. */
     oft_connection *connection = oft_connect(
             "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, client_ctx,
-            on_established_register_capture, &capture, error_buffer, sizeof(error_buffer));
+            error_buffer, sizeof(error_buffer));
     TEST_ASSERT(connection != NULL);
+
+    /* Registering after oft_connect() returns is safe precisely because received callbacks are
+     * buffered (see oft_connection_set_received_callback): nothing raised before this call is lost,
+     * so this isn't a race against the listener's immediate reply above. */
+    oft_connection_set_received_callback(connection, on_message_capture, &capture);
 
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(capture.length == 9);
@@ -897,12 +886,55 @@ static void test_connect_on_established_callback_never_misses_a_message_sent_imm
     SSL_CTX_free(server_ctx);
 }
 
+static void test_listener_connected_callback_attached_after_accept_still_receives_it(void) {
+    SSL_CTX *server_ctx = test_create_server_context();
+    oft_host_options host_options;
+    memset(&host_options, 0, sizeof(host_options));
+    host_options.info = "server";
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
+
+    char error_buffer[256];
+    oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, server_ctx, error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(listener != NULL);
+
+    SSL_CTX *client_ctx = test_create_client_context();
+    oft_connect_options connect_options;
+    memset(&connect_options, 0, sizeof(connect_options));
+    connect_options.info = "client";
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
+
+    /* No connected callback is registered yet, so the accept below races against
+     * handle_accepted's own thread with nothing here to synchronize on but a plain sleep - exactly
+     * the scenario that would silently lose the connected notification without connected_buffer. */
+    oft_connection *client_connection = oft_connect(
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, client_ctx,
+            error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(client_connection != NULL);
+
+    struct timespec delay = {0, 200 * 1000 * 1000};
+    nanosleep(&delay, NULL);
+
+    connection_capture accepted;
+    connection_capture_init(&accepted);
+    oft_listener_set_connected_callback(listener, on_connection_established, &accepted);
+
+    oft_connection *server_connection = connection_capture_wait(&accepted, 10);
+    TEST_ASSERT(server_connection != NULL);
+
+    connection_capture_destroy(&accepted);
+    oft_connection_close(client_connection);
+    oft_connection_close(server_connection);
+    SSL_CTX_free(client_ctx);
+    oft_listener_close(listener);
+    SSL_CTX_free(server_ctx);
+}
+
 static void test_listener_close_does_not_affect_already_accepted_connections(void) {
     SSL_CTX *server_ctx = test_create_server_context();
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -916,10 +948,10 @@ static void test_listener_close_does_not_affect_already_accepted_connections(voi
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     uint16_t port = (uint16_t)oft_listener_local_port(listener);
-    oft_connection *client_connection = oft_connect("127.0.0.1", port, &connect_options, client_ctx, NULL, NULL, error_buffer, sizeof(error_buffer));
+    oft_connection *client_connection = oft_connect("127.0.0.1", port, &connect_options, client_ctx, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(client_connection != NULL);
 
     oft_connection *server_connection = connection_capture_wait(&accepted, 10);
@@ -1314,7 +1346,7 @@ static test_listening_peer make_listening_peer(const char *info) {
     memset(&options, 0, sizeof(options));
     options.info = info;
     options.ssl_ctx = result.ssl_ctx;
-    options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
 
     result.peer = oft_peer_create(&options);
 
@@ -1344,7 +1376,7 @@ static test_outbound_peer make_outbound_peer(const char *info, long idle_timeout
     memset(&options, 0, sizeof(options));
     options.info = info;
     options.ssl_ctx = result.ssl_ctx;
-    options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
     options.idle_timeout_ms = idle_timeout_ms;
     options.eviction_check_interval_ms = eviction_check_interval_ms;
 
@@ -1405,7 +1437,7 @@ static void test_peer_eviction_disconnects_idle_connections(void) {
 
     closed_capture closed;
     closed_capture_init(&closed);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(connection, on_closed_capture, &closed) == OFT_OK);
+    oft_connection_set_disconnected_callback(connection, on_closed_capture, &closed);
 
     TEST_ASSERT(closed_capture_wait(&closed, 20) == 0);
 
@@ -1421,7 +1453,7 @@ static void test_peer_eviction_disconnects_idle_inbound_connections(void) {
     memset(&options, 0, sizeof(options));
     options.info = "listener";
     options.ssl_ctx = ssl_ctx;
-    options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
     options.idle_timeout_ms = 200;
     options.eviction_check_interval_ms = 50;
 
@@ -1429,19 +1461,22 @@ static void test_peer_eviction_disconnects_idle_inbound_connections(void) {
     char error_buffer[256];
     TEST_ASSERT(oft_peer_open(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_OK);
 
-    SSL_CTX *client_ctx = test_create_client_context();
+    /* A peer only ever supports DUAL_AUTHENTICATION (see OFT_SECURITY_MODE_SERVER_AUTHENTICATION's
+     * own documentation for why), so the raw client dialing into it below must present its own
+     * certificate too - a peer-context ssl_ctx, not a client-only one. */
+    SSL_CTX *client_ctx = test_create_peer_context();
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
 
     uint16_t port = (uint16_t)oft_peer_local_port(peer);
-    oft_connection *connection = oft_connect("127.0.0.1", port, &connect_options, client_ctx, NULL, NULL, error_buffer, sizeof(error_buffer));
+    oft_connection *connection = oft_connect("127.0.0.1", port, &connect_options, client_ctx, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(connection != NULL);
 
     closed_capture closed;
     closed_capture_init(&closed);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(connection, on_closed_capture, &closed) == OFT_OK);
+    oft_connection_set_disconnected_callback(connection, on_closed_capture, &closed);
 
     TEST_ASSERT(closed_capture_wait(&closed, 10) == 0);
 
@@ -1461,7 +1496,7 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
     memset(&options, 0, sizeof(options));
     options.info = "client";
     options.ssl_ctx = client_ctx;
-    options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
     /* Long enough that idle/lifetime eviction never kicks in on its own - only the
      * max_connection_count-driven "evict the oldest" path below should ever disconnect anything. */
     options.idle_timeout_ms = 60000;
@@ -1482,7 +1517,7 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
 
     closed_capture closed;
     closed_capture_init(&closed);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(connection_a, on_closed_capture, &closed) == OFT_OK);
+    oft_connection_set_disconnected_callback(connection_a, on_closed_capture, &closed);
 
     /* Connecting to a second host, beyond max_connection_count of 1, makes connection_a the
      * evictable "oldest" connection at the next eviction cycle even though it's still well within
@@ -1607,7 +1642,7 @@ static void test_peer_disconnect_disconnects_outbound_and_inbound_connections(vo
 
     closed_capture closed;
     closed_capture_init(&closed);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(connection, on_closed_capture, &closed) == OFT_OK);
+    oft_connection_set_disconnected_callback(connection, on_closed_capture, &closed);
 
     oft_peer_disconnect(client.peer);
 
@@ -1648,11 +1683,22 @@ static void test_peer_disconnect_no_connections_does_not_crash(void) {
     destroy_outbound_peer(&client);
 }
 
-static void test_peer_open_fails_when_authentication_mode_missing_ssl_ctx(void) {
+static void test_peer_create_server_authentication_mode_fails(void) {
     oft_peer_options options;
     memset(&options, 0, sizeof(options));
     options.info = "peer";
-    options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION; /* requires an ssl_ctx, deliberately left NULL */
+    /* Not a valid mode for a peer: a peer has no client/server delineation, so it cannot express a
+     * one-sided authentication requirement (use OFT_SECURITY_MODE_DUAL_AUTHENTICATION instead). */
+    options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
+
+    TEST_ASSERT(oft_peer_create(&options) == NULL);
+}
+
+static void test_peer_open_fails_when_dual_authentication_mode_missing_ssl_ctx(void) {
+    oft_peer_options options;
+    memset(&options, 0, sizeof(options));
+    options.info = "peer";
+    options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION; /* requires an ssl_ctx, deliberately left NULL */
 
     oft_peer *peer = oft_peer_create(&options);
 
@@ -1694,7 +1740,7 @@ static void test_peer_close_called_twice_is_idempotent(void) {
     SSL_CTX_free(client.ssl_ctx);
 }
 
-/* ---- Insecure mode tests (see Docs/OFT.md §9) ---- */
+/* ---- Trusted mode tests (see Docs/OFT.md §9) ---- */
 
 /* Dials a raw, TLS-less TCP connection to 127.0.0.1:port. Returns the connected fd, or -1. */
 static int raw_connect(uint16_t port) {
@@ -1717,21 +1763,21 @@ static int raw_connect(uint16_t port) {
     return fd;
 }
 
-static void test_host_authentication_mode_without_ssl_ctx_fails(void) {
+static void test_host_server_authentication_mode_without_ssl_ctx_fails(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
 
     char error_buffer[256];
     TEST_ASSERT(oft_host("127.0.0.1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer)) == NULL);
 }
 
-static void test_host_insecure_without_ssl_ctx_succeeds(void) {
+static void test_host_trusted_without_ssl_ctx_succeeds(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     char error_buffer[256];
     oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer));
@@ -1743,7 +1789,7 @@ static void test_host_close_called_twice_is_idempotent(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     char error_buffer[256];
     oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer));
@@ -1757,7 +1803,7 @@ static void test_host_binds_ipv6_loopback(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     char error_buffer[256];
     oft_listener *listener = oft_host("::1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer));
@@ -1767,11 +1813,11 @@ static void test_host_binds_ipv6_loopback(void) {
     oft_listener_close(listener);
 }
 
-static void test_insecure_connection_establishes_and_exchanges_messages(void) {
+static void test_trusted_connection_establishes_and_exchanges_messages(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -1784,10 +1830,10 @@ static void test_insecure_connection_establishes_and_exchanges_messages(void) {
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    connect_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     oft_connection *client_connection = oft_connect(
-            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, NULL, NULL, error_buffer, sizeof(error_buffer));
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(client_connection != NULL);
 
     oft_connection *server_connection = connection_capture_wait(&accepted, 10);
@@ -1811,11 +1857,11 @@ static void test_insecure_connection_establishes_and_exchanges_messages(void) {
     oft_listener_close(listener);
 }
 
-static void test_rekey_on_insecure_connection_is_noop(void) {
+static void test_rekey_on_trusted_connection_is_noop(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -1828,10 +1874,10 @@ static void test_rekey_on_insecure_connection_is_noop(void) {
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    connect_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     oft_connection *client_connection = oft_connect(
-            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, NULL, NULL, error_buffer, sizeof(error_buffer));
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(client_connection != NULL);
 
     oft_connection *server_connection = connection_capture_wait(&accepted, 10);
@@ -1845,11 +1891,11 @@ static void test_rekey_on_insecure_connection_is_noop(void) {
     oft_listener_close(listener);
 }
 
-static void test_insecure_hail_is_exchanged_directly_over_raw_tcp(void) {
+static void test_trusted_hail_is_exchanged_directly_over_raw_tcp(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -1901,7 +1947,7 @@ static void test_incompatible_hail_version_rejected(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -1939,7 +1985,7 @@ static void test_malformed_hail_rejected(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
 
     connection_capture accepted;
     connection_capture_init(&accepted);
@@ -1972,7 +2018,7 @@ static void test_peer_eviction_skips_connections_with_pending_inbound_data(void)
     oft_peer_options options;
     memset(&options, 0, sizeof(options));
     options.info = "listener";
-    options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    options.security_mode = OFT_SECURITY_MODE_TRUSTED;
     options.idle_timeout_ms = 100;
     options.eviction_check_interval_ms = 25;
 
@@ -2068,7 +2114,7 @@ static void test_secure_no_ssl_ctx_configured_connection_establishes_and_exchang
     connect_options.security_mode = OFT_SECURITY_MODE_SECURE;
 
     oft_connection *client_connection = oft_connect(
-            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, NULL, NULL, error_buffer, sizeof(error_buffer));
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(client_connection != NULL);
 
     oft_connection *server_connection = connection_capture_wait(&accepted, 10);
@@ -2133,7 +2179,7 @@ static void test_dual_authentication_connect_without_ssl_ctx_fails(void) {
     close(probe_fd);
 
     char error_buffer[256];
-    oft_connection *connection = oft_connect("127.0.0.1", port, &connect_options, NULL, NULL, NULL, error_buffer, sizeof(error_buffer));
+    oft_connection *connection = oft_connect("127.0.0.1", port, &connect_options, NULL, error_buffer, sizeof(error_buffer));
     TEST_ASSERT(connection == NULL);
 }
 
@@ -2162,7 +2208,7 @@ static void test_dual_authentication_both_sides_present_certificates_connection_
 
     oft_connection *client_connection = oft_connect(
             "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, client_ctx,
-            NULL, NULL, error_buffer, sizeof(error_buffer));
+            error_buffer, sizeof(error_buffer));
     TEST_ASSERT(client_connection != NULL);
 
     oft_connection *server_connection = connection_capture_wait(&accepted, 10);
@@ -2201,7 +2247,7 @@ static void test_poll_keeps_idle_connection_alive_beyond_poll_timeout(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
     host_options.poll_interval_ms = 50;
     host_options.poll_timeout_ms = 200;
 
@@ -2216,13 +2262,13 @@ static void test_poll_keeps_idle_connection_alive_beyond_poll_timeout(void) {
     oft_connect_options connect_options;
     memset(&connect_options, 0, sizeof(connect_options));
     connect_options.info = "client";
-    connect_options.security_mode = OFT_SECURITY_MODE_AUTHENTICATION;
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
     connect_options.poll_interval_ms = 50;
     connect_options.poll_timeout_ms = 200;
 
     pair.client_connection = oft_connect(
             "127.0.0.1", (uint16_t)oft_listener_local_port(pair.listener), &connect_options, pair.client_ssl_ctx,
-            NULL, NULL, error_buffer, sizeof(error_buffer));
+            error_buffer, sizeof(error_buffer));
     TEST_ASSERT(pair.client_connection != NULL);
 
     pair.server_connection = connection_capture_wait(&accepted, 10);
@@ -2231,7 +2277,7 @@ static void test_poll_keeps_idle_connection_alive_beyond_poll_timeout(void) {
 
     closed_capture closed;
     closed_capture_init(&closed);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(pair.server_connection, on_closed_capture, &closed) == OFT_OK);
+    oft_connection_set_disconnected_callback(pair.server_connection, on_closed_capture, &closed);
 
     /* No application traffic at all in either direction for well beyond poll_timeout_ms: if the
      * background Poll packets weren't keeping the connection alive, the watchdog would have already
@@ -2251,7 +2297,7 @@ static void test_poll_closes_connection_when_peer_goes_silent(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
     host_options.info = "server";
-    host_options.security_mode = OFT_SECURITY_MODE_INSECURE;
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
     host_options.poll_interval_ms = 50;
     host_options.poll_timeout_ms = 200;
 
@@ -2289,7 +2335,7 @@ static void test_poll_closes_connection_when_peer_goes_silent(void) {
 
     closed_capture closed;
     closed_capture_init(&closed);
-    TEST_ASSERT(oft_connection_add_disconnected_listener(server_connection, on_closed_capture, &closed) == OFT_OK);
+    oft_connection_set_disconnected_callback(server_connection, on_closed_capture, &closed);
 
     /* The raw client above never sends another byte (no Poll, nothing) after the hail: the server
      * side must notice via its liveness watchdog and close on its own. */
@@ -2307,7 +2353,7 @@ int main(void) {
 
     RUN_TEST(test_establish_exchanges_info_as_hail);
     RUN_TEST(test_remote_endpoint_returns_the_peers_actual_address);
-    RUN_TEST(test_remove_disconnected_listener_stops_receiving_notifications);
+    RUN_TEST(test_disconnected_callback_reassigned_to_null_ignores_notification);
     RUN_TEST(test_send_small_message_delivered_as_unit);
     RUN_TEST(test_send_large_message_split_and_reassembled);
     RUN_TEST(test_higher_priority_interrupts_lower_priority);
@@ -2318,7 +2364,7 @@ int main(void) {
     RUN_TEST(test_wait_unknown_message_id_fails);
     RUN_TEST(test_cancel_unknown_message_id_is_a_no_op);
     RUN_TEST(test_remote_endpoint_returns_ipv6_address);
-    RUN_TEST(test_add_disconnected_listener_beyond_max_fails);
+    RUN_TEST(test_disconnected_callback_assigned_after_close_with_none_set_still_receives_it);
     RUN_TEST(test_rekey_from_client);
     RUN_TEST(test_rekey_from_server);
     RUN_TEST(test_rekey_simultaneous_does_not_deadlock);
@@ -2327,9 +2373,10 @@ int main(void) {
     RUN_TEST(test_connect_dns_resolution_failure_fails);
     RUN_TEST(test_host_dns_resolution_failure_fails);
     RUN_TEST(test_host_bind_failure_when_port_already_in_use);
-    RUN_TEST(test_default_options_establish_insecure_connection);
+    RUN_TEST(test_default_options_establish_trusted_connection);
     RUN_TEST(test_connect_handshake_failure_does_not_leak_socket);
-    RUN_TEST(test_connect_on_established_callback_never_misses_a_message_sent_immediately);
+    RUN_TEST(test_connect_received_never_misses_a_message_sent_immediately);
+    RUN_TEST(test_listener_connected_callback_attached_after_accept_still_receives_it);
     RUN_TEST(test_listener_close_does_not_affect_already_accepted_connections);
     RUN_TEST(test_wire_hail_decode_empty_input_fills_defaults);
     RUN_TEST(test_wire_hail_decode_truncated_tag_fails);
@@ -2367,17 +2414,18 @@ int main(void) {
     RUN_TEST(test_peer_disconnect_disconnects_outbound_and_inbound_connections);
     RUN_TEST(test_peer_disconnect_peer_remains_usable_afterward);
     RUN_TEST(test_peer_disconnect_no_connections_does_not_crash);
-    RUN_TEST(test_peer_open_fails_when_authentication_mode_missing_ssl_ctx);
+    RUN_TEST(test_peer_create_server_authentication_mode_fails);
+    RUN_TEST(test_peer_open_fails_when_dual_authentication_mode_missing_ssl_ctx);
     RUN_TEST(test_peer_send_to_unreachable_host_fails);
     RUN_TEST(test_peer_close_called_twice_is_idempotent);
 
-    RUN_TEST(test_host_authentication_mode_without_ssl_ctx_fails);
-    RUN_TEST(test_host_insecure_without_ssl_ctx_succeeds);
+    RUN_TEST(test_host_server_authentication_mode_without_ssl_ctx_fails);
+    RUN_TEST(test_host_trusted_without_ssl_ctx_succeeds);
     RUN_TEST(test_host_close_called_twice_is_idempotent);
     RUN_TEST(test_host_binds_ipv6_loopback);
-    RUN_TEST(test_insecure_connection_establishes_and_exchanges_messages);
-    RUN_TEST(test_rekey_on_insecure_connection_is_noop);
-    RUN_TEST(test_insecure_hail_is_exchanged_directly_over_raw_tcp);
+    RUN_TEST(test_trusted_connection_establishes_and_exchanges_messages);
+    RUN_TEST(test_rekey_on_trusted_connection_is_noop);
+    RUN_TEST(test_trusted_hail_is_exchanged_directly_over_raw_tcp);
     RUN_TEST(test_incompatible_hail_version_rejected);
     RUN_TEST(test_malformed_hail_rejected);
     RUN_TEST(test_peer_eviction_skips_connections_with_pending_inbound_data);

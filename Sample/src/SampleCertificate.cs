@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Sample;
+namespace BlueHeighliner.OpenFrameTransport.Sample;
 
 /// <summary>
 /// Generates a throwaway self-signed certificate so the sample can demonstrate OFT's TLS handshake

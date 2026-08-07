@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class OftPeerTests
 {
@@ -12,7 +12,7 @@ public sealed class OftPeerTests
 
         TrackedListener listener = await TrackedListener.Start(new IPEndPoint(IPAddress.Loopback, 0), serverOptions);
         TaskCompletionSource<IOftConnection> connectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listener.Connected += (_, args) => connectionSource.TrySetResult(args.Connection);
+        listener.OnConnectedExtra = connection => connectionSource.TrySetResult(connection);
         return (listener, connectionSource);
     }
 
@@ -101,7 +101,7 @@ public sealed class OftPeerTests
         await using IOftConnection connection = await connector.Connect("127.0.0.1", listeningPeer.LocalEndPoint!.Port, clientOptions).WaitAsync(OftTestHarness.DefaultTimeout);
 
         TaskCompletionSource<bool> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        connection.Disconnected += (_, _) => closedSource.TrySetResult(true);
+        connection.DisconnectedHandler = _ => closedSource.TrySetResult(true);
 
         await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
     }
@@ -134,15 +134,15 @@ public sealed class OftPeerTests
         await using IOftPeer listeningPeer = CreateListeningPeer();
         await listeningPeer.Open(new IPEndPoint(IPAddress.Loopback, 0));
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listeningPeer.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        listeningPeer.ReceivedHandler = (_, data) => received.TrySetResult(data);
 
         await using IOftPeer caller = CreatePeer();
         byte[] payload = "hello listener"u8.ToArray();
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, payload).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -228,17 +228,21 @@ public sealed class OftPeerTests
         await using IOftPeer listeningPeer = CreateListeningPeer();
         await listeningPeer.Open(new IPEndPoint(IPAddress.Loopback, 0));
 
-        // Subscribed before any message is ever sent: Received buffers every raise until the first
-        // subscriber attaches (see OftBufferedEvent), so subscribing here rather than after the
-        // "hello" send below avoids seeing that earlier, unrelated message instead of the
+        // Assigned before any message is ever sent: ReceivedHandler buffers every raise until the
+        // first non-null assignment (see OftBufferedHandlerSlot), so assigning here rather than
+        // after the "hello" send below avoids seeing that earlier, unrelated message instead of the
         // post-rekey one this test actually cares about.
         byte[] payload = "post-rekey"u8.ToArray();
-        TaskCompletionSource<OftReceivedEventArgs> receivedPostRekey = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listeningPeer.Received += (_, args) =>
+        TaskCompletionSource<IMemoryOwner<byte>> receivedPostRekey = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        listeningPeer.ReceivedHandler = (_, data) =>
         {
-            if (args.Data.Span.SequenceEqual(payload))
+            if (data.Memory.Span.SequenceEqual(payload))
             {
-                receivedPostRekey.TrySetResult(args);
+                receivedPostRekey.TrySetResult(data);
+            }
+            else
+            {
+                data.Dispose();
             }
         };
 
@@ -250,8 +254,8 @@ public sealed class OftPeerTests
 
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, payload).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        OftReceivedEventArgs args = await receivedPostRekey.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await receivedPostRekey.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -273,7 +277,13 @@ public sealed class OftPeerTests
         Assert.Single(remoteListener.Connections);
 
         TaskCompletionSource<bool> closedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        inboundOnServer.Disconnected += (_, _) => closedSource.TrySetResult(true);
+        listener.OnConnectionDisconnectedExtra = (connection, _) =>
+        {
+            if (connection == inboundOnServer)
+            {
+                closedSource.TrySetResult(true);
+            }
+        };
 
         await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
 

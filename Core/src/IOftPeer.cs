@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// A peer-to-peer convenience layer over <see cref="IOftHoster"/>/<see cref="IOftListener"/> and
@@ -18,12 +18,21 @@ public interface IOftPeer : IAsyncDisposable
     IPEndPoint? LocalEndPoint { get; }
 
     /// <summary>
-    /// Raised whenever a complete application message has been received on any connection this
-    /// peer holds. Nothing raised before the first subscriber ever attaches is lost — it's
-    /// delivered to that first subscriber as soon as it attaches (see README.md and
-    /// <c>OftBufferedEvent</c>).
+    /// Called for every message received on any connection this peer holds, both inbound and
+    /// outbound, identifying which one via its <see cref="IOftConnection"/> parameter, with ownership
+    /// of the message's pooled payload — the callback must dispose it (returning its memory to its
+    /// pool) once done with it, e.g. via a <see langword="using"/> statement. <see langword="null"/>
+    /// if no callback is currently assigned. There is only ever one callback at a time — assigning a
+    /// new value here always replaces any previous one, and the same
+    /// buffering-until-first-non-null-assignment guarantee
+    /// <see cref="IOftConnection.ReceivedHandler"/> itself makes applies here too (see README.md).
+    /// The <see cref="IOftConnection"/> passed here is only for replying on the same connection a
+    /// message arrived on — this peer otherwise deliberately exposes no way to enumerate, look up, or
+    /// be notified about the individual connections it holds (e.g. no disconnected notification):
+    /// connection lifecycle is this peer's own implementation detail, transparently managed
+    /// (reconnecting, evicting, etc.) behind <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>.
     /// </summary>
-    event EventHandler<OftReceivedEventArgs>? Received;
+    Action<IOftConnection, IMemoryOwner<byte>>? ReceivedHandler { get; set; }
 
     /// <summary>
     /// Starts listening for inbound connections. A peer that never calls this only ever makes
@@ -34,7 +43,8 @@ public interface IOftPeer : IAsyncDisposable
     /// <exception cref="ArgumentException">
     /// <see cref="OftPeerOptions.ServerCertificate"/> was not set and
     /// <see cref="OftPeerOptions.SecurityMode"/> requires one (see
-    /// <see cref="OftSecurityMode.Authentication"/>/<see cref="OftSecurityMode.DualAuthentication"/>).
+    /// <see cref="OftSecurityMode.DualAuthentication"/> — the only authenticating mode a peer
+    /// supports).
     /// </exception>
     Task Open(IPEndPoint listenEndPoint, CancellationToken cancellationToken = default);
 
@@ -76,7 +86,7 @@ public interface IOftPeer : IAsyncDisposable
     /// <summary>
     /// Requests a TLS 1.3 <c>KeyUpdate</c> (see Docs/OFT.md §8) on every connection this peer
     /// currently holds, both outbound and inbound (a no-op for any held connection established with
-    /// <see cref="OftPeerOptions.SecurityMode"/> set to <see cref="OftSecurityMode.Insecure"/> —
+    /// <see cref="OftPeerOptions.SecurityMode"/> set to <see cref="OftSecurityMode.Trusted"/> —
     /// there is no TLS session to rekey). Connections established after this call is issued are
     /// unaffected.
     /// </summary>

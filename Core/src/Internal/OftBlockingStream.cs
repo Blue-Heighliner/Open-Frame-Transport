@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// Wraps a stream that only really supports synchronous I/O — like the one BouncyCastle's TLS

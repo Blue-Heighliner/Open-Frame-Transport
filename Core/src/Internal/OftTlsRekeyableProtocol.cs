@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// Requests a TLS 1.3 post-handshake <c>KeyUpdate</c> (see Docs/OFT.md §8) on an established

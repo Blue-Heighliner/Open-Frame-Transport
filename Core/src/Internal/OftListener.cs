@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// <inheritdoc cref="IOftListener" />
@@ -9,7 +9,7 @@ internal sealed class OftListener : IOftListener
     private readonly TcpListener listener;
     private readonly CancellationTokenSource acceptLoopCts;
     private readonly Task acceptLoopTask;
-    private readonly OftBufferedEvent<OftConnectedEventArgs> connectedEvent;
+    private readonly OftBufferedHandlerSlot<Action<IOftConnection>> connectedSlot = new();
     private bool disposed;
 
     private OftListener(OftHostOptions options, TcpListener listener, CancellationTokenSource acceptLoopCts)
@@ -17,7 +17,6 @@ internal sealed class OftListener : IOftListener
         this.options = options;
         this.listener = listener;
         this.acceptLoopCts = acceptLoopCts;
-        this.connectedEvent = new OftBufferedEvent<OftConnectedEventArgs>(this);
         this.acceptLoopTask = Task.Run(this.AcceptLoop, CancellationToken.None);
     }
 
@@ -49,10 +48,10 @@ internal sealed class OftListener : IOftListener
     public IPEndPoint LocalEndPoint => (IPEndPoint)this.listener.LocalEndpoint;
 
     /// <inheritdoc />
-    public event EventHandler<OftConnectedEventArgs>? Connected
+    public Action<IOftConnection>? ConnectedHandler
     {
-        add => this.connectedEvent.Subscribe(value);
-        remove => this.connectedEvent.Unsubscribe(value);
+        get => this.connectedSlot.Handler;
+        set => this.connectedSlot.Handler = value;
     }
 
     /// <inheritdoc />
@@ -79,11 +78,11 @@ internal sealed class OftListener : IOftListener
 
         this.acceptLoopCts.Dispose();
 
-        // Nobody will ever subscribe to a disposed listener's events after this point, so a
-        // Connected still buffered for lack of a subscriber would otherwise be held onto forever -
-        // though, unlike OftConnection's Received, OftConnectedEventArgs owns nothing disposable;
-        // this is just consistent cleanup.
-        this.connectedEvent.DisposeBuffered();
+        // Nobody will ever assign a callback to a disposed listener after this point, so a connected
+        // notification still buffered for lack of one would otherwise be held onto forever - though,
+        // unlike OftConnection's received notifications, this owns nothing disposable; this is just
+        // consistent cleanup.
+        this.connectedSlot.DisposeBuffered();
     }
 
     private async Task AcceptLoop()
@@ -117,12 +116,13 @@ internal sealed class OftListener : IOftListener
         {
             OftConnection connection = await OftConnection.EstablishAsServer(tcpClient, this.options, cancellationToken).ConfigureAwait(false);
 
-            // Safe to start processing immediately, before raising Connected: Connected is backed by
-            // OftBufferedEvent, so a Received/Disconnected this connection raises before a caller
-            // reacting to Connected gets a chance to subscribe is buffered rather than lost (see
-            // README.md and OftBufferedEvent's own doc comment).
+            // Safe to start processing immediately, before raising the connected notification: that
+            // notification is backed by OftBufferedHandlerSlot, so a received/disconnected
+            // notification this connection raises before a caller reacting to it gets a chance to
+            // assign its own callbacks is buffered rather than lost (see README.md and
+            // OftBufferedHandlerSlot's own doc comment).
             connection.StartProcessing();
-            this.connectedEvent.Raise(new OftConnectedEventArgs { Connection = connection });
+            this.connectedSlot.Raise(callback => callback(connection));
         }
         catch
         {

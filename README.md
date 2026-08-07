@@ -39,63 +39,137 @@ An Avalonia sample app demonstrating peer-to-peer messaging with simulated netwo
 
 ## API flow
 
-1. **Server side**: host a listener on a local endpoint, and register a handler for accepted
-   connections — inside which you register a handler for received messages on that connection.
-2. **Client side**: connect to a remote host/port, and register a handler for received messages on
+1. **Server side**: host a listener on a local endpoint, and assign a callback for accepted
+   connections — inside which you assign a callback for received messages on that connection.
+2. **Client side**: connect to a remote host/port, and assign a callback for received messages on
    the returned connection.
 3. **Either side** sends messages on any connection it holds, with an optional priority.
 4. **Peer-to-peer**: create a peer, optionally have it also accept inbound connections, and send to
    a host/port directly on the peer — it connects (and caches the connection) the first time and
    reuses it afterward. Messages from every connection the peer holds, inbound or outbound, arrive
-   through one handler registered on the peer itself.
+   through one callback assigned on the peer itself.
 
-**Note:** C#'s events buffer anything raised before their first subscriber, so registering a
-received-message handler any time after getting a connection is always safe. Java and C instead
-guarantee this via an explicit callback invoked *before* a new connection starts processing inbound
-packets — use it (rather than registering afterward) if a peer might reply the instant a connection
-is up. See [Docs/Architecture.md](Docs/Architecture.md#where-a-ports-flow-differs-from-this) for
-this and other per-port flow differences (blocking vs. async calls, single- vs. multi-subscriber
-received notifications).
+All three ports use the same shape: a connection has an independent, single-slot callback for
+received messages and one for disconnection; a listener has one for newly accepted connections; a
+peer has one for messages received on any connection it holds (identifying which one) — a plain
+`Action<T>` property in C#, a `set*Handler(Consumer<T>)` method in Java, a `oft_*_set_*_callback()`
+function taking a function pointer in C. Assigning a new callback always replaces any previous one,
+so exactly one recipient is ever notified of a given message, and each notification kind is assigned
+independently of the others. A peer deliberately has no disconnected or connected callback of its
+own — connection lifecycle is its own implementation detail, transparently managed behind its send
+method.
+
+**Note:** all three ports buffer anything raised before a connection/listener/peer's first callback
+is assigned, so assigning one (received, disconnected, or connected) any time after getting a
+connection or listener is always safe, even if a peer replies the instant a connection is up. See
+[Docs/Architecture.md](Docs/Architecture.md#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
+for details, and for other per-port flow differences (mainly blocking vs. async calls).
 
 ## Getting started
 
-### Client/server (C#)
+### CSharp
+
+#### Client/server
 
 ```csharp
-using OpenFrameTransport;
+using BlueHeighliner.OpenFrameTransport;
 
 // Server
-IOftListener listener = await new OftHoster().Host(
-    new IPEndPoint(IPAddress.Any, 5000),
-    new OftHostOptions { Info = "my-server", SecurityMode = OftSecurityMode.Secure });
-
-listener.Connected += (_, e) =>
-    e.Connection.Received += (_, msg) => Console.WriteLine(Encoding.UTF8.GetString(msg.Data.Span));
+IOftListener listener = await new OftHoster().Host(5000);
+listener.ConnectedHandler = connection => connection.ReceivedHandler = data => Console.WriteLine(Encoding.UTF8.GetString(data.Memory.Span));
 
 // Client
-await using IOftConnection connection = await new OftConnector().Connect(
-    "127.0.0.1", 5000,
-    new OftConnectOptions { Info = "my-client", SecurityMode = OftSecurityMode.Secure });
-
+await using IOftConnection connection = await new OftConnector().Connect("127.0.0.1", 5000);
 await connection.Send(Encoding.UTF8.GetBytes("hello"));
 ```
 
-### Peer-to-peer (C#)
+#### Peer-to-peer
 
 ```csharp
-using OpenFrameTransport;
+using BlueHeighliner.OpenFrameTransport;
 
-IOftPeer peer = new OftPeerFactory(new OftConnector(), new OftHoster())
-    .Create(new OftPeerOptions { Info = "my-peer", SecurityMode = OftSecurityMode.Secure });
-
-peer.Received += (_, msg) => Console.WriteLine(Encoding.UTF8.GetString(msg.Data.Span));
+IOftPeer peer = new OftPeerFactory().Create();
+peer.ReceivedHandler = (connection, data) => Console.WriteLine(Encoding.UTF8.GetString(data.Memory.Span));
 
 await peer.Open(new IPEndPoint(IPAddress.Any, 5001)); // optional: also accept inbound connections
 await peer.Send("127.0.0.1", 5001, Encoding.UTF8.GetBytes("hello"));
 ```
 
+### Java
+
+#### Client/server
+
+```java
+import org.blueheighliner.openframetransport.*;
+
+// Server
+OftListener listener = OftHoster.create().host(5000);
+listener.setConnectedHandler(connection -> connection.setReceivedHandler(data -> System.out.println(new String(data))));
+
+// Client
+OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000);
+connection.send("hello".getBytes(), 0);
+```
+
+#### Peer-to-peer
+
+```java
+import org.blueheighliner.openframetransport.*;
+
+OftPeer peer = OftPeer.create(OftPeerOptions.builder().build());
+peer.setReceivedHandler((connection, data) -> System.out.println(new String(data)));
+
+peer.open(new InetSocketAddress("0.0.0.0", 5001)); // optional: also accept inbound connections
+peer.send("127.0.0.1", 5001, "hello".getBytes(), 0);
+```
+
+### C
+
+#### Client/server
+
+```c
+#include "oft/oft.h"
+
+static void on_received(oft_connection *connection, uint8_t *data, size_t length, void *user_data) {
+    printf("%.*s\n", (int)length, data);
+    free(data); // ownership passes to this callback
+}
+
+static void on_connected(oft_listener *listener, oft_connection *connection, void *user_data) {
+    oft_connection_set_received_callback(connection, on_received, NULL);
+}
+
+char error_buffer[256];
+
+// Server
+oft_listener *listener = oft_host("0.0.0.0", 5000, NULL, NULL, error_buffer, sizeof(error_buffer));
+oft_listener_set_connected_callback(listener, on_connected, NULL);
+
+// Client
+oft_connection *connection = oft_connect("127.0.0.1", 5000, NULL, NULL, error_buffer, sizeof(error_buffer));
+
+uint64_t message_id;
+oft_connection_send(connection, (const uint8_t *)"hello", 5, 0, &message_id);
+```
+
+#### Peer-to-peer
+
+```c
+#include "oft/oft_peer.h"
+
+oft_peer_options options = {0};
+oft_peer *peer = oft_peer_create(&options);
+oft_peer_set_received_callback(peer, on_received, NULL);
+
+char error_buffer[256];
+oft_peer_open(peer, "0.0.0.0", 5001, error_buffer, sizeof(error_buffer)); // optional: also accept inbound connections
+
+uint64_t message_id;
+oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, 0, NULL, &message_id, error_buffer, sizeof(error_buffer));
+```
+
 See [Docs/CSharp.md](Docs/CSharp.md), [Docs/Java.md](Docs/Java.md), and [Docs/C.md](Docs/C.md) for
-the equivalent examples in Java and C, plus security-mode configuration, cancellation, rekeying,
+more detail on each of these examples, plus security-mode configuration, cancellation, rekeying,
 memory ownership, and more.
 
 ## Repository layout

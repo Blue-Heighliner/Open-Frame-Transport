@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Options shared by <see cref="OftHostOptions"/> and <see cref="OftConnectOptions"/> that govern
@@ -24,7 +24,7 @@ public abstract record OftConnectionOptions
     /// When set, the connection automatically rekeys its TLS session (see Docs/OFT.md §8) on this
     /// interval. When <see langword="null"/>, automatic rekeying is disabled and rekeying only
     /// happens when requested manually via <see cref="IOftConnection.Rekey"/>. Ignored when
-    /// <see cref="SecurityMode"/> is <see cref="OftSecurityMode.Insecure"/> — there is no TLS
+    /// <see cref="SecurityMode"/> is <see cref="OftSecurityMode.Trusted"/> — there is no TLS
     /// session to rekey.
     /// </summary>
     public TimeSpan? RekeyInterval { get; init; }

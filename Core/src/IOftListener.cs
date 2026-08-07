@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Listens for and accepts inbound OFT connections on one endpoint. Instances are produced by
@@ -17,11 +17,15 @@ public interface IOftListener : IAsyncDisposable
     IPEndPoint LocalEndPoint { get; }
 
     /// <summary>
-    /// Raised whenever a new inbound connection completes its TLS handshake and hail exchange.
-    /// Nothing raised before the first subscriber ever attaches is lost — it's delivered to that
-    /// first subscriber as soon as it attaches (see README.md and <c>OftBufferedEvent</c>), since
-    /// this listener may accept and establish connections before a caller has had a chance to
-    /// subscribe.
+    /// Called whenever a new inbound connection completes its TLS handshake and hail exchange, or
+    /// <see langword="null"/> if no callback is currently assigned. There is only ever one callback
+    /// at a time — assigning a new value here always replaces any previous one. The first time this
+    /// is ever assigned a non-null value, it is synchronously delivered, in order, every connection
+    /// accepted before that assignment (see README.md), since this listener may accept and establish
+    /// connections before a caller has had a chance to assign a callback. Assigning
+    /// <see langword="null"/> afterward simply discards any connection accepted while no callback is
+    /// assigned (it is not automatically closed, unlike a discarded received message — the caller may
+    /// still reach it later, e.g. by enumerating a peer's tracked connections).
     /// </summary>
-    event EventHandler<OftConnectedEventArgs>? Connected;
+    Action<IOftConnection>? ConnectedHandler { get; set; }
 }

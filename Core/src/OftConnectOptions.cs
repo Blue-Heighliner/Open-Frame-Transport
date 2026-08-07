@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Options for an <see cref="IOftConnector"/> connection.
@@ -15,7 +15,7 @@ public sealed record OftConnectOptions : OftConnectionOptions
     /// <summary>
     /// An optional callback used to validate a connected server's certificate. When
     /// <see langword="null"/>, the default .NET validation is used. Only consulted when
-    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Authentication"/>
+    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.ServerAuthentication"/>
     /// or <see cref="OftSecurityMode.DualAuthentication"/> — under
     /// <see cref="OftSecurityMode.Secure"/>, the server's certificate is accepted unconditionally
     /// regardless of this callback, since it's an ephemeral certificate with nothing meaningful to

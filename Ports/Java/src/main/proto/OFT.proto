@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package oft;
 
-option java_package = "org.openframetransport.proto";
+option java_package = "org.blueheighliner.openframetransport.proto";
 option java_outer_classname = "OftProto";
 option java_multiple_files = true;
 

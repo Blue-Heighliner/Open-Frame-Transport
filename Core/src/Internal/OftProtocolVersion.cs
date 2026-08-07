@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// The OFT protocol version spoken by this implementation, sent as <see cref="Hail.Version"/> in

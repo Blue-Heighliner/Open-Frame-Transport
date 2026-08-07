@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Tests;
+namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class RekeyTests
 {
@@ -9,14 +9,14 @@ public sealed class RekeyTests
 
         await pair.ClientConnection.Rekey().WaitAsync(OftTestHarness.DefaultTimeout);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "post-rekey"u8.ToArray();
         await pair.ClientConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -26,14 +26,14 @@ public sealed class RekeyTests
 
         await pair.ServerConnection.Rekey().WaitAsync(OftTestHarness.DefaultTimeout);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ClientConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "post-rekey-from-server"u8.ToArray();
         await pair.ServerConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -46,14 +46,14 @@ public sealed class RekeyTests
 
         await Task.WhenAll(clientRekey, serverRekey).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "after simultaneous rekey"u8.ToArray();
         await pair.ClientConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -61,8 +61,8 @@ public sealed class RekeyTests
     {
         await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = [.. Enumerable.Repeat((byte)7, 300)];
         Task sendTask = pair.ClientConnection.Send(payload, priority: 1);
@@ -71,8 +71,8 @@ public sealed class RekeyTests
         await pair.ClientConnection.Rekey().WaitAsync(OftTestHarness.DefaultTimeout);
 
         await sendTask.WaitAsync(OftTestHarness.DefaultTimeout);
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]
@@ -82,13 +82,13 @@ public sealed class RekeyTests
 
         await Task.Delay(500);
 
-        TaskCompletionSource<OftReceivedEventArgs> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ServerConnection.Received += (_, args) => received.TrySetResult(args);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
 
         byte[] payload = "still here"u8.ToArray();
         await pair.ClientConnection.Send(payload);
 
-        OftReceivedEventArgs args = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, args.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 }

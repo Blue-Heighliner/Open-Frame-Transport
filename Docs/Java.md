@@ -1,8 +1,7 @@
 # Open Frame Transport — Java
 
 A Java implementation of [OFT](OFT.md) under [`Ports/Java/`](../Ports/Java). See
-[Architecture.md](Architecture.md) for how its components relate to the other ports (notably: the
-`onEstablished` callback pattern used here to avoid a connect-time message-loss race, and the
+[Architecture.md](Architecture.md) for how its components relate to the other ports (notably the
 blocking call style); this document covers the Java-specific API in detail, with examples.
 
 ## Types
@@ -17,18 +16,23 @@ blocking call style); this document covers the Java-specific API in detail, with
 - `OftPeer` / `DefaultOftPeer` — the peer-to-peer convenience layer. `OftPeer.create(OftPeerOptions)`.
 - `OftConnectOptions`, `OftHostOptions`, `OftPeerOptions` — per-role option types, each with a
   `.builder()`.
-- `OftSecurityMode` — `INSECURE` / `SECURE` / `AUTHENTICATION` / `DUAL_AUTHENTICATION` (see
-  [OFT.md §9](OFT.md#9-security-modes)).
-- `OftReceivedListener` — functional interface (`onReceived(OftConnection, byte[])`) for received
-  messages. Disconnection uses a plain `Consumer<Throwable>`; a listener's accepted-connection
-  notification uses a plain `Consumer<OftConnection>`.
+- `OftSecurityMode` — `TRUSTED` / `SECURE` / `SERVER_AUTHENTICATION` / `DUAL_AUTHENTICATION` (see
+  [OFT.md §9](OFT.md#9-security-modes)). `SERVER_AUTHENTICATION` is rejected by
+  `OftPeer.create(OftPeerOptions)` — a peer has no client/server delineation, so use
+  `DUAL_AUTHENTICATION` instead.
+- `OftConnection.setReceivedHandler`/`.setDisconnectedHandler`, `OftListener.setConnectedHandler`,
+  `OftPeer.setReceivedHandler` — single-slot `Consumer<T>`/`BiConsumer<T, U>` callback setters, one
+  per notification kind, assigned directly (no handler-object interface to implement). Assigning a
+  new value (including `null`) always replaces any previous one, and each notification kind is
+  assigned independently of the others. `OftPeer` has no `setDisconnectedHandler`/
+  `setConnectedHandler` of its own — see its own type doc comment for why.
 - `OftSendHandle` — returned by `send`, exposes `completion()` (a `CompletableFuture<Void>`) and
   `cancel()`.
 
 ## Client/server example
 
 ```java
-import org.openframetransport.*;
+import org.blueheighliner.openframetransport.*;
 
 import java.net.InetSocketAddress;
 
@@ -39,8 +43,8 @@ OftHostOptions hostOptions = OftHostOptions.builder()
         .build();
 
 OftListener listener = OftHoster.create().host(new InetSocketAddress("0.0.0.0", 5000), hostOptions);
-listener.addConnectedListener(connection -> {
-    connection.addReceivedListener((conn, data) -> {
+listener.setConnectedHandler(connection -> {
+    connection.setReceivedHandler(data -> {
         System.out.println("Received: " + new String(data));
     });
 });
@@ -59,28 +63,10 @@ connection.send("hello".getBytes(), /* priority */ 0);
 (`connect(host, port)`/`host(listenEndpoint)`) use defaults (`SECURE`, empty `info`, 1 KiB max
 packet size, 1s/5s poll interval/timeout).
 
-### Avoiding the connect-time message-loss race
-
-The plain example above subscribes to `addReceivedListener` *after* `connect`/the connected
-callback already has the connection — safe here because nothing is sent immediately upon
-connecting. If a peer might reply the instant a connection is up, use the `onEstablished`
-overloads instead, which run synchronously before the connection starts processing inbound packets:
-
-```java
-OftConnection connection = OftConnector.create().connect(
-        "127.0.0.1", 5000, connectOptions,
-        established -> established.addReceivedListener((conn, data) -> {
-            System.out.println("Received: " + new String(data));
-        }));
-```
-
-The same pattern applies on the accept side: register listeners inside the connected callback
-(`listener.addConnectedListener(connection -> ...)`), not after the fact, for the same guarantee.
-
 ## Peer-to-peer example
 
 ```java
-import org.openframetransport.*;
+import org.blueheighliner.openframetransport.*;
 
 import java.net.InetSocketAddress;
 
@@ -90,7 +76,7 @@ OftPeerOptions options = OftPeerOptions.builder()
         .build();
 
 OftPeer peer = OftPeer.create(options);
-peer.addReceivedListener((connection, data) -> System.out.println("Received: " + new String(data)));
+peer.setReceivedHandler((connection, data) -> System.out.println("Received: " + new String(data)));
 
 // Optional: also accept inbound connections into the same pool.
 peer.open(new InetSocketAddress("0.0.0.0", 5001));
@@ -100,6 +86,12 @@ peer.send("127.0.0.1", 5001, "hello".getBytes(), /* priority */ 0);
 
 peer.close();
 ```
+
+`OftPeer.setReceivedHandler`'s `connection` argument is only for replying on the same connection a
+message arrived on — a peer deliberately exposes no other way to enumerate, look up, or be notified
+about the individual connections it holds (there is no `setDisconnectedHandler`/
+`setConnectedHandler`): connection lifecycle is the peer's own implementation detail, transparently
+managed (reconnecting, evicting, etc.) behind `send`.
 
 ## Waiting for delivery and cancellation
 
@@ -130,7 +122,7 @@ OftConnectOptions options = OftConnectOptions.builder()
 ```
 
 `rekey()` is a no-op (returns an already-completed future) if the connection was established with
-`OftSecurityMode.INSECURE` — there's no TLS session to rekey. `OftPeer.rekey()`/`.disconnect()` act
+`OftSecurityMode.TRUSTED` — there's no TLS session to rekey. `OftPeer.rekey()`/`.disconnect()` act
 on every connection the peer currently holds, both inbound and outbound, at once.
 
 ## Security modes
@@ -142,21 +134,23 @@ fields — so a single `sslContext()` option covers both roles here:
 ```java
 SSLContext serverContext = ...; // carries your server certificate + private key
 
-// Authentication (one-way TLS): the server presents a real certificate.
+// SERVER_AUTHENTICATION (one-way TLS): the server presents a real certificate.
 OftHostOptions hostOptions = OftHostOptions.builder()
         .info("my-server")
-        .securityMode(OftSecurityMode.AUTHENTICATION)
+        .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
         .sslContext(serverContext)
         .build();
 
 SSLContext clientContext = ...; // configured to trust the server's certificate
 OftConnectOptions connectOptions = OftConnectOptions.builder()
         .info("my-client")
-        .securityMode(OftSecurityMode.AUTHENTICATION)
+        .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
         .sslContext(clientContext) // if omitted, falls back to the JVM's default trust store
         .build();
 
-// DualAuthentication (mutual TLS): the client's SSLContext must also carry its own identity.
+// DUAL_AUTHENTICATION (mutual TLS): the client's SSLContext must also carry its own identity. The
+// only authenticating mode OftPeer supports — SERVER_AUTHENTICATION above is only valid for
+// OftConnector/OftHoster.
 SSLContext mutualClientContext = ...; // carries both a client certificate and trust configuration
 OftConnectOptions mutualOptions = OftConnectOptions.builder()
         .info("my-client")
@@ -165,7 +159,7 @@ OftConnectOptions mutualOptions = OftConnectOptions.builder()
         .build();
 ```
 
-`sslContext()` is required (non-`null`) for `AUTHENTICATION` and `DUAL_AUTHENTICATION`; under
+`sslContext()` is required (non-`null`) for `SERVER_AUTHENTICATION` and `DUAL_AUTHENTICATION`; under
 `SECURE`, a caller-supplied context is accepted but ignored (the accepting side generates its own
 throwaway identity, and the connecting side accepts whatever certificate it's presented with
 unconditionally). See [OFT.md §9](OFT.md#9-security-modes) for the full semantics of each mode.
@@ -175,7 +169,7 @@ unconditionally). See [OFT.md §9](OFT.md#9-security-modes) for the full semanti
 Each connection owns two daemon threads: one blocked reading packets (the receive loop) and one
 draining the outbound priority queues (the send loop). A third daemon thread, on a
 `ScheduledExecutorService`, sends the periodic `Poll` packet and runs the liveness watchdog check
-(see [OFT.md §10](OFT.md#10-liveness-polling)); when `securityMode()` is `OftSecurityMode.INSECURE`,
+(see [OFT.md §10](OFT.md#10-liveness-polling)); when `securityMode()` is `OftSecurityMode.TRUSTED`,
 the connection skips the TLS handshake entirely and reads/writes the plain `Socket` directly.
 
 Connections are pinned to TLS 1.3 (`SSLSocket.setEnabledProtocols(new String[] {"TLSv1.3"})`).

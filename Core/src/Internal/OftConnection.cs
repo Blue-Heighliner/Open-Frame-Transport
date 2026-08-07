@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// <inheritdoc cref="IOftConnection" />
@@ -81,8 +81,8 @@ internal sealed class OftConnection : IOftConnection
     private Task? receiveLoopTask;
     private Task? sendLoopTask;
 
-    private readonly OftBufferedEvent<OftReceivedEventArgs> receivedEvent;
-    private readonly OftBufferedEvent<OftDisconnectedEventArgs> disconnectedEvent;
+    private readonly OftBufferedHandlerSlot<Action<IMemoryOwner<byte>>> receivedSlot = new();
+    private readonly OftBufferedHandlerSlot<Action<Exception?>> disconnectedSlot = new();
 
     private OftConnection(TcpClient tcpClient, NetworkStream networkStream, Stream plaintextStream, IOftTlsRekeyableProtocol? tlsProtocol, OftConnectionOptions options)
     {
@@ -93,8 +93,6 @@ internal sealed class OftConnection : IOftConnection
         this.frameStream = new OftFrameStream(plaintextStream);
         this.options = options;
         this.RemoteInfo = string.Empty;
-        this.receivedEvent = new OftBufferedEvent<OftReceivedEventArgs>(this);
-        this.disconnectedEvent = new OftBufferedEvent<OftDisconnectedEventArgs>(this);
     }
 
     /// <inheritdoc />
@@ -133,29 +131,29 @@ internal sealed class OftConnection : IOftConnection
     }
 
     /// <inheritdoc />
-    public event EventHandler<OftReceivedEventArgs>? Received
+    public Action<IMemoryOwner<byte>>? ReceivedHandler
     {
-        add => this.receivedEvent.Subscribe(value);
-        remove => this.receivedEvent.Unsubscribe(value);
+        get => this.receivedSlot.Handler;
+        set => this.receivedSlot.Handler = value;
     }
 
     /// <inheritdoc />
-    public event EventHandler<OftDisconnectedEventArgs>? Disconnected
+    public Action<Exception?>? DisconnectedHandler
     {
-        add => this.disconnectedEvent.Subscribe(value);
-        remove => this.disconnectedEvent.Unsubscribe(value);
+        get => this.disconnectedSlot.Handler;
+        set => this.disconnectedSlot.Handler = value;
     }
 
     /// <summary>
     /// Dials <paramref name="tcpClient"/>, performs the client-side TLS 1.3 handshake (unless
-    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Insecure"/>) and
+    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Trusted"/>) and
     /// hail exchange against it, and returns the resulting established connection.
     /// </summary>
     internal static async Task<OftConnection> EstablishAsClient(TcpClient tcpClient, string targetHost, OftConnectOptions options, CancellationToken cancellationToken)
     {
         NetworkStream networkStream = tcpClient.GetStream();
 
-        if (options.SecurityMode == OftSecurityMode.Insecure)
+        if (options.SecurityMode == OftSecurityMode.Trusted)
         {
             OftConnection insecureConnection = new(tcpClient, networkStream, networkStream, tlsProtocol: null, options);
             await insecureConnection.CompleteHandshake(cancellationToken).ConfigureAwait(false);
@@ -176,14 +174,14 @@ internal sealed class OftConnection : IOftConnection
 
     /// <summary>
     /// Accepts <paramref name="tcpClient"/>, performs the server-side TLS 1.3 handshake (unless
-    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Insecure"/>) and
+    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Trusted"/>) and
     /// hail exchange against it, and returns the resulting established connection.
     /// </summary>
     internal static async Task<OftConnection> EstablishAsServer(TcpClient tcpClient, OftHostOptions options, CancellationToken cancellationToken)
     {
         NetworkStream networkStream = tcpClient.GetStream();
 
-        if (options.SecurityMode == OftSecurityMode.Insecure)
+        if (options.SecurityMode == OftSecurityMode.Trusted)
         {
             OftConnection insecureConnection = new(tcpClient, networkStream, networkStream, tlsProtocol: null, options);
             await insecureConnection.CompleteHandshake(cancellationToken).ConfigureAwait(false);
@@ -192,7 +190,7 @@ internal sealed class OftConnection : IOftConnection
 
         // By this point ServerCertificate is always resolved: for Secure mode, IOftListener.Start
         // has already replaced it with a listener-lifetime ephemeral certificate; for
-        // Authentication/DualAuthentication, IOftHoster.Host has already validated the caller
+        // ServerAuthentication/DualAuthentication, IOftHoster.Host has already validated the caller
         // supplied a real one.
         X509Certificate2 serverCertificate = options.ServerCertificate!;
 
@@ -316,7 +314,7 @@ internal sealed class OftConnection : IOftConnection
             }
             catch
             {
-                // The receive loop's failure is already surfaced via the Disconnected event.
+                // The receive loop's failure is already surfaced via DisconnectedHandler.
             }
         }
 
@@ -328,7 +326,7 @@ internal sealed class OftConnection : IOftConnection
             }
             catch
             {
-                // The send loop's failure is already surfaced via the Disconnected event.
+                // The send loop's failure is already surfaced via DisconnectedHandler.
             }
         }
     }
@@ -361,12 +359,12 @@ internal sealed class OftConnection : IOftConnection
 
     /// <summary>
     /// Starts this connection's background work: the receive loop (which begins delivering inbound
-    /// activity to <see cref="Received"/> subscribers), the send loop, and (if configured) the
-    /// automatic rekey timer. Safe to call immediately after establishment, regardless of whether a
-    /// caller has subscribed to <see cref="Received"/>/<see cref="Disconnected"/> yet: both are
-    /// backed by <see cref="OftBufferedEvent{TEventArgs}"/>, which buffers any raise that happens
-    /// before the first subscriber attaches rather than discarding it (see its own doc comment), so
-    /// there is no ordering requirement between starting processing and a caller subscribing.
+    /// activity to <see cref="ReceivedHandler"/>/<see cref="DisconnectedHandler"/>), the send loop, and
+    /// (if configured) the automatic rekey timer. Safe to call immediately after establishment,
+    /// regardless of whether a caller has assigned either callback yet: both are backed by
+    /// <see cref="OftBufferedHandlerSlot{TDelegate}"/>, which buffers any raise that happens before
+    /// the first non-null assignment rather than discarding it (see its own doc comment), so there is
+    /// no ordering requirement between starting processing and a caller assigning a callback.
     /// </summary>
     internal void StartProcessing()
     {
@@ -580,8 +578,7 @@ internal sealed class OftConnection : IOftConnection
         switch (packet.Control)
         {
             case 1:
-                (ReadOnlyMemory<byte> unitData, IMemoryOwner<byte>? unitOwner) = RentAndCopy(packet.Data.Span);
-                this.RaiseReceived(unitData, unitOwner);
+                this.RaiseReceived(RentAndCopy(packet.Data.Span));
                 break;
             case 2:
                 this.CompleteInboundMessage(packet.Data.Memory, cancelled: false);
@@ -636,46 +633,51 @@ internal sealed class OftConnection : IOftConnection
         }
 
         int totalLength = buffer.Sum(chunk => chunk.Length);
-        IMemoryOwner<byte>? owner = totalLength > 0 ? MemoryPool<byte>.Shared.Rent(totalLength) : null;
-        Memory<byte> message = owner is null ? Memory<byte>.Empty : owner.Memory[..totalLength];
+        IMemoryOwner<byte> owner = Rent(totalLength);
         int offset = 0;
         foreach (ReadOnlyMemory<byte> chunk in buffer)
         {
-            chunk.Span.CopyTo(message.Span[offset..]);
+            chunk.Span.CopyTo(owner.Memory.Span[offset..]);
             offset += chunk.Length;
         }
 
-        this.RaiseReceived(message, owner);
+        this.RaiseReceived(owner);
     }
 
     /// <summary>
+    /// Rents pooled memory sized to exactly <paramref name="length"/> bytes, even when
+    /// <paramref name="length"/> is 0: <see cref="ReceivedHandler"/>/<see cref="IOftPeer.ReceivedHandler"/>
+    /// always receive a non-null <see cref="IMemoryOwner{T}"/>, so there is no separate "no pooled
+    /// memory" case for an empty message to special-case. A pool's rental may be larger than
+    /// requested (e.g. rounded up to a bucket size), so this wraps it in
+    /// <see cref="OftSlicedMemoryOwner"/> to expose exactly <paramref name="length"/> bytes via
+    /// <see cref="IMemoryOwner{T}.Memory"/> while still returning the whole rental to its pool on
+    /// <see cref="IDisposable.Dispose"/>.
+    /// </summary>
+    private static IMemoryOwner<byte> Rent(int length) => new OftSlicedMemoryOwner(MemoryPool<byte>.Shared.Rent(length), length);
+
+    /// <summary>
     /// Rents pooled memory sized to <paramref name="source"/> and copies it in, so the caller can
-    /// hand ownership of the copy off to <see cref="OftReceivedEventArgs"/> without holding onto (or
+    /// hand ownership of the copy off to <see cref="ReceivedHandler"/> without holding onto (or
     /// needing to keep alive) whatever <paramref name="source"/> was a view over.
     /// </summary>
-    private static (ReadOnlyMemory<byte> Data, IMemoryOwner<byte>? Owner) RentAndCopy(ReadOnlySpan<byte> source)
+    private static IMemoryOwner<byte> RentAndCopy(ReadOnlySpan<byte> source)
     {
-        if (source.Length == 0)
-        {
-            return (ReadOnlyMemory<byte>.Empty, null);
-        }
-
-        IMemoryOwner<byte> owner = MemoryPool<byte>.Shared.Rent(source.Length);
+        IMemoryOwner<byte> owner = Rent(source.Length);
         source.CopyTo(owner.Memory.Span);
-        return (owner.Memory[..source.Length], owner);
+        return owner;
     }
 
-    private void RaiseReceived(ReadOnlyMemory<byte> data, IMemoryOwner<byte>? owner) =>
-        this.receivedEvent.Raise(new OftReceivedEventArgs { Data = data, Owner = owner });
+    private void RaiseReceived(IMemoryOwner<byte> data) =>
+        this.receivedSlot.Raise(callback => callback(data), discardedDisposable: data);
 
     /// <summary>
     /// Fires on every <see cref="OftConnectionOptions.PollInterval"/> tick (see Docs/OFT.md §10):
     /// sends a best-effort <c>Poll</c> packet, then closes the connection if nothing at all has
     /// been received from the peer within <see cref="OftConnectionOptions.PollTimeout"/>. Rekeying
     /// (see Docs/OFT.md §8) is a TLS-layer operation, invisible to and never coordinated with this
-    /// packet-level write — unlike the old session-replacing rekey design, there's no window during
-    /// which writing a packet here could corrupt anything, so this never needs to wait for
-    /// <see cref="writePermit"/>.
+    /// packet-level write — there's no window during which writing a packet here could corrupt
+    /// anything, so this never needs to wait for <see cref="writePermit"/>.
     /// </summary>
     private async Task OnPollTimerTick()
     {
@@ -755,13 +757,13 @@ internal sealed class OftConnection : IOftConnection
             // Best-effort cleanup.
         }
 
-        this.disconnectedEvent.Raise(new OftDisconnectedEventArgs { Exception = exception });
+        this.disconnectedSlot.Raise(callback => callback(exception));
 
-        // Nobody will ever subscribe to a closed connection's events after this point, so any raise
-        // still buffered for lack of a subscriber (most relevantly a Received carrying pooled
-        // memory) would otherwise be held onto forever instead of being released.
-        this.receivedEvent.DisposeBuffered();
-        this.disconnectedEvent.DisposeBuffered();
+        // Nobody will ever assign a callback to a closed connection after this point, so any raise
+        // still buffered for lack of one (most relevantly a received message carrying pooled memory)
+        // would otherwise be held onto forever instead of being released.
+        this.receivedSlot.DisposeBuffered();
+        this.disconnectedSlot.DisposeBuffered();
     }
 
     private void UpdateLastSentAt() => Interlocked.Exchange(ref this.lastSentAtTicks, NowTicks());

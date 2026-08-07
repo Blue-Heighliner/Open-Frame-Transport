@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// Bridges between .NET's <see cref="X509Certificate2"/>-based certificate/key representation (used

@@ -1,6 +1,7 @@
 #include "oft/oft.h"
 #include "oft_connection_internal.h"
 #include "oft_ephemeral_ssl_ctx.h"
+#include "oft_event_buffer.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -19,6 +20,17 @@ typedef struct {
     int fd;
 } oft_accept_task;
 
+typedef struct {
+    oft_listener *listener;
+    oft_connection *connection;
+} oft_connected_buffer_item;
+
+/* The dispatch target attached to connected_buffer below. */
+typedef struct {
+    oft_connected_callback callback;
+    void *user_data;
+} oft_connected_target;
+
 struct oft_listener {
     oft_host_options options;
     char *info_copy;
@@ -32,11 +44,38 @@ struct oft_listener {
     uint16_t local_port;
     pthread_t accept_thread;
 
-    pthread_mutex_t lock;
-    oft_connected_callback connected_callback;
-    void *connected_callback_user_data;
+    /* Holds every accepted connection until oft_listener_set_connected_callback() is first called
+     * with a non-NULL callback, then flushes that backlog to it before becoming its live target -
+     * see oft_event_buffer's own doc comment. This is what makes calling
+     * oft_listener_set_connected_callback() after oft_host() already returned the listener always
+     * safe, with no accept-before-subscribe race to guard against. connected_target is the live
+     * target attached to connected_buffer - embedded rather than heap-allocated since there is only
+     * ever one at a time. */
+    oft_event_buffer connected_buffer;
+    oft_connected_target connected_target;
+
     int closed;
 };
+
+/* Discards (by closing) an accepted connection nobody ever assigned a callback to receive - matches
+ * oft_event_buffer's own "discard on destroy" contract. */
+static void free_connected_buffer_item(void *item) {
+    oft_connected_buffer_item *accepted = item;
+    oft_connection_close(accepted->connection);
+    free(accepted);
+}
+
+static void dispatch_connected_buffer_item(void *user_data, void *item) {
+    oft_connected_target *target = user_data;
+    oft_connected_buffer_item *accepted = item;
+    if (target->callback) {
+        target->callback(accepted->listener, accepted->connection, target->user_data);
+    } else {
+        oft_connection_close(accepted->connection);
+    }
+
+    free(accepted);
+}
 
 /* Runs on a short-lived, detached thread per accepted connection so a slow TLS handshake from one
  * peer never delays accepting the next. */
@@ -53,19 +92,22 @@ static void *handle_accepted(void *arg) {
         return NULL;
     }
 
-    pthread_mutex_lock(&listener->lock);
-    oft_connected_callback callback = listener->connected_callback;
-    void *user_data = listener->connected_callback_user_data;
-    pthread_mutex_unlock(&listener->lock);
+    /* Safe to start processing immediately, before raising the connected notification below:
+     * connected_buffer buffers it, so a caller reacting to it - even one that hasn't called
+     * oft_connection_set_received_callback()/oft_connection_set_disconnected_callback() on it yet -
+     * never misses this connection's own buffered received/disconnected notifications either (see
+     * oft_connection's received_buffer/disconnected_buffer). */
+    oft_connection_start_processing(connection);
 
-    if (callback) {
-        callback(listener, connection, user_data);
+    oft_connected_buffer_item *item = malloc(sizeof(oft_connected_buffer_item));
+    if (!item) {
+        oft_connection_close(connection);
+        return NULL;
     }
 
-    /* Started only now, after the connected callback above has had a chance to attach its own
-     * received callback: starting any earlier risks the receive loop delivering (and discarding,
-     * for lack of a callback) this connection's first inbound message before that ever happens. */
-    oft_connection_start_processing(connection);
+    item->listener = listener;
+    item->connection = connection;
+    oft_event_buffer_raise(&listener->connected_buffer, item);
 
     return NULL;
 }
@@ -152,11 +194,11 @@ oft_listener *oft_host(
     options = resolve_options(options, &defaults);
 
     int owns_ssl_ctx = 0;
-    if (options->security_mode == OFT_SECURITY_MODE_AUTHENTICATION || options->security_mode == OFT_SECURITY_MODE_DUAL_AUTHENTICATION) {
+    if (options->security_mode == OFT_SECURITY_MODE_SERVER_AUTHENTICATION || options->security_mode == OFT_SECURITY_MODE_DUAL_AUTHENTICATION) {
         if (!ssl_ctx) {
             if (error_buffer) {
                 snprintf(error_buffer, error_buffer_size,
-                         "ssl_ctx is required when security_mode is OFT_SECURITY_MODE_AUTHENTICATION or OFT_SECURITY_MODE_DUAL_AUTHENTICATION");
+                         "ssl_ctx is required when security_mode is OFT_SECURITY_MODE_SERVER_AUTHENTICATION or OFT_SECURITY_MODE_DUAL_AUTHENTICATION");
             }
 
             return NULL;
@@ -197,7 +239,7 @@ oft_listener *oft_host(
     listener->ssl_ctx = ssl_ctx;
     listener->owns_ssl_ctx = owns_ssl_ctx;
     listener->listen_fd = -1;
-    pthread_mutex_init(&listener->lock, NULL);
+    oft_event_buffer_init(&listener->connected_buffer, free_connected_buffer_item);
 
     char port_str[16];
     snprintf(port_str, sizeof(port_str), "%u", (unsigned)bind_port);
@@ -288,10 +330,9 @@ int oft_listener_local_port(oft_listener *listener) {
 }
 
 void oft_listener_set_connected_callback(oft_listener *listener, oft_connected_callback callback, void *user_data) {
-    pthread_mutex_lock(&listener->lock);
-    listener->connected_callback = callback;
-    listener->connected_callback_user_data = user_data;
-    pthread_mutex_unlock(&listener->lock);
+    listener->connected_target.callback = callback;
+    listener->connected_target.user_data = user_data;
+    oft_event_buffer_attach(&listener->connected_buffer, callback ? dispatch_connected_buffer_item : NULL, &listener->connected_target);
 }
 
 void oft_listener_close(oft_listener *listener) {
@@ -313,7 +354,9 @@ void oft_listener_close(oft_listener *listener) {
         close(listener->wakeup_pipe[1]);
     }
 
-    pthread_mutex_destroy(&listener->lock);
+    /* Safe now: the accept thread (the only thread that ever raises onto connected_buffer) has
+     * fully exited, or was never started. */
+    oft_event_buffer_destroy(&listener->connected_buffer);
 
     if (listener->owns_ssl_ctx) {
         SSL_CTX_free(listener->ssl_ctx);

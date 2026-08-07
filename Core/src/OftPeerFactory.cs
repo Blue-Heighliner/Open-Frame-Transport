@@ -1,10 +1,10 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Creates <see cref="IOftPeer"/> instances. Registered for dependency injection by convention
 /// (see <see cref="OpenFrameTransportServiceCollectionExtensions"/>); construct
-/// <see cref="OftPeerFactory"/> directly (with an <see cref="OftConnector"/> and
-/// <see cref="OftHoster"/>) when not using an IoC container.
+/// <see cref="OftPeerFactory"/> directly — with its parameterless constructor, or with a custom
+/// <see cref="IOftConnector"/>/<see cref="IOftHoster"/> — when not using an IoC container.
 /// </summary>
 public interface IOftPeerFactory
 {
@@ -16,6 +16,11 @@ public interface IOftPeerFactory
     /// <see cref="OftPeerOptions.Info"/>) are used.
     /// </param>
     /// <returns>The new peer.</returns>
+    /// <exception cref="ArgumentException">
+    /// <see cref="OftPeerOptions.SecurityMode"/> is <see cref="OftSecurityMode.ServerAuthentication"/> — not a
+    /// valid mode for a peer, which has no client/server delineation and so cannot express a
+    /// one-sided authentication requirement (use <see cref="OftSecurityMode.DualAuthentication"/> instead).
+    /// </exception>
     IOftPeer Create(OftPeerOptions? options = null);
 }
 
@@ -26,6 +31,18 @@ public sealed class OftPeerFactory : IOftPeerFactory
 {
     private readonly IOftConnector connector;
     private readonly IOftHoster hoster;
+
+    /// <summary>
+    /// Creates a peer factory that builds its peers' outbound/inbound connections with a plain
+    /// <see cref="OftConnector"/>/<see cref="OftHoster"/> — equivalent to
+    /// <see cref="OftPeerFactory(IOftConnector, IOftHoster)"/> called with
+    /// <c>new OftConnector()</c>/<c>new OftHoster()</c>, for callers that don't need a custom
+    /// connector/hoster (e.g. via an IoC container) and would rather not construct them by hand.
+    /// </summary>
+    public OftPeerFactory()
+        : this(new OftConnector(), new OftHoster())
+    {
+    }
 
     /// <summary>
     /// Creates a peer factory that builds its peers' outbound/inbound connections with the given
@@ -43,6 +60,15 @@ public sealed class OftPeerFactory : IOftPeerFactory
     public IOftPeer Create(OftPeerOptions? options = null)
     {
         options ??= new OftPeerOptions { Info = string.Empty };
+
+        if (options.SecurityMode == OftSecurityMode.ServerAuthentication)
+        {
+            throw new ArgumentException(
+                $"{nameof(OftSecurityMode.ServerAuthentication)} is not a valid {nameof(OftConnectionOptions.SecurityMode)} for an " +
+                $"{nameof(IOftPeer)}: a peer has no client/server delineation, so it cannot express a one-sided authentication " +
+                $"requirement. Use {nameof(OftSecurityMode.DualAuthentication)} instead.",
+                nameof(options));
+        }
 
         OftConnectOptions connectOptions = new()
         {

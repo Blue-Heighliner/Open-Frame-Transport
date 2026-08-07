@@ -1,4 +1,4 @@
-namespace OpenFrameTransport;
+namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
 /// Options for an <see cref="IOftPeer"/>. TLS 1.3 is the only protocol version ever negotiated (see
@@ -15,8 +15,9 @@ public sealed record OftPeerOptions
     /// <summary>
     /// The certificate the peer authenticates itself with when accepting an inbound connection.
     /// Required to call <see cref="IOftPeer.Open(IPEndPoint, CancellationToken)"/> when
-    /// <see cref="SecurityMode"/> is <see cref="OftSecurityMode.Authentication"/> or
-    /// <see cref="OftSecurityMode.DualAuthentication"/>; unused otherwise.
+    /// <see cref="SecurityMode"/> is <see cref="OftSecurityMode.DualAuthentication"/> (the only
+    /// authenticating mode a peer supports — see <see cref="OftSecurityMode.ServerAuthentication"/>);
+    /// unused otherwise.
     /// </summary>
     public X509Certificate2? ServerCertificate { get; init; }
 
@@ -28,14 +29,16 @@ public sealed record OftPeerOptions
 
     /// <summary>
     /// When set, every connection automatically rekeys its TLS session (see Docs/OFT.md §8) on this
-    /// interval. Ignored when <see cref="SecurityMode"/> is <see cref="OftSecurityMode.Insecure"/>.
+    /// interval. Ignored when <see cref="SecurityMode"/> is <see cref="OftSecurityMode.Trusted"/>.
     /// </summary>
     public TimeSpan? RekeyInterval { get; init; }
 
     /// <summary>
     /// How this peer's connections use TLS (see <see cref="OftSecurityMode"/>). Defaults to
     /// <see cref="OftSecurityMode.Secure"/> — encrypted, but with no authentication of either side's
-    /// identity.
+    /// identity. <see cref="OftSecurityMode.ServerAuthentication"/> is not a valid value here — see
+    /// its own documentation for why — and <see cref="IOftPeerFactory.Create(OftPeerOptions?)"/>
+    /// throws if it's set.
     /// </summary>
     public OftSecurityMode SecurityMode { get; init; } = OftSecurityMode.Secure;
 
@@ -63,7 +66,7 @@ public sealed record OftPeerOptions
     /// An optional callback used to validate the peer's certificate on either an outbound
     /// connection's server or an inbound connection's client. When <see langword="null"/>, the
     /// default .NET validation is used. Only consulted when <see cref="SecurityMode"/> is
-    /// <see cref="OftSecurityMode.Authentication"/> or <see cref="OftSecurityMode.DualAuthentication"/>.
+    /// <see cref="OftSecurityMode.DualAuthentication"/>.
     /// </summary>
     public RemoteCertificateValidationCallback? CertificateValidation { get; init; }
 

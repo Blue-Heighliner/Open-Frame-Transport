@@ -1,4 +1,4 @@
-namespace OpenFrameTransport.Internal;
+namespace BlueHeighliner.OpenFrameTransport.Internal;
 
 /// <summary>
 /// Generates a throwaway self-signed certificate for <see cref="OftSecurityMode.Secure"/>, where the
