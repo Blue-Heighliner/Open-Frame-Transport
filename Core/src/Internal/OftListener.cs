@@ -5,19 +5,18 @@ namespace BlueHeighliner.OpenFrameTransport.Internal;
 /// </summary>
 internal sealed class OftListener : IOftListener
 {
-    private readonly OftHostOptions options;
+    private readonly OftConnectionOptions options;
     private readonly TcpListener listener;
     private readonly CancellationTokenSource acceptLoopCts;
-    private readonly Task acceptLoopTask;
     private readonly OftBufferedHandlerSlot<Action<IOftConnection>> connectedSlot = new();
     private bool disposed;
 
-    private OftListener(OftHostOptions options, TcpListener listener, CancellationTokenSource acceptLoopCts)
+    private OftListener(OftConnectionOptions options, TcpListener listener, CancellationTokenSource acceptLoopCts)
     {
         this.options = options;
         this.listener = listener;
         this.acceptLoopCts = acceptLoopCts;
-        this.acceptLoopTask = Task.Run(this.AcceptLoop, CancellationToken.None);
+        _ = Task.Run(this.AcceptLoop, CancellationToken.None);
     }
 
     /// <summary>
@@ -26,7 +25,7 @@ internal sealed class OftListener : IOftListener
     /// <param name="options">The options used to accept every connection.</param>
     /// <param name="listenEndPoint">The local endpoint to listen for incoming TCP connections on.</param>
     /// <param name="cancellationToken">A token that stops the listener when cancelled.</param>
-    internal static OftListener Start(OftHostOptions options, IPEndPoint listenEndPoint, CancellationToken cancellationToken)
+    internal static OftListener Start(OftConnectionOptions options, IPEndPoint listenEndPoint, CancellationToken cancellationToken)
     {
         // Resolved once per listener rather than per accepted connection: nothing validates this
         // certificate under Secure mode, so one throwaway certificate reused for the listener's
@@ -34,7 +33,7 @@ internal sealed class OftListener : IOftListener
         // every single inbound connection.
         if (options.SecurityMode == OftSecurityMode.Secure)
         {
-            options = options with { ServerCertificate = OftEphemeralCertificate.Create() };
+            options = options with { Certificate = OftEphemeralCertificate.Create() };
         }
 
         TcpListener listener = new(listenEndPoint);
@@ -54,8 +53,12 @@ internal sealed class OftListener : IOftListener
         set => this.connectedSlot.Handler = value;
     }
 
-    /// <inheritdoc />
-    public async ValueTask DisposeAsync()
+    /// <summary>
+    /// Immediately and synchronously stops listening and releases this listener's resources, without
+    /// waiting for its background accept loop to actually finish running, which happens shortly
+    /// afterward on its own.
+    /// </summary>
+    public void Dispose()
     {
         if (this.disposed)
         {
@@ -64,19 +67,12 @@ internal sealed class OftListener : IOftListener
 
         this.disposed = true;
 
-        await this.acceptLoopCts.CancelAsync().ConfigureAwait(false);
+        this.acceptLoopCts.Cancel();
         this.listener.Stop();
 
-        try
-        {
-            await this.acceptLoopTask.ConfigureAwait(false);
-        }
-        catch
-        {
-            // Expected during shutdown.
-        }
-
-        this.acceptLoopCts.Dispose();
+        // acceptLoopCts is deliberately never disposed here: AcceptLoop may still be unwinding (see
+        // its own catch blocks) and could still be touching its token by the time this returns, so
+        // disposing it here could race with that - it's cheap enough to just leave for the GC.
 
         // Nobody will ever assign a callback to a disposed listener after this point, so a connected
         // notification still buffered for lack of one would otherwise be held onto forever - though,
@@ -102,11 +98,11 @@ internal sealed class OftListener : IOftListener
         }
         catch (ObjectDisposedException)
         {
-            // Expected when DisposeAsync() closes the listener while a call to AcceptTcpClientAsync is pending.
+            // Expected when Dispose() closes the listener while a call to AcceptTcpClientAsync is pending.
         }
         catch (SocketException)
         {
-            // Expected when DisposeAsync() closes the listener while a call to AcceptTcpClientAsync is pending.
+            // Expected when Dispose() closes the listener while a call to AcceptTcpClientAsync is pending.
         }
     }
 

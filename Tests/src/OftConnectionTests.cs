@@ -5,7 +5,7 @@ public sealed class OftConnectionTests
     [Fact]
     public async Task Rekey_CalledTwiceOnSameConnection_BothComplete()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         Task rekey1 = pair.ClientConnection.Rekey();
         Task rekey2 = pair.ClientConnection.Rekey();
@@ -16,7 +16,7 @@ public sealed class OftConnectionTests
     [Fact]
     public async Task Disconnect_WithQueuedUnsentMessages_CancelsThem()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         Task task1 = pair.ClientConnection.Send("a"u8.ToArray());
         Task task2 = pair.ClientConnection.Send("b"u8.ToArray());
@@ -32,7 +32,7 @@ public sealed class OftConnectionTests
     [Fact]
     public async Task Send_NegativePriority_Throws()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => pair.ClientConnection.Send("hi"u8.ToArray(), priority: -1));
     }
@@ -40,25 +40,60 @@ public sealed class OftConnectionTests
     [Fact]
     public async Task Send_AfterDisconnect_Throws()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
         await pair.ClientConnection.Disconnect();
 
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => pair.ClientConnection.Send("hi"u8.ToArray()));
+        await Assert.ThrowsAsync<OftDisconnectedException>(() => pair.ClientConnection.Send("hi"u8.ToArray()));
     }
 
     [Fact]
     public async Task Disconnect_CalledTwice_IsIdempotent()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         await pair.ClientConnection.Disconnect();
         await pair.ClientConnection.Disconnect();
     }
 
     [Fact]
+    public async Task Rekey_AfterDisconnect_Throws()
+    {
+        using OftPair pair = await OftTestHarness.Establish();
+        await pair.ClientConnection.Disconnect();
+
+        await Assert.ThrowsAsync<OftDisconnectedException>(() => pair.ClientConnection.Rekey());
+    }
+
+    [Fact]
+    public async Task IsConnected_TrueUntilDisconnected()
+    {
+        using OftPair pair = await OftTestHarness.Establish();
+
+        Assert.True(pair.ClientConnection.IsConnected);
+
+        await pair.ClientConnection.Disconnect();
+
+        Assert.False(pair.ClientConnection.IsConnected);
+    }
+
+    [Fact]
+    public async Task IsConnected_FalseAfterRemoteDisconnect()
+    {
+        using OftPair pair = await OftTestHarness.Establish();
+
+        TaskCompletionSource<bool> disconnectedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.DisconnectedHandler = _ => disconnectedSource.TrySetResult(true);
+
+        await pair.ServerConnection.Disconnect();
+        await disconnectedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+
+        Assert.False(pair.ClientConnection.IsConnected);
+    }
+
+    [Fact]
     public async Task Received_HandlerReassignedToNull_IgnoresFutureNotifications()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         int invocationCount = 0;
         pair.ServerConnection.ReceivedHandler = _ => invocationCount++;
@@ -79,7 +114,7 @@ public sealed class OftConnectionTests
     [Fact]
     public async Task Disconnected_HandlerReassignedToNull_IgnoresNotification()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         int invocationCount = 0;
         pair.ServerConnection.DisconnectedHandler = _ => invocationCount++;

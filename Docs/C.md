@@ -24,8 +24,24 @@ This port targets Linux/POSIX and depends only on OpenSSL and pthreads.
   `_DUAL_AUTHENTICATION` instead.
 - `oft_received_callback`, `oft_disconnected_callback`, `oft_connected_callback` — function-pointer
   callback types.
+- `oft_connection_validation_callback` — an optional post-handshake connection-validation callback,
+  settable on `oft_connect_options`/`oft_host_options`/`oft_peer_options` (see
+  [Security modes](#security-modes) below).
+- `oft_identity` — this connection's remote identity: `host`/`port`, `certificate` (an
+  `oft_certificate_identity *`, or `NULL` if the remote side didn't present one), and `info` (the
+  opaque hail data). Returned (borrowed, valid until the connection closes) by
+  `oft_connection_identity()`.
+- `oft_certificate_identity` — `name`/`issuer` (the Common Name of a certificate's subject/issuer)
+  and `alternative_names`/`alternative_name_count`, extracted from the certificate presented during
+  a TLS handshake.
+- `oft_peer_reception` — an opaque handle for the value delivered to `oft_peer_received_callback`,
+  read via `oft_peer_reception_data()`/`_length()` (the message payload) and `_identity()` (an
+  independent snapshot of the sending connection's `oft_identity`, safe to use even after that
+  connection later disconnects). Freed via `oft_peer_reception_free()`.
 - `oft_send_handle`-equivalent: `oft_connection_send()` writes a `uint64_t` message id out-parameter,
   used with `oft_connection_wait()`/`oft_connection_cancel()` instead of a returned handle object.
+- `oft_connection_is_connected()` — non-zero until the connection permanently closes, for any reason
+  (local or remote), after which `oft_connection_send()`/`_rekey()` return `OFT_ERROR_CLOSED`.
 
 ## Client/server example
 
@@ -88,21 +104,52 @@ int main(void) {
 `options` may be `NULL` on both `oft_connect()`/`oft_host()` to use defaults (`OFT_SECURITY_MODE_SECURE`,
 empty `info`, 1 KiB max packet size, 1000ms/5000ms poll interval/timeout).
 
+## Remote identity
+
+```c
+const oft_identity *identity = oft_connection_identity(connection);
+printf("Remote endpoint: %s:%u\n", identity->host, identity->port);
+printf("Hail info: %s\n", identity->info);
+
+if (identity->certificate) {
+    const oft_certificate_identity *certificate = identity->certificate;
+    printf("Certificate subject CN: %s\n", certificate->name ? certificate->name : "(none)");
+    printf("Certificate issuer CN: %s\n", certificate->issuer ? certificate->issuer : "(none)");
+    for (size_t i = 0; i < certificate->alternative_name_count; i++) {
+        printf("Certificate SAN: %s\n", certificate->alternative_names[i]);
+    }
+}
+```
+
+`identity->certificate` is `NULL` for a connection established with `OFT_SECURITY_MODE_TRUSTED` (no
+TLS at all), and also `NULL` on the accepting side of a connection established under a mode that
+never requests a certificate from the connecting side (see `OFT_SECURITY_MODE_DUAL_AUTHENTICATION`).
+`oft_connection_identity()`'s return value is owned by the connection and only valid until it's
+closed — unlike `oft_peer_reception_identity()`'s return value below, which is an independent copy.
+
 ## Peer-to-peer example
 
 ```c
 #include "oft/oft_peer.h"
+
+static void on_peer_received(oft_peer_reception *reception, void *user_data) {
+    (void)user_data;
+    const oft_identity *identity = oft_peer_reception_identity(reception);
+    printf("Received from %s:%u: %.*s\n", identity->host, identity->port,
+           (int)oft_peer_reception_length(reception), oft_peer_reception_data(reception));
+    oft_peer_reception_free(reception); /* also frees its payload and identity */
+}
 
 oft_peer_options options = {0};
 options.info = "my-peer";
 options.security_mode = OFT_SECURITY_MODE_SECURE;
 
 oft_peer *peer = oft_peer_create(&options);
-oft_peer_set_received_callback(peer, on_received, NULL);
+oft_peer_set_received_callback(peer, on_peer_received, NULL);
 
 /* Optional: also accept inbound connections into the same pool. */
 char error_buffer[256];
-oft_peer_open(peer, "0.0.0.0", 5001, error_buffer, sizeof(error_buffer));
+oft_peer_listen(peer, "0.0.0.0", 5001, error_buffer, sizeof(error_buffer));
 
 /* Sending to a host:port transparently reuses a cached connection or creates and caches a new one. */
 uint64_t message_id;
@@ -112,9 +159,11 @@ oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, /* priority 
 oft_peer_close(peer);
 ```
 
-`oft_peer_set_received_callback()`'s `connection` argument is only for replying on the same
-connection a message arrived on — a peer deliberately exposes no other way to enumerate, look up, or
-be notified about the individual connections it holds (there is no
+`oft_peer_set_received_callback()` delivers an `oft_peer_reception` — its identity (via
+`oft_peer_reception_identity()`) is only for identifying which connection a message arrived on, e.g.
+to decide how to respond via
+`oft_peer_send()`; a peer deliberately exposes no other way to enumerate, look up, or be notified
+about the individual connections it holds (there is no
 `oft_peer_set_disconnected_callback()`/`oft_peer_set_connected_callback()`): connection lifecycle is
 the peer's own implementation detail, transparently managed (reconnecting, evicting, etc.) behind
 `oft_peer_send()`.
@@ -150,7 +199,7 @@ options.rekey_interval_ms = 10 * 60 * 1000;
 
 `oft_connection_rekey()` is a no-op (returns `OFT_OK` immediately) if the connection was established
 with `OFT_SECURITY_MODE_TRUSTED` — there's no TLS session to rekey. `oft_peer_rekey()`/
-`oft_peer_disconnect()` act on every connection the peer currently holds, both inbound and outbound,
+`oft_peer_drop()` act on every connection the peer currently holds, both inbound and outbound,
 at once.
 
 ## Security modes
@@ -190,12 +239,41 @@ accepts), and `oft_connect()`'s `ssl_ctx` is unused entirely — the connecting 
 certificate it's presented with unconditionally. See [OFT.md §9](OFT.md#9-security-modes) for the
 full semantics of each mode.
 
+`oft_connect_options`/`oft_host_options`/`oft_peer_options` also each have a `connection_validation`
+field (plus a `connection_validation_user_data` passed through to it): an optional
+`oft_connection_validation_callback` invoked once the OFT hail exchange completes, for every security
+mode (including `OFT_SECURITY_MODE_TRUSTED` and `OFT_SECURITY_MODE_SECURE`, where its `certificate`/
+`chain` parameters are always `NULL`) — unlike the verification configured on the `SSL_CTX` itself,
+which only runs during the TLS handshake and never sees the connection's `oft_identity`:
+
+```c
+static int validate_connection(const oft_identity *identity, X509 *certificate, STACK_OF(X509) *chain, long verify_result, void *user_data) {
+    /* certificate/chain are borrowed - valid only for the duration of this call, and must not be
+     * freed here. verify_result is whatever SSL_get_verify_result() reported (X509_V_OK if the
+     * certificate validated cleanly). */
+    return 1; /* or 0 to reject the connection */
+}
+
+oft_connect_options connect_options = {0};
+connect_options.info = "my-client";
+connect_options.connection_validation = validate_connection;
+```
+
+`NULL` (the default) accepts every connection; returning `0` fails `oft_connect()`/`oft_host()` with
+`OFT_ERROR`. This callback runs synchronously, matching the rest of this port's blocking call style
+(see [Architecture.md](Architecture.md)) — unlike the C# reference implementation's
+`ConnectionValidation`, which is `async`. It also carries a `verify_result` parameter (mirroring
+`SSL_get_verify_result()`) rather than C#'s `sslErrors` (`SslPolicyErrors`) — the closest OpenSSL
+equivalent actually available at this point.
+
 ## Memory ownership
 
 `oft_connection_send()` (and `oft_peer_send()`) copy the data they're given; the caller retains
 ownership of its own buffer and may free or reuse it as soon as the call returns. Data delivered to
 an `oft_received_callback` is heap-allocated (`malloc()`) by the library, and ownership passes to
-the callback — it **must** `free()` it once done (see the examples above).
+the callback — it **must** `free()` it once done (see the examples above). An `oft_peer_received_callback`
+instead receives an `oft_peer_reception`, which it owns in full (payload and identity together) —
+free it with `oft_peer_reception_free()` once done, rather than freeing its fields individually.
 
 ## Concurrency model
 

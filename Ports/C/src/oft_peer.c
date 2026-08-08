@@ -1,26 +1,54 @@
 #include "oft/oft_peer.h"
 
+#include "oft_connection_internal.h"
+
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define OFT_PEER_DEFAULT_IDLE_TIMEOUT_MS (5L * 60L * 1000L)
-#define OFT_PEER_DEFAULT_MAX_CONNECTION_LIFETIME_MS (60L * 60L * 1000L)
-#define OFT_PEER_DEFAULT_MAX_CONNECTION_COUNT 128
-#define OFT_PEER_DEFAULT_EVICTION_CHECK_INTERVAL_MS (30L * 1000L)
+#define OFT_PEER_DEFAULT_IDLE_TIMEOUT_MS (2L * 60L * 60L * 1000L)
+#define OFT_PEER_DEFAULT_MAX_CONNECTION_LIFETIME_MS (24L * 60L * 60L * 1000L)
+#define OFT_PEER_DEFAULT_MAX_CONNECTION_COUNT 16
+
+/* How long a connection must have had no pending data (see oft_connection_has_pending_data())
+ * before it becomes eligible for automatic eviction (idle, lifetime, or excess-count based) at
+ * all - a fixed value, not configurable, giving the underlying TLS/TCP layers time to actually
+ * flush and acknowledge everything after the last application-level message completes, rather than
+ * evicting the instant oft_connection_has_pending_data() turns 0. */
+#define OFT_PEER_EVICTION_GRACE_PERIOD_MS (30L * 1000L)
+
+/* How often run_eviction() checks connections against idle_timeout_ms, max_connection_lifetime_ms,
+ * and max_connection_count - a fixed value, not configurable (see oft_peer.h's own top comment).
+ * Since eviction only ever runs on this cadence, neither of those two duration-based options can
+ * take effect any sooner than this floor. */
+#define OFT_PEER_EVICTION_CHECK_INTERVAL_MS (30L * 1000L)
 
 /* Tracks a single outbound connection this peer has cached, keyed by host:port for reuse lookups. */
 typedef struct oft_peer_outbound_node {
     char host[256];
     uint16_t port;
     oft_connection *connection;
+
+    /* When this connection was first observed, by run_eviction(), to have no pending data (see
+     * oft_connection_has_pending_data()) - reset (pending_data_cleared_at_valid = 0) the moment it's
+     * next observed with pending data, so a connection that resumes sending after a quiet period
+     * gets a fresh OFT_PEER_EVICTION_GRACE_PERIOD_MS once it finishes again. */
+    struct timespec pending_data_cleared_at;
+    int pending_data_cleared_at_valid;
+
     struct oft_peer_outbound_node *next;
 } oft_peer_outbound_node;
 
 /* Tracks a single inbound connection this peer has accepted. */
 typedef struct oft_peer_inbound_node {
     oft_connection *connection;
+
+    /* See oft_peer_outbound_node's own field of the same name. */
+    struct timespec pending_data_cleared_at;
+    int pending_data_cleared_at_valid;
+
     struct oft_peer_inbound_node *next;
 } oft_peer_inbound_node;
 
@@ -45,13 +73,19 @@ struct oft_peer {
     oft_peer_inbound_node *inbound_connections;
 
     pthread_mutex_t received_callback_lock;
-    oft_received_callback received_callback;
+    oft_peer_received_callback received_callback;
     void *received_callback_user_data;
 
     pthread_t eviction_thread;
     atomic_int eviction_stop;
 
     atomic_int disposed;
+};
+
+struct oft_peer_reception {
+    uint8_t *data;
+    size_t length;
+    oft_identity identity;
 };
 
 static long apply_default_ms(long value, long default_value) {
@@ -68,17 +102,39 @@ static long timespec_diff_ms(const struct timespec *a, const struct timespec *b)
     return sec_diff * 1000L + nsec_diff / 1000000L;
 }
 
+/* Builds an independent snapshot of connection's current identity - unlike oft_connection_identity()
+ * (borrowed, only valid while the connection stays open), this is owned by the caller and safe to
+ * keep using after the connection later disconnects. */
+static void copy_identity(oft_connection *connection, oft_identity *out_identity) {
+    const oft_identity *source = oft_connection_identity(connection);
+    snprintf(out_identity->host, sizeof(out_identity->host), "%s", source->host);
+    out_identity->port = source->port;
+    out_identity->certificate = oft_certificate_identity_copy(source->certificate);
+    out_identity->info = strdup(source->info);
+}
+
 static void raise_received(oft_peer *peer, oft_connection *connection, uint8_t *data, size_t length) {
     pthread_mutex_lock(&peer->received_callback_lock);
-    oft_received_callback callback = peer->received_callback;
+    oft_peer_received_callback callback = peer->received_callback;
     void *user_data = peer->received_callback_user_data;
     pthread_mutex_unlock(&peer->received_callback_lock);
 
-    if (callback) {
-        callback(connection, data, length, user_data);
-    } else {
+    if (!callback) {
         free(data);
+        return;
     }
+
+    oft_peer_reception *reception = calloc(1, sizeof(oft_peer_reception));
+    if (!reception) {
+        free(data);
+        return;
+    }
+
+    reception->data = data;
+    reception->length = length;
+    copy_identity(connection, &reception->identity);
+
+    callback(reception, user_data);
 }
 
 static void on_outbound_received(oft_connection *connection, uint8_t *data, size_t length, void *user_data) {
@@ -188,7 +244,6 @@ oft_peer *oft_peer_create(const oft_peer_options *options) {
     peer->options.idle_timeout_ms = apply_default_ms(options->idle_timeout_ms, OFT_PEER_DEFAULT_IDLE_TIMEOUT_MS);
     peer->options.max_connection_lifetime_ms = apply_default_ms(options->max_connection_lifetime_ms, OFT_PEER_DEFAULT_MAX_CONNECTION_LIFETIME_MS);
     peer->options.max_connection_count = apply_default_count(options->max_connection_count, OFT_PEER_DEFAULT_MAX_CONNECTION_COUNT);
-    peer->options.eviction_check_interval_ms = apply_default_ms(options->eviction_check_interval_ms, OFT_PEER_DEFAULT_EVICTION_CHECK_INTERVAL_MS);
 
     pthread_mutex_init(&peer->outbound_lock, NULL);
     pthread_mutex_init(&peer->inbound_lock, NULL);
@@ -203,6 +258,8 @@ oft_peer *oft_peer_create(const oft_peer_options *options) {
     peer->connect_options.security_mode = peer->options.security_mode;
     peer->connect_options.poll_interval_ms = peer->options.poll_interval_ms;
     peer->connect_options.poll_timeout_ms = peer->options.poll_timeout_ms;
+    peer->connect_options.connection_validation = peer->options.connection_validation;
+    peer->connect_options.connection_validation_user_data = peer->options.connection_validation_user_data;
 
     memset(&peer->host_options, 0, sizeof(peer->host_options));
     peer->host_options.info = peer->options.info;
@@ -211,13 +268,15 @@ oft_peer *oft_peer_create(const oft_peer_options *options) {
     peer->host_options.security_mode = peer->options.security_mode;
     peer->host_options.poll_interval_ms = peer->options.poll_interval_ms;
     peer->host_options.poll_timeout_ms = peer->options.poll_timeout_ms;
+    peer->host_options.connection_validation = peer->options.connection_validation;
+    peer->host_options.connection_validation_user_data = peer->options.connection_validation_user_data;
 
     pthread_create(&peer->eviction_thread, NULL, eviction_loop, peer);
 
     return peer;
 }
 
-int oft_peer_open(oft_peer *peer, const char *bind_host, uint16_t bind_port, char *error_buffer, size_t error_buffer_size) {
+int oft_peer_listen(oft_peer *peer, const char *bind_host, uint16_t bind_port, char *error_buffer, size_t error_buffer_size) {
     oft_listener *listener = oft_host(bind_host, bind_port, &peer->host_options, peer->options.ssl_ctx, error_buffer, error_buffer_size);
     if (!listener) {
         return OFT_ERROR;
@@ -228,7 +287,7 @@ int oft_peer_open(oft_peer *peer, const char *bind_host, uint16_t bind_port, cha
     return OFT_OK;
 }
 
-void oft_peer_stop(oft_peer *peer) {
+void oft_peer_stop_listening(oft_peer *peer) {
     if (!peer->listener) {
         return;
     }
@@ -241,11 +300,34 @@ int oft_peer_local_port(oft_peer *peer) {
     return peer->listener ? oft_listener_local_port(peer->listener) : 0;
 }
 
-void oft_peer_set_received_callback(oft_peer *peer, oft_received_callback callback, void *user_data) {
+void oft_peer_set_received_callback(oft_peer *peer, oft_peer_received_callback callback, void *user_data) {
     pthread_mutex_lock(&peer->received_callback_lock);
     peer->received_callback = callback;
     peer->received_callback_user_data = user_data;
     pthread_mutex_unlock(&peer->received_callback_lock);
+}
+
+const uint8_t *oft_peer_reception_data(const oft_peer_reception *reception) {
+    return reception->data;
+}
+
+size_t oft_peer_reception_length(const oft_peer_reception *reception) {
+    return reception->length;
+}
+
+const oft_identity *oft_peer_reception_identity(const oft_peer_reception *reception) {
+    return &reception->identity;
+}
+
+void oft_peer_reception_free(oft_peer_reception *reception) {
+    if (!reception) {
+        return;
+    }
+
+    free(reception->data);
+    oft_certificate_identity_free(reception->identity.certificate);
+    free(reception->identity.info);
+    free(reception);
 }
 
 static oft_peer_outbound_node *get_or_connect(oft_peer *peer, const char *host, uint16_t port, char *error_buffer, size_t error_buffer_size) {
@@ -373,7 +455,7 @@ int oft_peer_rekey(oft_peer *peer) {
     return result;
 }
 
-void oft_peer_disconnect(oft_peer *peer) {
+void oft_peer_drop(oft_peer *peer) {
     size_t count;
     oft_connection **handles = get_tracked_connections(peer, &count);
     if (!handles) {
@@ -387,6 +469,69 @@ void oft_peer_disconnect(oft_peer *peer) {
     free(handles);
 }
 
+/* Finds connection's tracking node (outbound or inbound) and returns, via *out_cleared_at, when it
+ * was first observed with no pending data - stamping it with *now the first time this is called for
+ * a connection since it last had pending data (see clear_pending_data_cleared_at()). Falls back to
+ * "just cleared now" if connection was untracked between the snapshot in get_tracked_connections()
+ * and this call, which simply makes it ineligible this pass rather than lose the timestamp. */
+static void get_or_set_pending_data_cleared_at(oft_peer *peer, oft_connection *connection, const struct timespec *now, struct timespec *out_cleared_at) {
+    pthread_mutex_lock(&peer->outbound_lock);
+    for (oft_peer_outbound_node *node = peer->outbound_connections; node; node = node->next) {
+        if (node->connection == connection) {
+            if (!node->pending_data_cleared_at_valid) {
+                node->pending_data_cleared_at = *now;
+                node->pending_data_cleared_at_valid = 1;
+            }
+
+            *out_cleared_at = node->pending_data_cleared_at;
+            pthread_mutex_unlock(&peer->outbound_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&peer->outbound_lock);
+
+    pthread_mutex_lock(&peer->inbound_lock);
+    for (oft_peer_inbound_node *node = peer->inbound_connections; node; node = node->next) {
+        if (node->connection == connection) {
+            if (!node->pending_data_cleared_at_valid) {
+                node->pending_data_cleared_at = *now;
+                node->pending_data_cleared_at_valid = 1;
+            }
+
+            *out_cleared_at = node->pending_data_cleared_at;
+            pthread_mutex_unlock(&peer->inbound_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&peer->inbound_lock);
+
+    *out_cleared_at = *now;
+}
+
+/* Resets connection's tracking node so the next time it's observed with no pending data starts a
+ * fresh OFT_PEER_EVICTION_GRACE_PERIOD_MS window - see get_or_set_pending_data_cleared_at(). */
+static void clear_pending_data_cleared_at(oft_peer *peer, oft_connection *connection) {
+    pthread_mutex_lock(&peer->outbound_lock);
+    for (oft_peer_outbound_node *node = peer->outbound_connections; node; node = node->next) {
+        if (node->connection == connection) {
+            node->pending_data_cleared_at_valid = 0;
+            pthread_mutex_unlock(&peer->outbound_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&peer->outbound_lock);
+
+    pthread_mutex_lock(&peer->inbound_lock);
+    for (oft_peer_inbound_node *node = peer->inbound_connections; node; node = node->next) {
+        if (node->connection == connection) {
+            node->pending_data_cleared_at_valid = 0;
+            pthread_mutex_unlock(&peer->inbound_lock);
+            return;
+        }
+    }
+    pthread_mutex_unlock(&peer->inbound_lock);
+}
+
 static void run_eviction(oft_peer *peer) {
     struct timespec now;
     clock_gettime(CLOCK_REALTIME, &now);
@@ -398,17 +543,29 @@ static void run_eviction(oft_peer *peer) {
     }
 
     int *should_evict = calloc(index, sizeof(int));
-    if (should_evict) {
+    int *is_candidate = calloc(index, sizeof(int));
+    if (should_evict && is_candidate) {
         size_t evict_count = 0;
         for (size_t i = 0; i < index; i++) {
             /* A connection with pending/unacknowledged data (see oft_connection_has_pending_data())
              * is never auto-disconnected here, regardless of which eviction condition it would
              * otherwise meet: doing so could silently drop a message that's still queued, in
              * flight, or only partially reassembled. It's only a candidate once all of its data has
-             * been acknowledged. */
+             * been acknowledged, and even then, only once OFT_PEER_EVICTION_GRACE_PERIOD_MS has
+             * passed since that happened - giving the underlying TLS/TCP layers time to actually
+             * flush and acknowledge everything rather than evicting the instant it turns 0. */
             if (oft_connection_has_pending_data(handles[i])) {
+                clear_pending_data_cleared_at(peer, handles[i]);
                 continue;
             }
+
+            struct timespec cleared_at;
+            get_or_set_pending_data_cleared_at(peer, handles[i], &now, &cleared_at);
+            if (timespec_diff_ms(&now, &cleared_at) < OFT_PEER_EVICTION_GRACE_PERIOD_MS) {
+                continue;
+            }
+
+            is_candidate[i] = 1;
 
             struct timespec last_sent;
             struct timespec last_received;
@@ -434,7 +591,7 @@ static void run_eviction(oft_peer *peer) {
                 size_t oldest_index = (size_t)-1;
                 struct timespec oldest_connected_at = {0};
                 for (size_t i = 0; i < index; i++) {
-                    if (should_evict[i] || oft_connection_has_pending_data(handles[i])) {
+                    if (should_evict[i] || !is_candidate[i]) {
                         continue;
                     }
 
@@ -461,16 +618,16 @@ static void run_eviction(oft_peer *peer) {
                 oft_connection_disconnect(handles[i]);
             }
         }
-
-        free(should_evict);
     }
 
+    free(should_evict);
+    free(is_candidate);
     free(handles);
 }
 
 static void *eviction_loop(void *arg) {
     oft_peer *peer = arg;
-    long remaining_ms = peer->options.eviction_check_interval_ms;
+    long remaining_ms = OFT_PEER_EVICTION_CHECK_INTERVAL_MS;
 
     while (!atomic_load(&peer->eviction_stop)) {
         long step_ms = remaining_ms < 50 ? remaining_ms : 50;
@@ -482,7 +639,7 @@ static void *eviction_loop(void *arg) {
             continue;
         }
 
-        remaining_ms = peer->options.eviction_check_interval_ms;
+        remaining_ms = OFT_PEER_EVICTION_CHECK_INTERVAL_MS;
         if (!atomic_load(&peer->eviction_stop)) {
             run_eviction(peer);
         }
@@ -500,7 +657,7 @@ void oft_peer_close(oft_peer *peer) {
     atomic_store(&peer->eviction_stop, 1);
     pthread_join(peer->eviction_thread, NULL);
 
-    oft_peer_stop(peer);
+    oft_peer_stop_listening(peer);
 
     size_t count;
     oft_connection **handles = get_tracked_connections(peer, &count);

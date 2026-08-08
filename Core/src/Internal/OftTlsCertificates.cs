@@ -77,6 +77,15 @@ internal static class OftTlsCertificates
     }
 
     /// <summary>
+    /// Extracts the leaf (first) certificate from a certificate chain presented during a TLS
+    /// handshake.
+    /// </summary>
+    /// <param name="chain">The presented certificate chain, leaf certificate first.</param>
+    /// <returns>The leaf certificate, or <see langword="null"/> if none was presented.</returns>
+    public static X509Certificate2? ExtractLeafCertificate(Certificate chain) =>
+        chain.IsEmpty ? null : X509CertificateLoader.LoadCertificate(chain.GetCertificateList()[0].GetEncoded());
+
+    /// <summary>
     /// Validates a certificate chain presented by the peer during the TLS handshake, either by
     /// delegating to <paramref name="callback"/> if supplied, or by performing .NET's standard
     /// <see cref="X509Chain"/>-based trust validation (against the OS trust store) plus, when
@@ -91,23 +100,34 @@ internal static class OftTlsCertificates
     /// Alternative Name when validating a server's certificate (client-side only; always
     /// <see langword="null"/> when validating a client's certificate).
     /// </param>
+    /// <param name="policyErrors">
+    /// The policy errors found while validating the chain (<see cref="SslPolicyErrors.None"/> if it
+    /// validated cleanly), regardless of whether the certificate was ultimately accepted or rejected.
+    /// </param>
+    /// <returns>
+    /// The <see cref="X509Chain"/> built while validating the certificate, transferring ownership to
+    /// the caller (who becomes responsible for disposing it) — <see langword="null"/> if the peer
+    /// didn't present a certificate at all.
+    /// </returns>
     /// <exception cref="AuthenticationException">The certificate was rejected.</exception>
-    public static void Validate(Certificate chain, RemoteCertificateValidationCallback? callback, string? targetHost)
+    public static X509Chain? Validate(Certificate chain, RemoteCertificateValidationCallback? callback, string? targetHost, out SslPolicyErrors policyErrors)
     {
-        if (chain.IsEmpty)
+        X509Certificate2? leaf = ExtractLeafCertificate(chain);
+        if (leaf is null)
         {
-            if (callback is not null && callback(null!, null, null, SslPolicyErrors.RemoteCertificateNotAvailable))
+            policyErrors = SslPolicyErrors.RemoteCertificateNotAvailable;
+
+            if (callback is not null && callback(null!, null, null, policyErrors))
             {
-                return;
+                return null;
             }
 
             throw new AuthenticationException("The peer did not present a certificate.");
         }
 
         TlsCertificate[] entries = chain.GetCertificateList();
-        X509Certificate2 leaf = X509CertificateLoader.LoadCertificate(entries[0].GetEncoded());
 
-        using X509Chain x509Chain = new();
+        X509Chain x509Chain = new();
         for (int i = 1; i < entries.Length; i++)
         {
             x509Chain.ChainPolicy.ExtraStore.Add(X509CertificateLoader.LoadCertificate(entries[i].GetEncoded()));
@@ -115,7 +135,7 @@ internal static class OftTlsCertificates
 
         bool chainIsValid = x509Chain.Build(leaf);
 
-        SslPolicyErrors policyErrors = SslPolicyErrors.None;
+        policyErrors = SslPolicyErrors.None;
         if (!chainIsValid)
         {
             policyErrors |= SslPolicyErrors.RemoteCertificateChainErrors;
@@ -132,8 +152,11 @@ internal static class OftTlsCertificates
 
         if (!accepted)
         {
+            x509Chain.Dispose();
             throw new AuthenticationException($"The remote certificate was rejected by the validation policy ({policyErrors}).");
         }
+
+        return x509Chain;
     }
 
     /// <summary>
@@ -146,6 +169,68 @@ internal static class OftTlsCertificates
     {
         bool isIpAddress = IPAddress.TryParse(hostname, out IPAddress? targetAddress);
 
+        foreach ((string kind, string value) in EnumerateSubjectAlternativeNameEntries(certificate))
+        {
+            if (!isIpAddress && kind is "DNS Name" or "DNS")
+            {
+                if (string.Equals(value, hostname, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            else if (isIpAddress && kind is "IP Address")
+            {
+                if (IPAddress.TryParse(value, out IPAddress? sanAddress) && sanAddress.Equals(targetAddress))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Extracts <paramref name="certificate"/>'s Subject Alternative Name DNS and IP address entries,
+    /// in the order they appear on the certificate.
+    /// </summary>
+    /// <param name="certificate">The certificate to extract Subject Alternative Names from.</param>
+    /// <returns>
+    /// Every DNS name and IP address entry's value, or an empty list if the certificate has no
+    /// Subject Alternative Name extension.
+    /// </returns>
+    internal static IReadOnlyList<string> ExtractSubjectAlternativeNames(X509Certificate2 certificate) =>
+        EnumerateSubjectAlternativeNameEntries(certificate)
+            .Where(entry => entry.Kind is "DNS Name" or "DNS" or "IP Address")
+            .Select(entry => entry.Value)
+            .ToList();
+
+    /// <summary>
+    /// Extracts the Common Name (CN) relative distinguished name component from
+    /// <paramref name="distinguishedName"/> (a certificate's <c>SubjectName</c> or
+    /// <c>IssuerName</c>).
+    /// </summary>
+    /// <param name="distinguishedName">The distinguished name to extract a Common Name from.</param>
+    /// <returns>The Common Name, or <see langword="null"/> if it has none.</returns>
+    internal static string? ExtractCommonName(X500DistinguishedName distinguishedName)
+    {
+        foreach (X500RelativeDistinguishedName rdn in distinguishedName.EnumerateRelativeDistinguishedNames())
+        {
+            if (!rdn.HasMultipleElements && rdn.GetSingleElementType().Value == "2.5.4.3")
+            {
+                return rdn.GetSingleElementValue();
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Parses <paramref name="certificate"/>'s Subject Alternative Name extension, if it has one,
+    /// into kind/value pairs (e.g. <c>("DNS", "example.com")</c>).
+    /// </summary>
+    private static IEnumerable<(string Kind, string Value)> EnumerateSubjectAlternativeNameEntries(X509Certificate2 certificate)
+    {
         foreach (X509Extension extension in certificate.Extensions)
         {
             if (extension.Oid?.Value != "2.5.29.17")
@@ -169,26 +254,8 @@ internal static class OftTlsCertificates
                     continue;
                 }
 
-                string kind = entry[..separatorIndex].Trim();
-                string value = entry[(separatorIndex + 1)..].Trim();
-
-                if (!isIpAddress && kind is "DNS Name" or "DNS")
-                {
-                    if (string.Equals(value, hostname, StringComparison.OrdinalIgnoreCase))
-                    {
-                        return true;
-                    }
-                }
-                else if (isIpAddress && kind is "IP Address")
-                {
-                    if (IPAddress.TryParse(value, out IPAddress? sanAddress) && sanAddress.Equals(targetAddress))
-                    {
-                        return true;
-                    }
-                }
+                yield return (entry[..separatorIndex].Trim(), entry[(separatorIndex + 1)..].Trim());
             }
         }
-
-        return false;
     }
 }

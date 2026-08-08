@@ -4,10 +4,12 @@ Conventions for anyone (human or agent) writing code in this repository. See
 [`README.md`](README.md) for the protocol design and [`Core/`](Core/) for the implementation it
 describes.
 
-## Language & Platform
+## Code Style
 
-- Environment is Ubuntu Linux.
 - C#, targeting the latest .NET SDK available, using the latest available language features.
+- Do not use `var`. Always declare the explicit variable type.
+- Each project has a single `Using.cs` file containing all `global using` directives for that
+  project. Do not place `using` directives in individual files.
 
 ## Documentation & Comments
 
@@ -33,12 +35,9 @@ describes.
   - A standalone interface with no single implementing class in the same file is named after its
     concept without the `I` prefix (e.g. `IOther` with no co-located `Other` class lives in
     `Other.cs`).
-
-## Usings
-
-- Each project has a single `Using.cs` file containing all `global using` directives for that
-  project.
-- Do not place `using` directives in individual files.
+- Use an IoC container to manage and inject dependencies. Configure automatic resolution of
+  interfaces to their same-named implementation (e.g. `IThing` resolves to `Thing`) without
+  requiring explicit registration.
 
 ## Async & Performance
 
@@ -59,16 +58,6 @@ describes.
   construction. Where a parsed object already owns its own copy of data (e.g. a deserialized
   message) and no ownership transfer is needed, prefer a zero-copy `Span`/`Memory` view over it
   instead of re-copying, rather than pooling redundant copies.
-
-## Variable Declarations
-
-- Do not use `var`. Always declare the explicit variable type.
-
-## Dependency Injection
-
-- Use an IoC container to manage and inject dependencies.
-- Configure automatic resolution of interfaces to their same-named implementation (e.g. `IThing`
-  resolves to `Thing`) without requiring explicit registration.
 
 ## Other-language ports
 

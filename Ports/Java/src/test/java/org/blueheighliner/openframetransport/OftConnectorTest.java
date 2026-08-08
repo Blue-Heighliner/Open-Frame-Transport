@@ -68,7 +68,7 @@ final class OftConnectorTest {
     void connect_noOptions_usesDefaults() throws Exception {
         try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0))) {
             try (OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort())) {
-                assertEquals("", connection.getRemoteInfo());
+                assertEquals("", connection.getIdentity().info());
             }
         }
     }

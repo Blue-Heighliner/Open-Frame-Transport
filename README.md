@@ -3,19 +3,18 @@
 Open Frame Transport (OFT) is an application-layer protocol that runs on top of TCP and TLS. It
 provides:
 
-- **Framing** — a byte stream is broken into discrete, length-delimited protobuf messages.
-- **Acknowledgement** — every frame that carries application intent is individually acknowledged
-  before the next one is sent, giving the connection simple, deterministic flow control.
+- **Framing** — a byte stream is broken into discrete messages.
+- **Acknowledgement** — every packet is individually acknowledged before the next one is sent, giving the connection simple, deterministic flow control.
 - **Priority interruption** — an application can have many messages in flight logically at once, and
   a high-priority message can interrupt the transmission of a lower-priority one, which resumes
   automatically once the interruption is finished.
-- **Cancellation** — an application can abandon a message it previously queued to send at any time
+- **Cancellation** — an application can cancel a message it previously queued to send at any time
   before it completes.
-- **Security modes** — each connection chooses one of four TLS modes, from no TLS at all up through
+- **Security modes** — each connection chooses one of four TLS modes, from no TLS at all up to
   mutual authentication.
 - **TLS rekeying** — a connection's TLS session can be rekeyed in place, manually or automatically,
   without reconnecting.
-- **Polling** — idle connections are still verified alive on a fixed interval.
+- **Polling** — idle connections are verified alive on a fixed interval.
 
 Full protocol specification: **[Docs/OFT.md](Docs/OFT.md)**. Implementation architecture and
 components: **[Docs/Architecture.md](Docs/Architecture.md)**.
@@ -79,7 +78,7 @@ IOftListener listener = await new OftHoster().Host(5000);
 listener.ConnectedHandler = connection => connection.ReceivedHandler = data => Console.WriteLine(Encoding.UTF8.GetString(data.Memory.Span));
 
 // Client
-await using IOftConnection connection = await new OftConnector().Connect("127.0.0.1", 5000);
+using IOftConnection connection = await new OftConnector().Connect("127.0.0.1", 5000);
 await connection.Send(Encoding.UTF8.GetBytes("hello"));
 ```
 
@@ -89,9 +88,9 @@ await connection.Send(Encoding.UTF8.GetBytes("hello"));
 using BlueHeighliner.OpenFrameTransport;
 
 IOftPeer peer = new OftPeerFactory().Create();
-peer.ReceivedHandler = (connection, data) => Console.WriteLine(Encoding.UTF8.GetString(data.Memory.Span));
+peer.ReceivedHandler = reception => Console.WriteLine(Encoding.UTF8.GetString(reception.Data.Span));
 
-await peer.Open(new IPEndPoint(IPAddress.Any, 5001)); // optional: also accept inbound connections
+await peer.Listen(new IPEndPoint(IPAddress.Any, 5001)); // optional: also accept inbound connections
 await peer.Send("127.0.0.1", 5001, Encoding.UTF8.GetBytes("hello"));
 ```
 
@@ -117,9 +116,9 @@ connection.send("hello".getBytes(), 0);
 import org.blueheighliner.openframetransport.*;
 
 OftPeer peer = OftPeer.create(OftPeerOptions.builder().build());
-peer.setReceivedHandler((connection, data) -> System.out.println(new String(data)));
+peer.setReceivedHandler(reception -> System.out.println(new String(reception.data())));
 
-peer.open(new InetSocketAddress("0.0.0.0", 5001)); // optional: also accept inbound connections
+peer.listen(new InetSocketAddress("0.0.0.0", 5001)); // optional: also accept inbound connections
 peer.send("127.0.0.1", 5001, "hello".getBytes(), 0);
 ```
 
@@ -157,12 +156,17 @@ oft_connection_send(connection, (const uint8_t *)"hello", 5, 0, &message_id);
 ```c
 #include "oft/oft_peer.h"
 
+static void on_peer_received(oft_peer_reception *reception, void *user_data) {
+    printf("%.*s\n", (int)oft_peer_reception_length(reception), oft_peer_reception_data(reception));
+    oft_peer_reception_free(reception); // also frees its payload and identity
+}
+
 oft_peer_options options = {0};
 oft_peer *peer = oft_peer_create(&options);
-oft_peer_set_received_callback(peer, on_received, NULL);
+oft_peer_set_received_callback(peer, on_peer_received, NULL);
 
 char error_buffer[256];
-oft_peer_open(peer, "0.0.0.0", 5001, error_buffer, sizeof(error_buffer)); // optional: also accept inbound connections
+oft_peer_listen(peer, "0.0.0.0", 5001, error_buffer, sizeof(error_buffer)); // optional: also accept inbound connections
 
 uint64_t message_id;
 oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, 0, NULL, &message_id, error_buffer, sizeof(error_buffer));

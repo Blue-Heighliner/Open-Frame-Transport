@@ -3,7 +3,7 @@ package org.blueheighliner.openframetransport;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 
 /**
  * A peer-to-peer convenience layer over {@link OftHoster}/{@link OftListener} and
@@ -11,8 +11,23 @@ import java.util.function.BiConsumer;
  * connection or creates and caches a new one; idle, expired, or excess cached connections are
  * disconnected automatically, and connections with a configured
  * {@link OftPeerOptions#rekeyInterval()} rekey themselves automatically (see README.md &sect;8).
- * There is no way to enumerate or look up an individual connection this peer holds;
- * {@link #rekey()} and {@link #disconnect()} act on all of them at once.
+ * A connection only ever becomes eligible for automatic disconnection once it has had no pending
+ * data (see {@link OftConnection#hasPendingData()}) for a fixed 30-second grace period - not
+ * configurable - giving the underlying TLS/TCP layers time to actually flush and acknowledge
+ * everything after the last application-level message completes. Eviction itself (checking
+ * connections against {@link OftPeerOptions#idleTimeout()}, {@link OftPeerOptions#maxConnectionLifetime()},
+ * and {@link OftPeerOptions#maxConnectionCount()}) is likewise only ever run on a fixed,
+ * non-configurable 30-second interval - so, combined with the grace period above, neither
+ * {@link OftPeerOptions#idleTimeout()} nor {@link OftPeerOptions#maxConnectionLifetime()} can take
+ * effect any sooner than roughly 30-60 seconds after it's reached, regardless of how much shorter
+ * either is configured to be. There is no way to enumerate or
+ * look up an individual connection this peer holds;
+ * {@link #rekey()} and {@link #drop()} act on all of them at once. {@link #close()} permanently
+ * puts this peer itself into a disconnected state - unlike {@link #drop()}, which only disconnects
+ * this peer's currently held connections and leaves the peer itself usable - after which
+ * {@link #isConnected()} is permanently {@code false} and every other member below throws:
+ * {@link #listen}, {@link #stopListening()}, and {@link #drop()} throw {@link IllegalStateException}, while
+ * {@link #send} and {@link #rekey()} throw {@link OftDisconnectedException}.
  */
 public interface OftPeer extends AutoCloseable {
     /**
@@ -38,42 +53,55 @@ public interface OftPeer extends AutoCloseable {
     }
 
     /**
-     * The endpoint actually being listened on once {@link #open(InetSocketAddress)} has completed,
+     * Whether this peer is still connected: {@code true} until {@link #close()} is called, after
+     * which it is permanently {@code false}. Unlike {@link OftConnection#isConnected()}, this is
+     * unaffected by any individual connection this peer holds disconnecting (locally via
+     * {@link #drop()} or remotely) - connection lifecycle is this peer's own implementation detail
+     * (see {@link #setReceivedHandler}'s own doc comment).
+     */
+    boolean isConnected();
+
+    /**
+     * The endpoint actually being listened on once {@link #listen(InetSocketAddress)} has completed,
      * or {@code null} if the peer isn't currently listening.
      */
     InetSocketAddress getLocalEndpoint();
 
     /**
      * Called for every message received on any connection this peer holds, both inbound and
-     * outbound, identifying which one via its {@link OftConnection} argument, or {@code null} if no
-     * callback is currently assigned. There is only ever one callback at a time - assigning a new
-     * value here always replaces any previous one, and the same buffering-until-first-non-null-
-     * assignment guarantee {@link OftConnection#setReceivedHandler} itself makes applies here too
-     * (see README.md). The {@link OftConnection} passed here is only for replying on the same
-     * connection a message arrived on - this peer otherwise deliberately exposes no way to
-     * enumerate, look up, or be notified about the individual connections it holds (e.g. no
-     * disconnected notification): connection lifecycle is this peer's own implementation detail,
-     * transparently managed (reconnecting, evicting, etc.) behind {@link #send}.
+     * outbound, with the received {@link OftPeerReception}, or {@code null} if no callback is
+     * currently assigned. There is only ever one callback at a time - assigning a new value here
+     * always replaces any previous one, and the same buffering-until-first-non-null-assignment
+     * guarantee {@link OftConnection#setReceivedHandler} itself makes applies here too (see
+     * README.md). This peer deliberately exposes no way to enumerate, look up, or be notified about
+     * the individual connections it holds beyond an {@link OftPeerReception}'s own
+     * {@link OftPeerReception#identity()} (e.g. no disconnected notification): connection lifecycle
+     * is this peer's own implementation detail, transparently managed (reconnecting, evicting, etc.)
+     * behind {@link #send}.
      */
-    void setReceivedHandler(BiConsumer<OftConnection, byte[]> handler);
+    void setReceivedHandler(Consumer<OftPeerReception> handler);
 
     /** The callback currently assigned via {@link #setReceivedHandler}, or {@code null} if none is. */
-    BiConsumer<OftConnection, byte[]> getReceivedHandler();
+    Consumer<OftPeerReception> getReceivedHandler();
 
     /**
      * Starts listening for inbound connections. A peer that never calls this only ever makes
      * outbound connections.
      *
      * @param listenEndpoint the local endpoint to listen for incoming TCP connections on
+     * @throws IllegalStateException {@link #isConnected()} is {@code false}
      */
-    void open(InetSocketAddress listenEndpoint) throws IOException;
+    void listen(InetSocketAddress listenEndpoint) throws IOException;
 
     /**
      * Stops listening for new inbound connections. Already-established connections are left open.
-     * Not named {@code close()}, unlike its C#/C counterparts: that name is reserved here for
+     * Not named {@code close()}, matching C#'s {@code IOftPeer.StopListening()} and C's
+     * {@code oft_peer_stop_listening()}: that name is reserved here, as in both, for
      * {@link AutoCloseable#close()}'s full-teardown semantics (see {@link #close()}).
+     *
+     * @throws IllegalStateException {@link #isConnected()} is {@code false}
      */
-    void stop();
+    void stopListening();
 
     /**
      * Sends a message to {@code host}:{@code port}, reusing a cached connection if one already
@@ -84,6 +112,7 @@ public interface OftPeer extends AutoCloseable {
      * @param data     the message payload
      * @param priority the priority to send the message at (see README.md &sect;5-&sect;6)
      * @return a handle that can be used to wait for delivery or cancel the message
+     * @throws OftDisconnectedException {@link #isConnected()} is {@code false}
      */
     OftSendHandle send(String host, int port, byte[] data, int priority) throws IOException;
 
@@ -93,17 +122,25 @@ public interface OftPeer extends AutoCloseable {
      * issued are unaffected.
      *
      * @return a future that completes once every connection's local key update request has been sent
+     * @throws OftDisconnectedException {@link #isConnected()} is {@code false}
      */
     CompletableFuture<Void> rekey();
 
     /**
-     * Disconnects every connection this peer currently holds, both outbound and inbound. The peer
-     * itself is left usable - a subsequent {@link #send} call creates and caches a new outbound
-     * connection as usual, and, if listening, new inbound connections keep being accepted.
+     * Disconnects every connection this peer currently holds, both outbound and inbound. Unlike
+     * {@link #close()}, this peer itself is left usable afterward - a subsequent {@link #send} call
+     * creates and caches a new outbound connection as usual, and, if listening, new inbound
+     * connections keep being accepted.
+     *
+     * @throws IllegalStateException {@link #isConnected()} is {@code false}
      */
-    void disconnect();
+    void drop();
 
-    /** Stops listening (if applicable) and closes every connection this peer holds. */
+    /**
+     * Permanently puts this peer itself into a disconnected state: stops listening (if applicable)
+     * and disconnects every connection it currently holds, both outbound and inbound. Safe to call
+     * more than once; every call after the first is a no-op.
+     */
     @Override
     void close();
 }

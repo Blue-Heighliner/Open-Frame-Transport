@@ -10,6 +10,7 @@ import java.util.Objects;
 public final class OftHostOptions {
     private final String info;
     private final SSLContext sslContext;
+    private final OftConnectionValidationCallback connectionValidation;
     private final int maxPacketDataSize;
     private final Duration rekeyInterval;
     private final OftSecurityMode securityMode;
@@ -20,6 +21,7 @@ public final class OftHostOptions {
         this.info = Objects.requireNonNull(builder.info, "info");
         this.securityMode = Objects.requireNonNull(builder.securityMode, "securityMode");
         this.sslContext = builder.sslContext;
+        this.connectionValidation = builder.connectionValidation;
         this.maxPacketDataSize = builder.maxPacketDataSize;
         this.rekeyInterval = builder.rekeyInterval;
         this.pollInterval = builder.pollInterval;
@@ -41,6 +43,17 @@ public final class OftHostOptions {
      */
     public SSLContext sslContext() {
         return this.sslContext;
+    }
+
+    /**
+     * An optional callback used to validate a fully-established connection, invoked once the OFT
+     * hail exchange completes (see README.md &sect;3), for every {@link #securityMode()} - unlike
+     * the trust manager configured on {@link #sslContext()}, which only runs during the TLS
+     * handshake. When {@code null} (the default), every connection is accepted; otherwise, hosting
+     * fails with an {@link java.io.IOException} if the callback returns {@code false}.
+     */
+    public OftConnectionValidationCallback connectionValidation() {
+        return this.connectionValidation;
     }
 
     /** The maximum number of payload bytes carried in a single packet's data field. */
@@ -87,6 +100,7 @@ public final class OftHostOptions {
     public static final class Builder {
         private String info = "";
         private SSLContext sslContext;
+        private OftConnectionValidationCallback connectionValidation;
         private int maxPacketDataSize = 1024;
         private Duration rekeyInterval;
         private OftSecurityMode securityMode = OftSecurityMode.SECURE;
@@ -103,6 +117,11 @@ public final class OftHostOptions {
 
         public Builder sslContext(SSLContext sslContext) {
             this.sslContext = sslContext;
+            return this;
+        }
+
+        public Builder connectionValidation(OftConnectionValidationCallback connectionValidation) {
+            this.connectionValidation = connectionValidation;
             return this;
         }
 

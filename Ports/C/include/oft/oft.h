@@ -17,6 +17,7 @@
 #ifndef OFT_H
 #define OFT_H
 
+#include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -34,6 +35,45 @@ enum oft_result {
     OFT_ERROR_CANCELLED = -3,
     OFT_ERROR_CLOSED = -4,
 };
+
+/*
+ * Identity information extracted from an X.509 certificate presented during a TLS handshake.
+ */
+typedef struct {
+    /* The Common Name (CN) of the certificate's subject, or NULL if it has none. Owned by this
+     * struct. */
+    char *name;
+
+    /* The Common Name (CN) of the certificate's issuer, or NULL if it has none. Owned by this
+     * struct. */
+    char *issuer;
+
+    /* This certificate's Subject Alternative Name DNS and IP address entries, in the order they
+     * appear on the certificate. NULL if alternative_name_count is 0. Both the array and every
+     * entry in it are owned by this struct. */
+    char **alternative_names;
+    size_t alternative_name_count;
+} oft_certificate_identity;
+
+/*
+ * The identity of an OFT connection's remote side.
+ */
+typedef struct {
+    /* The connection's remote TCP host address (NUL-terminated) and port. */
+    char host[INET6_ADDRSTRLEN];
+    uint16_t port;
+
+    /* The remote side's TLS certificate identity, or NULL if it didn't present one - always NULL
+     * for a connection established with OFT_SECURITY_MODE_TRUSTED (no TLS at all), and also NULL
+     * for the accepting side of a connection established under a mode that never requests a client
+     * certificate (see OFT_SECURITY_MODE_DUAL_AUTHENTICATION). Owned by the enclosing
+     * oft_connection. */
+    oft_certificate_identity *certificate;
+
+    /* The opaque, application-controlled data the remote side sent in its hail (see Docs/OFT.md
+     * §3). Owned by the enclosing oft_connection. */
+    char *info;
+} oft_identity;
 
 /*
  * The security mode a connection is established under (see Docs/OFT.md §9). Mirrors the C#
@@ -81,6 +121,19 @@ typedef void (*oft_disconnected_callback)(oft_connection *connection, const char
 /* Called whenever an oft_listener accepts and establishes a new inbound connection. */
 typedef void (*oft_connected_callback)(oft_listener *listener, oft_connection *connection, void *user_data);
 
+/*
+ * Validates a fully-established OFT connection. Invoked once per connection, after the OFT hail
+ * exchange completes (see Docs/OFT.md §3), for every security mode - including
+ * OFT_SECURITY_MODE_TRUSTED (no TLS at all), where `certificate`/`chain` are always NULL and
+ * `verify_result` is X509_V_OK. Unlike the trust store/verification configured on the SSL_CTX passed
+ * to oft_connect()/oft_host(), which only runs during the TLS handshake itself, this runs after
+ * `identity` is fully populated. `certificate` and `chain` (if non-NULL) are borrowed - valid only
+ * for the duration of this call, and must not be freed by the callee. Return non-zero to accept the
+ * connection, or zero to reject it (in which case oft_connect()/oft_host() fails).
+ */
+typedef int (*oft_connection_validation_callback)(
+        const oft_identity *identity, X509 *certificate, STACK_OF(X509) *chain, long verify_result, void *user_data);
+
 typedef struct {
     /* Opaque, application-controlled data sent to the peer in this side's hail (see Docs/OFT.md §3). Copied. */
     const char *info;
@@ -105,6 +158,11 @@ typedef struct {
      * packet or any other packet) before it assumes the peer is unreachable and closes itself (see
      * Docs/OFT.md §10). 0 = default (5000ms). */
     long poll_timeout_ms;
+
+    /* An optional callback used to validate a fully-established connection (see
+     * oft_connection_validation_callback's own documentation). NULL = every connection is accepted. */
+    oft_connection_validation_callback connection_validation;
+    void *connection_validation_user_data;
 } oft_connect_options;
 
 typedef struct {
@@ -128,6 +186,11 @@ typedef struct {
      * or any other packet) before it assumes the peer is unreachable and closes itself (see
      * Docs/OFT.md §10). 0 = default (5000ms). */
     long poll_timeout_ms;
+
+    /* An optional callback used to validate a fully-established connection (see
+     * oft_connection_validation_callback's own documentation). NULL = every connection is accepted. */
+    oft_connection_validation_callback connection_validation;
+    void *connection_validation_user_data;
 } oft_host_options;
 
 /* ---- Connection ---- */
@@ -189,11 +252,12 @@ void oft_connection_set_received_callback(oft_connection *connection, oft_receiv
  */
 void oft_connection_set_disconnected_callback(oft_connection *connection, oft_disconnected_callback callback, void *user_data);
 
-/* The opaque, application-controlled data the peer sent in its hail (see Docs/OFT.md §3). Owned by the connection. */
-const char *oft_connection_remote_info(oft_connection *connection);
-
-/* Writes the remote host (NUL-terminated) and port of this connection. Returns OFT_OK, or OFT_ERROR if host_buffer is too small. */
-int oft_connection_remote_endpoint(oft_connection *connection, char *host_buffer, size_t host_buffer_size, uint16_t *out_port);
+/*
+ * This connection's remote identity: its TCP endpoint, its TLS certificate (if any was presented),
+ * and the opaque, application-controlled data it sent in its hail (see Docs/OFT.md §3). Owned by
+ * the connection; valid until it is closed.
+ */
+const oft_identity *oft_connection_identity(oft_connection *connection);
 
 /* When the OFT handshake (TLS session plus hail exchange) completed. */
 void oft_connection_connected_at(oft_connection *connection, struct timespec *out_time);
@@ -213,6 +277,14 @@ void oft_connection_last_received_at(oft_connection *connection, struct timespec
  * dropped.
  */
 int oft_connection_has_pending_data(oft_connection *connection);
+
+/*
+ * Non-zero if this connection is still connected: true until it closes, for any reason - a local
+ * oft_connection_disconnect()/oft_connection_close() call, the remote side disconnecting, or an
+ * unrecoverable error (e.g. a liveness timeout) - after which it is permanently zero.
+ * oft_connection_send()/oft_connection_rekey() both return OFT_ERROR_CLOSED once this is zero.
+ */
+int oft_connection_is_connected(oft_connection *connection);
 
 /* Closes the connection. Safe to call more than once. */
 void oft_connection_disconnect(oft_connection *connection);

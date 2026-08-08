@@ -15,25 +15,25 @@ public sealed class OftConnectorTests
     [Fact]
     public async Task Connect_NoOptions_UsesDefaults()
     {
-        await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0));
+        using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0));
 
         IOftConnector connector = new OftConnector();
-        await using IOftConnection connection = await connector.Connect("127.0.0.1", listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
+        using IOftConnection connection = await connector.Connect("127.0.0.1", listener.LocalEndPoint.Port).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        Assert.Equal(string.Empty, connection.RemoteInfo);
+        Assert.Equal(string.Empty, connection.Identity.Info);
     }
 
     [Fact]
     public async Task Connect_ReceivedNeverMissesAMessageSentImmediately()
     {
-        OftHostOptions hostOptions = new()
+        OftConnectionOptions hostOptions = new()
         {
             Info = "server",
-            ServerCertificate = TestCertificate.Create(),
+            Certificate = TestCertificate.Create(),
             SecurityMode = OftSecurityMode.ServerAuthentication,
         };
 
-        await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
+        using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
 
         // Queued as early as structurally possible - before this connection's own send loop even
         // exists yet (see IOftListener.ConnectedHandler's contract) - so it's flushed as the very
@@ -42,14 +42,14 @@ public sealed class OftConnectorTests
         listener.ConnectedHandler = connection => _ = connection.Send("immediate"u8.ToArray());
 
         IOftConnector connector = new OftConnector();
-        OftConnectOptions connectOptions = new()
+        OftConnectionOptions connectOptions = new()
         {
             Info = "client",
             SecurityMode = OftSecurityMode.ServerAuthentication,
-            ServerCertificateValidation = (_, _, _, _) => true,
+            CertificateValidation = (_, _, _, _) => true,
         };
 
-        await using IOftConnection connection = await connector.Connect("127.0.0.1", listener.LocalEndPoint.Port, connectOptions).WaitAsync(OftTestHarness.DefaultTimeout);
+        using IOftConnection connection = await connector.Connect("127.0.0.1", listener.LocalEndPoint.Port, connectOptions).WaitAsync(OftTestHarness.DefaultTimeout);
 
         // Assigning ReceivedHandler after Connect() returns is safe precisely because it's backed by
         // OftBufferedHandlerSlot: nothing raised before this assignment is lost, so this isn't a

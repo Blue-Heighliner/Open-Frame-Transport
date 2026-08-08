@@ -18,10 +18,10 @@ public interface IOftConnector
     /// <param name="cancellationToken">A token used to cancel connecting.</param>
     /// <returns>The established connection.</returns>
     /// <exception cref="ArgumentException">
-    /// <see cref="OftConnectOptions.ClientCertificates"/> was not set and
+    /// <see cref="OftConnectionOptions.Certificate"/> was not set and
     /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.DualAuthentication"/>.
     /// </exception>
-    Task<IOftConnection> Connect(string host, int port, OftConnectOptions? options = null, CancellationToken cancellationToken = default);
+    Task<IOftConnection> Connect(string host, int port, OftConnectionOptions? options = null, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -30,14 +30,14 @@ public interface IOftConnector
 public sealed class OftConnector : IOftConnector
 {
     /// <inheritdoc />
-    public async Task<IOftConnection> Connect(string host, int port, OftConnectOptions? options = null, CancellationToken cancellationToken = default)
+    public async Task<IOftConnection> Connect(string host, int port, OftConnectionOptions? options = null, CancellationToken cancellationToken = default)
     {
-        options ??= new OftConnectOptions { Info = string.Empty };
+        options ??= new OftConnectionOptions { Info = string.Empty };
 
-        if (options.SecurityMode == OftSecurityMode.DualAuthentication && (options.ClientCertificates is null || options.ClientCertificates.Count == 0))
+        if (options.SecurityMode == OftSecurityMode.DualAuthentication && options.Certificate is null)
         {
             throw new ArgumentException(
-                $"{nameof(OftConnectOptions.ClientCertificates)} is required when {nameof(OftConnectionOptions.SecurityMode)} is {nameof(OftSecurityMode.DualAuthentication)}.",
+                $"{nameof(OftConnectionOptions.Certificate)} is required when {nameof(OftConnectionOptions.SecurityMode)} is {nameof(OftSecurityMode.DualAuthentication)}.",
                 nameof(options));
         }
 

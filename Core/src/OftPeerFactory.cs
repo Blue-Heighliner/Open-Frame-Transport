@@ -13,11 +13,11 @@ public interface IOftPeerFactory
     /// </summary>
     /// <param name="options">
     /// The peer's options. When <see langword="null"/>, options with default values (and an empty
-    /// <see cref="OftPeerOptions.Info"/>) are used.
+    /// <see cref="OftConnectionOptions.Info"/>) are used.
     /// </param>
     /// <returns>The new peer.</returns>
     /// <exception cref="ArgumentException">
-    /// <see cref="OftPeerOptions.SecurityMode"/> is <see cref="OftSecurityMode.ServerAuthentication"/> — not a
+    /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.ServerAuthentication"/> — not a
     /// valid mode for a peer, which has no client/server delineation and so cannot express a
     /// one-sided authentication requirement (use <see cref="OftSecurityMode.DualAuthentication"/> instead).
     /// </exception>
@@ -70,30 +70,11 @@ public sealed class OftPeerFactory : IOftPeerFactory
                 nameof(options));
         }
 
-        OftConnectOptions connectOptions = new()
-        {
-            Info = options.Info,
-            MaxPacketDataSize = options.MaxPacketDataSize,
-            RekeyInterval = options.RekeyInterval,
-            SecurityMode = options.SecurityMode,
-            PollInterval = options.PollInterval,
-            PollTimeout = options.PollTimeout,
-            ClientCertificates = options.ClientCertificates,
-            ServerCertificateValidation = options.CertificateValidation,
-        };
-
-        OftHostOptions hostOptions = new()
-        {
-            Info = options.Info,
-            MaxPacketDataSize = options.MaxPacketDataSize,
-            RekeyInterval = options.RekeyInterval,
-            SecurityMode = options.SecurityMode,
-            PollInterval = options.PollInterval,
-            PollTimeout = options.PollTimeout,
-            ServerCertificate = options.ServerCertificate,
-            ClientCertificateValidation = options.CertificateValidation,
-        };
-
-        return new OftPeer(options, this.connector, connectOptions, this.hoster, hostOptions);
+        // options is itself an OftConnectionOptions (OftPeerOptions extends it), so it's passed
+        // directly as both the connectOptions and hostOptions arguments below - no separate copy
+        // needed. OftConnectionOptions' meaning for Certificate/CertificateValidation already
+        // depends on which of IOftConnector.Connect/IOftHoster.Host it's passed to (see its own doc
+        // comment), so the same value naturally serves both roles here too.
+        return new OftPeer(options, this.connector, options, this.hoster, options);
     }
 }

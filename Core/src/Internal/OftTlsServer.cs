@@ -27,6 +27,27 @@ internal sealed class OftTlsServer : DefaultTlsServer
         this.clientCertificateValidation = clientCertificateValidation;
     }
 
+    /// <summary>
+    /// The certificate the client presented during the TLS handshake (only ever requested under
+    /// <see cref="OftSecurityMode.DualAuthentication"/>), or <see langword="null"/> if none was
+    /// requested or presented.
+    /// </summary>
+    public X509Certificate2? RemoteCertificate { get; private set; }
+
+    /// <summary>
+    /// The certificate chain built while validating <see cref="RemoteCertificate"/>, or
+    /// <see langword="null"/> if <see cref="RemoteCertificate"/> is. Ownership belongs to whoever
+    /// reads this property; disposed by <see cref="OftConnection"/> once it's done with it.
+    /// </summary>
+    public X509Chain? RemoteCertificateChain { get; private set; }
+
+    /// <summary>
+    /// The policy errors found while validating <see cref="RemoteCertificate"/>'s chain, or
+    /// <see cref="SslPolicyErrors.None"/> whenever <see cref="RemoteCertificateChain"/> is
+    /// <see langword="null"/>.
+    /// </summary>
+    public SslPolicyErrors RemoteCertificateSslErrors { get; private set; }
+
     protected override ProtocolVersion[] GetSupportedVersions() => ProtocolVersion.TLSv13.Only();
 
     public override TlsCredentials GetCredentials()
@@ -56,6 +77,11 @@ internal sealed class OftTlsServer : DefaultTlsServer
             null);
     }
 
-    public override void NotifyClientCertificate(Certificate clientCertificate) =>
-        OftTlsCertificates.Validate(clientCertificate, this.clientCertificateValidation, targetHost: null);
+    public override void NotifyClientCertificate(Certificate clientCertificate)
+    {
+        this.RemoteCertificate = OftTlsCertificates.ExtractLeafCertificate(clientCertificate);
+        this.RemoteCertificateChain = OftTlsCertificates.Validate(
+            clientCertificate, this.clientCertificateValidation, targetHost: null, out SslPolicyErrors sslErrors);
+        this.RemoteCertificateSslErrors = sslErrors;
+    }
 }

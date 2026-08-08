@@ -5,7 +5,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_Small_DeliveredAsUnit()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -20,7 +20,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_EmptyPayload_DeliveredAsEmptyMessage()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -34,7 +34,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_LargerThanPacketSize_SplitAndReassembled()
     {
-        await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -49,7 +49,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_ExactlyOnePacketSize_DeliveredAsUnit()
     {
-        await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -62,9 +62,28 @@ public sealed class MessageTests
     }
 
     [Fact]
+    public async Task Send_OneByteOverPacketSize_SplitWithMinimalFinalChunk()
+    {
+        // The smallest possible split: one full Data chunk plus a 1-byte Completion chunk. This is
+        // the boundary case the Completion-carries-the-proto3-default-control-value design (Docs/OFT.md
+        // §4) depends on - a Completion packet's data must never be empty, and this is as close to
+        // empty as a real one can get.
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
+
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
+
+        byte[] payload = [.. Enumerable.Range(0, 17).Select(i => (byte)i)];
+        await pair.ClientConnection.Send(payload, priority: 1);
+
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
+    }
+
+    [Fact]
     public async Task Send_IsBidirectional()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ClientConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -79,7 +98,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_HigherPriorityInterruptsLowerPriority()
     {
-        await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
 
         List<int> receivedOrder = [];
         TaskCompletionSource<bool> bothReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -114,7 +133,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_CancelledBeforeStart_NeverDelivered()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         using CancellationTokenSource cts = new();
         TaskCompletionSource<bool> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -137,7 +156,7 @@ public sealed class MessageTests
     [Fact]
     public async Task Send_CancelledAfterStart_SendsCancellationAndConnectionStaysHealthy()
     {
-        await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
 
         using CancellationTokenSource cts = new();
         byte[] payload = [.. Enumerable.Repeat((byte)9, 400)];

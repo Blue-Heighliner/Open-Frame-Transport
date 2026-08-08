@@ -5,7 +5,7 @@ public sealed class TrustedModeTests
     [Fact]
     public async Task Trusted_ConnectionEstablishesAndExchangesMessages()
     {
-        await using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Trusted);
+        using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Trusted);
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -18,19 +18,28 @@ public sealed class TrustedModeTests
     }
 
     [Fact]
+    public async Task Trusted_NoTlsSession_IdentityHasNoCertificate()
+    {
+        using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Trusted);
+
+        Assert.Null(pair.ClientConnection.Identity.Certificate);
+        Assert.Null(pair.ServerConnection.Identity.Certificate);
+    }
+
+    [Fact]
     public async Task Host_ServerAuthenticationModeWithoutServerCertificate_Throws()
     {
         await Assert.ThrowsAsync<ArgumentException>(() => new OftHoster().Host(
             new IPEndPoint(IPAddress.Loopback, 0),
-            new OftHostOptions { Info = "server", SecurityMode = OftSecurityMode.ServerAuthentication }));
+            new OftConnectionOptions { Info = "server", SecurityMode = OftSecurityMode.ServerAuthentication }));
     }
 
     [Fact]
     public async Task Host_TrustedWithoutServerCertificate_Succeeds()
     {
-        await using IOftListener listener = await new OftHoster().Host(
+        using IOftListener listener = await new OftHoster().Host(
             new IPEndPoint(IPAddress.Loopback, 0),
-            new OftHostOptions { Info = "server", SecurityMode = OftSecurityMode.Trusted });
+            new OftConnectionOptions { Info = "server", SecurityMode = OftSecurityMode.Trusted });
 
         Assert.NotNull(listener);
     }
@@ -38,7 +47,7 @@ public sealed class TrustedModeTests
     [Fact]
     public async Task Rekey_OnTrustedConnection_IsNoOp()
     {
-        await using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Trusted);
+        using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Trusted);
 
         await pair.ClientConnection.Rekey().WaitAsync(OftTestHarness.DefaultTimeout);
     }
@@ -46,13 +55,13 @@ public sealed class TrustedModeTests
     [Fact]
     public async Task Trusted_HailIsExchangedDirectlyOverRawTcp()
     {
-        OftHostOptions hostOptions = new()
+        OftConnectionOptions hostOptions = new()
         {
             Info = "server",
             SecurityMode = OftSecurityMode.Trusted,
         };
 
-        await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
+        using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
 
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
@@ -68,7 +77,7 @@ public sealed class TrustedModeTests
             Assert.Equal(OftProtocolVersion.Current, serverHail!.Version);
 
             IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-            Assert.Equal("raw-client", serverConnection.RemoteInfo);
+            Assert.Equal("raw-client", serverConnection.Identity.Info);
         }
     }
 }

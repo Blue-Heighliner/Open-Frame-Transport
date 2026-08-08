@@ -3,7 +3,7 @@ namespace BlueHeighliner.OpenFrameTransport.Tests;
 /// <summary>
 /// A connected client/server pair, both established against each other, for use in tests.
 /// </summary>
-internal sealed class OftPair : IAsyncDisposable
+internal sealed class OftPair : IDisposable
 {
     public required IOftListener Listener { get; init; }
 
@@ -11,11 +11,11 @@ internal sealed class OftPair : IAsyncDisposable
 
     public required IOftConnection ClientConnection { get; init; }
 
-    public async ValueTask DisposeAsync()
+    public void Dispose()
     {
-        await this.ClientConnection.DisposeAsync();
-        await this.ServerConnection.DisposeAsync();
-        await this.Listener.DisposeAsync();
+        this.ClientConnection.Dispose();
+        this.ServerConnection.Dispose();
+        this.Listener.Dispose();
     }
 }
 
@@ -24,7 +24,7 @@ internal sealed class OftPair : IAsyncDisposable
 /// hasn't disconnected yet — since <see cref="IOftListener"/> itself doesn't (see its own doc
 /// comment), tests that need to observe accepted-connection counts do it this way instead.
 /// </summary>
-internal sealed class TrackedListener : IAsyncDisposable
+internal sealed class TrackedListener : IDisposable
 {
     private readonly IOftListener listener;
     private readonly List<IOftConnection> connections = [];
@@ -36,7 +36,7 @@ internal sealed class TrackedListener : IAsyncDisposable
         listener.ConnectedHandler = this.OnConnected;
     }
 
-    public static async Task<TrackedListener> Start(IPEndPoint listenEndPoint, OftHostOptions? options = null, CancellationToken cancellationToken = default) =>
+    public static async Task<TrackedListener> Start(IPEndPoint listenEndPoint, OftConnectionOptions? options = null, CancellationToken cancellationToken = default) =>
         new(await new OftHoster().Host(listenEndPoint, options, cancellationToken).ConfigureAwait(false));
 
     public IPEndPoint LocalEndPoint => this.listener.LocalEndPoint;
@@ -88,7 +88,7 @@ internal sealed class TrackedListener : IAsyncDisposable
         this.OnConnectedExtra?.Invoke(connection);
     }
 
-    public async ValueTask DisposeAsync() => await this.listener.DisposeAsync();
+    public void Dispose() => this.listener.Dispose();
 }
 
 /// <summary>
@@ -99,6 +99,18 @@ internal static class OftTestHarness
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(10);
 
+    /// <summary>
+    /// A longer timeout for tests that must wait out <see cref="IOftPeer"/>'s fixed, non-configurable
+    /// 30-second eviction grace period (see its own doc comment) before observing an automatic
+    /// disconnection - worst case up to another fixed, non-configurable 30-second eviction check
+    /// interval on top of that (a connection can only become clear-of-pending-data on one check and
+    /// then satisfy the grace period on a later one, never the same one). Generous margin on top of
+    /// that theoretical ~60-second worst case: observed in practice to sometimes need well over
+    /// 75 seconds, since the eviction timer is a background <see cref="Timer"/> that can drift when
+    /// other tests are consuming the thread pool concurrently.
+    /// </summary>
+    public static readonly TimeSpan EvictionTimeout = TimeSpan.FromSeconds(120);
+
     public static async Task<OftPair> Establish(
         int maxPacketDataSize = 16384,
         TimeSpan? rekeyInterval = null,
@@ -106,13 +118,13 @@ internal static class OftTestHarness
         TimeSpan? pollInterval = null,
         TimeSpan? pollTimeout = null)
     {
-        bool needsServerCertificate = securityMode is OftSecurityMode.ServerAuthentication or OftSecurityMode.DualAuthentication;
+        bool needsHostCertificate = securityMode is OftSecurityMode.ServerAuthentication or OftSecurityMode.DualAuthentication;
 
-        OftHostOptions hostOptions = new()
+        OftConnectionOptions hostOptions = new()
         {
             Info = "server",
-            ServerCertificate = needsServerCertificate ? TestCertificate.Create() : null,
-            ClientCertificateValidation = (_, _, _, _) => true,
+            Certificate = needsHostCertificate ? TestCertificate.Create() : null,
+            CertificateValidation = (_, _, _, _) => true,
             MaxPacketDataSize = maxPacketDataSize,
             RekeyInterval = rekeyInterval,
             SecurityMode = securityMode,
@@ -126,7 +138,7 @@ internal static class OftTestHarness
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
-        OftConnectOptions connectOptions = new()
+        OftConnectionOptions connectOptions = new()
         {
             Info = "client",
             MaxPacketDataSize = maxPacketDataSize,
@@ -134,8 +146,8 @@ internal static class OftTestHarness
             SecurityMode = securityMode,
             PollInterval = pollInterval ?? TimeSpan.FromSeconds(1),
             PollTimeout = pollTimeout ?? TimeSpan.FromSeconds(5),
-            ClientCertificates = securityMode == OftSecurityMode.DualAuthentication ? [TestCertificate.Create()] : null,
-            ServerCertificateValidation = (_, _, _, _) => true,
+            Certificate = securityMode == OftSecurityMode.DualAuthentication ? TestCertificate.Create() : null,
+            CertificateValidation = (_, _, _, _) => true,
         };
 
         IOftConnector connector = new OftConnector();

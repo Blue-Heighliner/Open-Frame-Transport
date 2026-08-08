@@ -92,7 +92,7 @@ public sealed class OftTlsCertificatesTests
         Certificate emptyChain = Certificate.EmptyChain;
 
         AuthenticationException exception = Assert.Throws<AuthenticationException>(
-            () => OftTlsCertificates.Validate(emptyChain, callback: null, targetHost: null));
+            () => OftTlsCertificates.Validate(emptyChain, callback: null, targetHost: null, out _));
         Assert.Contains("did not present a certificate", exception.Message);
     }
 
@@ -101,10 +101,13 @@ public sealed class OftTlsCertificatesTests
     {
         Certificate emptyChain = Certificate.EmptyChain;
 
-        OftTlsCertificates.Validate(
+        X509Chain? resultChain = OftTlsCertificates.Validate(
             emptyChain,
             callback: (_, _, _, errors) => errors == SslPolicyErrors.RemoteCertificateNotAvailable,
-            targetHost: null);
+            targetHost: null,
+            out _);
+
+        Assert.Null(resultChain);
     }
 
     [Fact]
@@ -113,7 +116,7 @@ public sealed class OftTlsCertificatesTests
         Certificate emptyChain = Certificate.EmptyChain;
 
         Assert.Throws<AuthenticationException>(
-            () => OftTlsCertificates.Validate(emptyChain, callback: (_, _, _, _) => false, targetHost: null));
+            () => OftTlsCertificates.Validate(emptyChain, callback: (_, _, _, _) => false, targetHost: null, out _));
     }
 
     [Fact]
@@ -126,7 +129,7 @@ public sealed class OftTlsCertificatesTests
         // No callback supplied: falls back to .NET's default X509Chain validation, which rejects a
         // self-signed certificate no trust store recognizes.
         AuthenticationException exception = Assert.Throws<AuthenticationException>(
-            () => OftTlsCertificates.Validate(chain, callback: null, targetHost: null));
+            () => OftTlsCertificates.Validate(chain, callback: null, targetHost: null, out _));
         Assert.Contains("rejected by the validation policy", exception.Message);
     }
 
@@ -137,7 +140,7 @@ public sealed class OftTlsCertificatesTests
         BcTlsCrypto crypto = new();
         Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
 
-        OftTlsCertificates.Validate(chain, callback: (_, _, _, _) => true, targetHost: null);
+        using X509Chain? resultChain = OftTlsCertificates.Validate(chain, callback: (_, _, _, _) => true, targetHost: null, out _);
     }
 
     [Fact]
@@ -148,14 +151,15 @@ public sealed class OftTlsCertificatesTests
         Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
 
         SslPolicyErrors? observedErrors = null;
-        OftTlsCertificates.Validate(
+        using X509Chain? resultChain = OftTlsCertificates.Validate(
             chain,
             callback: (_, _, _, errors) =>
             {
                 observedErrors = errors;
                 return true;
             },
-            targetHost: "example.oft.test");
+            targetHost: "example.oft.test",
+            out _);
 
         Assert.NotNull(observedErrors);
         Assert.False(observedErrors.Value.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch));
@@ -169,14 +173,15 @@ public sealed class OftTlsCertificatesTests
         Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
 
         SslPolicyErrors? observedErrors = null;
-        OftTlsCertificates.Validate(
+        using X509Chain? resultChain = OftTlsCertificates.Validate(
             chain,
             callback: (_, _, _, errors) =>
             {
                 observedErrors = errors;
                 return true;
             },
-            targetHost: "not-example.oft.test");
+            targetHost: "not-example.oft.test",
+            out _);
 
         Assert.NotNull(observedErrors);
         Assert.True(observedErrors.Value.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch));
@@ -190,14 +195,15 @@ public sealed class OftTlsCertificatesTests
         Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
 
         SslPolicyErrors? observedErrors = null;
-        OftTlsCertificates.Validate(
+        using X509Chain? resultChain = OftTlsCertificates.Validate(
             chain,
             callback: (_, _, _, errors) =>
             {
                 observedErrors = errors;
                 return true;
             },
-            targetHost: "127.0.0.1");
+            targetHost: "127.0.0.1",
+            out _);
 
         Assert.NotNull(observedErrors);
         Assert.False(observedErrors.Value.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch));
@@ -211,14 +217,15 @@ public sealed class OftTlsCertificatesTests
         Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
 
         SslPolicyErrors? observedErrors = null;
-        OftTlsCertificates.Validate(
+        using X509Chain? resultChain = OftTlsCertificates.Validate(
             chain,
             callback: (_, _, _, errors) =>
             {
                 observedErrors = errors;
                 return true;
             },
-            targetHost: "10.0.0.1");
+            targetHost: "10.0.0.1",
+            out _);
 
         Assert.NotNull(observedErrors);
         Assert.True(observedErrors.Value.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch));
@@ -232,16 +239,78 @@ public sealed class OftTlsCertificatesTests
         Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
 
         SslPolicyErrors? observedErrors = null;
-        OftTlsCertificates.Validate(
+        using X509Chain? resultChain = OftTlsCertificates.Validate(
             chain,
             callback: (_, _, _, errors) =>
             {
                 observedErrors = errors;
                 return true;
             },
-            targetHost: null);
+            targetHost: null,
+            out _);
 
         Assert.NotNull(observedErrors);
         Assert.False(observedErrors.Value.HasFlag(SslPolicyErrors.RemoteCertificateNameMismatch));
+    }
+
+    [Fact]
+    public void ExtractLeafCertificate_EmptyChain_ReturnsNull()
+    {
+        Assert.Null(OftTlsCertificates.ExtractLeafCertificate(Certificate.EmptyChain));
+    }
+
+    [Fact]
+    public void ExtractLeafCertificate_NonEmptyChain_ReturnsLeaf()
+    {
+        using X509Certificate2 certificate = TestCertificate.Create();
+        BcTlsCrypto crypto = new();
+        Certificate chain = OftTlsCertificates.ToBcCertificateChain(certificate, crypto);
+
+        using X509Certificate2? leaf = OftTlsCertificates.ExtractLeafCertificate(chain);
+
+        Assert.NotNull(leaf);
+        Assert.Equal(certificate.RawData, leaf!.RawData);
+    }
+
+    [Fact]
+    public void ExtractCommonName_CertificateHasCommonName_ReturnsIt()
+    {
+        using X509Certificate2 certificate = TestCertificate.Create();
+
+        Assert.Equal("localhost", OftTlsCertificates.ExtractCommonName(certificate.SubjectName));
+    }
+
+    [Fact]
+    public void ExtractCommonName_NoCommonName_ReturnsNull()
+    {
+        using RSA rsa = RSA.Create(2048);
+        System.Security.Cryptography.X509Certificates.CertificateRequest request = new("O=NoCommonNameHere", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using X509Certificate2 certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
+
+        Assert.Null(OftTlsCertificates.ExtractCommonName(certificate.SubjectName));
+    }
+
+    [Fact]
+    public void ExtractSubjectAlternativeNames_NoSanExtension_ReturnsEmpty()
+    {
+        using X509Certificate2 certificate = TestCertificate.Create();
+
+        Assert.Empty(OftTlsCertificates.ExtractSubjectAlternativeNames(certificate));
+    }
+
+    [Fact]
+    public void ExtractSubjectAlternativeNames_DnsSan_ReturnsIt()
+    {
+        using X509Certificate2 certificate = TestCertificate.CreateWithDnsName("example.oft.test");
+
+        Assert.Equal(["example.oft.test"], OftTlsCertificates.ExtractSubjectAlternativeNames(certificate));
+    }
+
+    [Fact]
+    public void ExtractSubjectAlternativeNames_IpAddressSan_ReturnsIt()
+    {
+        using X509Certificate2 certificate = TestCertificate.CreateWithIpAddress(IPAddress.Loopback);
+
+        Assert.Equal(["127.0.0.1"], OftTlsCertificates.ExtractSubjectAlternativeNames(certificate));
     }
 }

@@ -14,6 +14,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @Timeout(value = 30, unit = TimeUnit.SECONDS)
@@ -28,6 +29,14 @@ final class TrustedModeTest {
             pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
 
             assertEquals("hello over plain tcp", new String(received.poll(10, TimeUnit.SECONDS)));
+        }
+    }
+
+    @Test
+    void trusted_noTlsSession_identityHasNoCertificate() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish(16384, null, OftSecurityMode.TRUSTED, Duration.ofSeconds(1), Duration.ofSeconds(5))) {
+            assertNull(pair.clientConnection().getIdentity().certificate());
+            assertNull(pair.serverConnection().getIdentity().certificate());
         }
     }
 
@@ -94,7 +103,7 @@ final class TrustedModeTest {
                 assertEquals(OftProtocolVersion.CURRENT, serverHail.getVersion());
 
                 OftConnection serverConnection = serverConnectionFuture.get(10, TimeUnit.SECONDS);
-                assertEquals("raw-client", serverConnection.getRemoteInfo());
+                assertEquals("raw-client", serverConnection.getIdentity().info());
             }
         }
     }

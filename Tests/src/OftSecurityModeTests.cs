@@ -7,7 +7,7 @@ public sealed class OftSecurityModeTests
     {
         // Secure mode needs no certificates from either side: the host generates its own
         // throwaway certificate internally, and the connecting side accepts it unconditionally.
-        await using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Secure);
+        using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.Secure);
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -20,56 +20,56 @@ public sealed class OftSecurityModeTests
     }
 
     [Fact]
-    public async Task Secure_ConfiguredServerCertificateIsIgnored()
+    public async Task Secure_ConfiguredCertificateIsIgnored()
     {
-        // A caller-supplied ServerCertificate is meaningless under Secure mode (nothing validates
-        // it), so hosting must succeed even though this certificate is never actually presented.
+        // A caller-supplied Certificate is meaningless under Secure mode (nothing validates it), so
+        // hosting must succeed even though this certificate is never actually presented.
         X509Certificate2 unusedCertificate = TestCertificate.Create();
 
-        await using IOftListener listener = await new OftHoster().Host(
+        using IOftListener listener = await new OftHoster().Host(
             new IPEndPoint(IPAddress.Loopback, 0),
-            new OftHostOptions { Info = "server", SecurityMode = OftSecurityMode.Secure, ServerCertificate = unusedCertificate });
+            new OftConnectionOptions { Info = "server", SecurityMode = OftSecurityMode.Secure, Certificate = unusedCertificate });
 
         Assert.NotNull(listener);
     }
 
     [Fact]
-    public async Task DualAuthentication_ConnectWithoutClientCertificates_Throws()
+    public async Task DualAuthentication_ConnectWithoutClientCertificate_Throws()
     {
         await Assert.ThrowsAsync<ArgumentException>(() => new OftConnector().Connect(
             "127.0.0.1",
             OftTestHarness.ReserveFreePort(),
-            new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.DualAuthentication }));
+            new OftConnectionOptions { Info = "client", SecurityMode = OftSecurityMode.DualAuthentication }));
     }
 
     [Fact]
     public async Task DualAuthentication_BothSidesPresentCertificates_ConnectionEstablishesAndExchangesMessages()
     {
-        OftHostOptions hostOptions = new()
+        OftConnectionOptions hostOptions = new()
         {
             Info = "server",
             SecurityMode = OftSecurityMode.DualAuthentication,
-            ServerCertificate = TestCertificate.Create(),
-            ClientCertificateValidation = (_, _, _, _) => true,
+            Certificate = TestCertificate.Create(),
+            CertificateValidation = (_, _, _, _) => true,
         };
 
-        await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
+        using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
 
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);
 
-        OftConnectOptions connectOptions = new()
+        OftConnectionOptions connectOptions = new()
         {
             Info = "client",
             SecurityMode = OftSecurityMode.DualAuthentication,
-            ClientCertificates = [TestCertificate.Create()],
-            ServerCertificateValidation = (_, _, _, _) => true,
+            Certificate = TestCertificate.Create(),
+            CertificateValidation = (_, _, _, _) => true,
         };
 
-        await using IOftConnection clientConnection = await new OftConnector()
+        using IOftConnection clientConnection = await new OftConnector()
             .Connect("127.0.0.1", listener.LocalEndPoint.Port, connectOptions)
             .WaitAsync(OftTestHarness.DefaultTimeout);
-        await using IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        using IOftConnection serverConnection = await serverConnectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         serverConnection.ReceivedHandler = data => received.TrySetResult(data);

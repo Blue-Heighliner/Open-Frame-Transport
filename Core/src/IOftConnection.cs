@@ -4,18 +4,18 @@ namespace BlueHeighliner.OpenFrameTransport;
 /// A single established OFT connection, as described in README.md. Instances are produced by
 /// <see cref="IOftHoster"/>/<see cref="IOftListener"/> (for inbound connections) and
 /// <see cref="IOftConnector"/> (for outbound connections), never constructed directly.
+/// <see cref="IDisposable.Dispose"/> immediately terminates the connection and releases its
+/// resources, without waiting for its background work to finish; call <see cref="Disconnect"/>
+/// instead for a graceful, awaitable teardown that waits for it.
 /// </summary>
-public interface IOftConnection : IAsyncDisposable
+public interface IOftConnection : IDisposable
 {
     /// <summary>
-    /// The remote TCP endpoint of this connection.
+    /// This connection's remote identity: its TCP endpoint, its TLS certificate (if any was
+    /// presented), and the opaque, application-controlled data it sent in its hail (see
+    /// Docs/OFT.md §3).
     /// </summary>
-    IPEndPoint RemoteEndPoint { get; }
-
-    /// <summary>
-    /// The opaque, application-controlled data the peer sent in its hail (see Docs/OFT.md §3).
-    /// </summary>
-    string RemoteInfo { get; }
+    OftIdentity Identity { get; }
 
     /// <summary>
     /// When the OFT handshake (TLS session plus hail exchange) completed.
@@ -31,6 +31,16 @@ public interface IOftConnection : IAsyncDisposable
     /// When the last packet was received on the connection.
     /// </summary>
     DateTimeOffset LastReceivedAt { get; }
+
+    /// <summary>
+    /// Whether this connection is still connected: <see langword="true"/> until it closes, for any
+    /// reason — a local <see cref="Disconnect"/>/<see cref="IDisposable.Dispose"/> call, the remote
+    /// side disconnecting, or an unrecoverable error (e.g. a liveness timeout) — after which it is
+    /// permanently <see langword="false"/>. <see cref="Send(ReadOnlyMemory{byte}, int, CancellationToken)"/>
+    /// and <see cref="Rekey"/> both throw <see cref="OftDisconnectedException"/> once this is
+    /// <see langword="false"/>.
+    /// </summary>
+    bool IsConnected { get; }
 
     /// <summary>
     /// Whether this connection currently has any outbound message that hasn't been fully
@@ -80,6 +90,7 @@ public interface IOftConnection : IAsyncDisposable
     /// sending, or by sending a <c>Cancellation</c> packet if it has (see Docs/OFT.md §7).
     /// </param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
+    /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
     Task Send(ReadOnlyMemory<byte> data, int priority = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -102,6 +113,7 @@ public interface IOftConnection : IAsyncDisposable
     /// sending, or by sending a <c>Cancellation</c> packet if it has (see Docs/OFT.md §7).
     /// </param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
+    /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
     Task Send(IMemoryOwner<byte> data, int priority = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -113,10 +125,16 @@ public interface IOftConnection : IAsyncDisposable
     /// </summary>
     /// <param name="cancellationToken">A token used to cancel the request before it's sent.</param>
     /// <returns>A task that completes once the local key update request has been sent.</returns>
+    /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
     Task Rekey(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Closes the connection.
+    /// Closes the connection and waits for its background work (its receive and send loops) to fully
+    /// finish, for a graceful teardown. Equivalent to <see cref="IDisposable.Dispose"/> for the
+    /// purpose of releasing this connection's resources — the connection is already closed and its
+    /// resources already released by the time this returns — but, unlike <see cref="IDisposable.Dispose"/>,
+    /// does not return until that background work has completely stopped.
     /// </summary>
+    /// <returns>A task that completes once the connection has fully closed.</returns>
     Task Disconnect();
 }

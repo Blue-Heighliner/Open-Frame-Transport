@@ -264,21 +264,23 @@ void oft_packet_free(oft_packet *packet) {
 
 int oft_packet_encode(const oft_packet *packet, oft_buffer *out) {
     /*
-     * The control field is always emitted, even when 0 (Receipt), matching the explicit field
-     * presence the .proto declares for it ("optional uint32 control"): without that, a Receipt
-     * (control 0, empty data) would serialize identically to Poll's bare zero-length frame (see
-     * Docs/OFT.md §4 and §10) under plain proto3 default-value omission. This codebase never
-     * constructs an oft_packet with a genuinely *absent* control - Poll is written as its own
-     * dedicated zero-length frame, never through this encoder - so always emitting the tag here is
-     * exactly equivalent to what the real protobuf runtimes the C#/Java ports use do for a field
-     * they've explicitly set to any value, including its default.
+     * Matches plain proto3 default-value omission - control is only emitted when nonzero, exactly
+     * like the real protobuf runtimes the C#/Java ports use do for a field left at its default
+     * value. This is safe because control 0 (Completion) is the only control value
+     * that could ever be omitted this way, and a Completion packet is only ever the final chunk of
+     * a message too large to fit in one packet (see Docs/OFT.md §4), so its data field is always
+     * non-empty and alone always forces a nonzero-length frame, so it can never collide with Poll's
+     * bare zero-length frame (Docs/OFT.md §4, §10) even with control omitted. Every other control
+     * value is itself nonzero and is always emitted.
      */
-    if (append_tag(out, 1, 0) != 0) {
-        return -1;
-    }
+    if (packet->control != 0) {
+        if (append_tag(out, 1, 0) != 0) {
+            return -1;
+        }
 
-    if (append_varint(out, packet->control) != 0) {
-        return -1;
+        if (append_varint(out, packet->control) != 0) {
+            return -1;
+        }
     }
 
     if (packet->length > 0) {

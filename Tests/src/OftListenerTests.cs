@@ -2,25 +2,25 @@ namespace BlueHeighliner.OpenFrameTransport.Tests;
 
 public sealed class OftListenerTests
 {
-    private static OftHostOptions CreateOptions() => new()
+    private static OftConnectionOptions CreateOptions() => new()
     {
         Info = "server",
-        ServerCertificate = TestCertificate.Create(),
+        Certificate = TestCertificate.Create(),
         SecurityMode = OftSecurityMode.ServerAuthentication,
     };
 
     private static IPEndPoint LoopbackEndPoint() => new(IPAddress.Loopback, 0);
 
     [Fact]
-    public async Task DisposeAsync_CalledTwice_IsIdempotent()
+    public async Task Dispose_CalledTwice_IsIdempotent()
     {
         IOftListener listener = await new OftHoster().Host(LoopbackEndPoint(), CreateOptions());
-        await listener.DisposeAsync();
-        await listener.DisposeAsync();
+        listener.Dispose();
+        listener.Dispose();
     }
 
     [Fact]
-    public async Task DisposeAsync_DoesNotAffectAlreadyAcceptedConnections()
+    public async Task Dispose_DoesNotAffectAlreadyAcceptedConnections()
     {
         IOftListener listener = await new OftHoster().Host(LoopbackEndPoint(), CreateOptions());
 
@@ -28,18 +28,18 @@ public sealed class OftListenerTests
         listener.ConnectedHandler = connection => connectionSource.TrySetResult(connection);
 
         IOftConnector connector = new OftConnector();
-        await using IOftConnection clientConnection = await connector.Connect(
+        using IOftConnection clientConnection = await connector.Connect(
                 "127.0.0.1",
                 listener.LocalEndPoint.Port,
-                new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.ServerAuthentication, ServerCertificateValidation = (_, _, _, _) => true })
+                new OftConnectionOptions { Info = "client", SecurityMode = OftSecurityMode.ServerAuthentication, CertificateValidation = (_, _, _, _) => true })
             .WaitAsync(OftTestHarness.DefaultTimeout);
 
-        await using IOftConnection serverConnection = await connectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        using IOftConnection serverConnection = await connectionSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
         // The listener doesn't track the connections it has accepted (see IOftListener's own doc
         // comment), so disposing it only stops the accept loop - it must leave an already-accepted
         // connection fully alive and usable.
-        await listener.DisposeAsync();
+        listener.Dispose();
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         serverConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -54,7 +54,7 @@ public sealed class OftListenerTests
     [Fact]
     public async Task HandleAccepted_MalformedClient_DoesNotAffectListener()
     {
-        await using IOftListener listener = await new OftHoster().Host(LoopbackEndPoint(), CreateOptions());
+        using IOftListener listener = await new OftHoster().Host(LoopbackEndPoint(), CreateOptions());
         bool established = false;
         listener.ConnectedHandler = _ => established = true;
 
@@ -69,10 +69,10 @@ public sealed class OftListenerTests
 
         // The listener is still healthy afterward: a real client can still connect.
         IOftConnector connector = new OftConnector();
-        await using IOftConnection connection = await connector.Connect(
+        using IOftConnection connection = await connector.Connect(
                 "127.0.0.1",
                 listener.LocalEndPoint.Port,
-                new OftConnectOptions { Info = "client", SecurityMode = OftSecurityMode.ServerAuthentication, ServerCertificateValidation = (_, _, _, _) => true })
+                new OftConnectionOptions { Info = "client", SecurityMode = OftSecurityMode.ServerAuthentication, CertificateValidation = (_, _, _, _) => true })
             .WaitAsync(OftTestHarness.DefaultTimeout);
     }
 
@@ -81,7 +81,7 @@ public sealed class OftListenerTests
     {
         int port = OftTestHarness.ReserveFreePort();
 
-        await using IOftListener listener = await new OftHoster().Host(port);
+        using IOftListener listener = await new OftHoster().Host(port);
 
         Assert.Equal(IPAddress.Any, listener.LocalEndPoint.Address);
         Assert.Equal(port, listener.LocalEndPoint.Port);

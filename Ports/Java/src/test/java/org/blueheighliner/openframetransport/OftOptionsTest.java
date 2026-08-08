@@ -91,7 +91,6 @@ final class OftOptionsTest {
                 .idleTimeout(Duration.ofMinutes(2))
                 .maxConnectionLifetime(Duration.ofMinutes(30))
                 .maxConnectionCount(64)
-                .evictionCheckInterval(Duration.ofSeconds(15))
                 .build();
 
         assertEquals("peer", options.info());
@@ -104,7 +103,6 @@ final class OftOptionsTest {
         assertEquals(Duration.ofMinutes(2), options.idleTimeout());
         assertEquals(Duration.ofMinutes(30), options.maxConnectionLifetime());
         assertEquals(64, options.maxConnectionCount());
-        assertEquals(Duration.ofSeconds(15), options.evictionCheckInterval());
     }
 
     @Test
@@ -115,9 +113,8 @@ final class OftOptionsTest {
         assertEquals(OftSecurityMode.SECURE, options.securityMode());
         assertEquals(Duration.ofSeconds(1), options.pollInterval());
         assertEquals(Duration.ofSeconds(5), options.pollTimeout());
-        assertEquals(Duration.ofMinutes(5), options.idleTimeout());
-        assertEquals(Duration.ofHours(1), options.maxConnectionLifetime());
-        assertEquals(128, options.maxConnectionCount());
-        assertEquals(Duration.ofSeconds(30), options.evictionCheckInterval());
+        assertEquals(Duration.ofHours(2), options.idleTimeout());
+        assertEquals(Duration.ofDays(1), options.maxConnectionLifetime());
+        assertEquals(16, options.maxConnectionCount());
     }
 }

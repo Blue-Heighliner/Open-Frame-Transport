@@ -5,7 +5,7 @@ public sealed class LivenessPollingTests
     [Fact]
     public async Task Poll_KeepsIdleConnectionAliveBeyondPollTimeout()
     {
-        await using OftPair pair = await OftTestHarness.Establish(
+        using OftPair pair = await OftTestHarness.Establish(
             pollInterval: TimeSpan.FromMilliseconds(50),
             pollTimeout: TimeSpan.FromMilliseconds(200));
 
@@ -23,7 +23,7 @@ public sealed class LivenessPollingTests
     [Fact]
     public async Task Poll_ClosesConnectionWhenPeerGoesSilent()
     {
-        OftHostOptions hostOptions = new()
+        OftConnectionOptions hostOptions = new()
         {
             Info = "server",
             SecurityMode = OftSecurityMode.Trusted,
@@ -31,7 +31,7 @@ public sealed class LivenessPollingTests
             PollTimeout = TimeSpan.FromMilliseconds(200),
         };
 
-        await using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
+        using IOftListener listener = await new OftHoster().Host(new IPEndPoint(IPAddress.Loopback, 0), hostOptions);
 
         TaskCompletionSource<IOftConnection> serverConnectionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         listener.ConnectedHandler = connection => serverConnectionSource.TrySetResult(connection);

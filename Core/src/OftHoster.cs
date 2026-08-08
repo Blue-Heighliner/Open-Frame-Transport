@@ -16,11 +16,11 @@ public interface IOftHoster
     /// <param name="cancellationToken">A token that stops the resulting listener when cancelled.</param>
     /// <returns>The new listener.</returns>
     /// <exception cref="ArgumentException">
-    /// <see cref="OftHostOptions.ServerCertificate"/> was not set and
+    /// <see cref="OftConnectionOptions.Certificate"/> was not set and
     /// <see cref="OftConnectionOptions.SecurityMode"/> requires one (see
     /// <see cref="OftSecurityMode.ServerAuthentication"/>/<see cref="OftSecurityMode.DualAuthentication"/>).
     /// </exception>
-    Task<IOftListener> Host(IPEndPoint listenEndPoint, OftHostOptions? options = null, CancellationToken cancellationToken = default);
+    Task<IOftListener> Host(IPEndPoint listenEndPoint, OftConnectionOptions? options = null, CancellationToken cancellationToken = default);
 }
 
 /// <summary>
@@ -29,14 +29,14 @@ public interface IOftHoster
 public sealed class OftHoster : IOftHoster
 {
     /// <inheritdoc />
-    public Task<IOftListener> Host(IPEndPoint listenEndPoint, OftHostOptions? options = null, CancellationToken cancellationToken = default)
+    public Task<IOftListener> Host(IPEndPoint listenEndPoint, OftConnectionOptions? options = null, CancellationToken cancellationToken = default)
     {
-        options ??= new OftHostOptions { Info = string.Empty };
+        options ??= new OftConnectionOptions { Info = string.Empty };
 
-        if (options.SecurityMode is OftSecurityMode.ServerAuthentication or OftSecurityMode.DualAuthentication && options.ServerCertificate is null)
+        if (options.SecurityMode is OftSecurityMode.ServerAuthentication or OftSecurityMode.DualAuthentication && options.Certificate is null)
         {
             throw new ArgumentException(
-                $"{nameof(OftHostOptions.ServerCertificate)} is required when {nameof(OftConnectionOptions.SecurityMode)} is " +
+                $"{nameof(OftConnectionOptions.Certificate)} is required when {nameof(OftConnectionOptions.SecurityMode)} is " +
                 $"{nameof(OftSecurityMode.ServerAuthentication)} or {nameof(OftSecurityMode.DualAuthentication)}.",
                 nameof(options));
         }
@@ -54,7 +54,7 @@ public static class OftHosterExtensions
     /// <summary>
     /// Starts listening for inbound OFT connections on <paramref name="port"/>, on any local IP
     /// address. Equivalent to calling
-    /// <see cref="IOftHoster.Host(IPEndPoint, OftHostOptions?, CancellationToken)"/> with
+    /// <see cref="IOftHoster.Host(IPEndPoint, OftConnectionOptions?, CancellationToken)"/> with
     /// <c>new IPEndPoint(IPAddress.Any, port)</c>.
     /// </summary>
     /// <param name="hoster">The hoster to start listening with.</param>
@@ -66,10 +66,10 @@ public static class OftHosterExtensions
     /// <param name="cancellationToken">A token that stops the resulting listener when cancelled.</param>
     /// <returns>The new listener.</returns>
     /// <exception cref="ArgumentException">
-    /// <see cref="OftHostOptions.ServerCertificate"/> was not set and
+    /// <see cref="OftConnectionOptions.Certificate"/> was not set and
     /// <see cref="OftConnectionOptions.SecurityMode"/> requires one (see
     /// <see cref="OftSecurityMode.ServerAuthentication"/>/<see cref="OftSecurityMode.DualAuthentication"/>).
     /// </exception>
-    public static Task<IOftListener> Host(this IOftHoster hoster, int port, OftHostOptions? options = null, CancellationToken cancellationToken = default) =>
+    public static Task<IOftListener> Host(this IOftHoster hoster, int port, OftConnectionOptions? options = null, CancellationToken cancellationToken = default) =>
         hoster.Host(new IPEndPoint(IPAddress.Any, port), options, cancellationToken);
 }

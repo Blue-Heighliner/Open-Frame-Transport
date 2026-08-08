@@ -17,7 +17,7 @@ public enum OftSecurityMode
     /// <summary>
     /// TLS provides encryption (and integrity) in transit, but no authentication of either side's
     /// identity: the server presents an ephemeral, throwaway certificate it generates itself
-    /// (<see cref="OftHostOptions.ServerCertificate"/> is unused), and the connecting side accepts
+    /// (<see cref="OftConnectionOptions.Certificate"/> is unused), and the connecting side accepts
     /// it unconditionally rather than validating it — there would be nothing meaningful to validate
     /// it against. This is the default.
     /// </summary>
@@ -25,7 +25,7 @@ public enum OftSecurityMode
 
     /// <summary>
     /// TLS provides both encryption and authentication of the server's identity: the server must
-    /// present its own certificate via <see cref="OftHostOptions.ServerCertificate"/>, and the
+    /// present its own certificate via <see cref="OftConnectionOptions.Certificate"/>, and the
     /// connecting side validates it normally (via a caller-supplied validation callback, or the
     /// default .NET chain/hostname validation). The client is not authenticated. Not a valid mode
     /// for <see cref="IOftPeer"/>, which has no client/server delineation and so cannot express a
@@ -36,7 +36,7 @@ public enum OftSecurityMode
     /// <summary>
     /// Mutual TLS: both sides authenticate each other. In addition to everything
     /// <see cref="ServerAuthentication"/> requires, the connecting side must present a certificate
-    /// via <see cref="OftConnectOptions.ClientCertificates"/>, and the accepting side requests and
+    /// via <see cref="OftConnectionOptions.Certificate"/>, and the accepting side requests and
     /// validates it.
     /// </summary>
     DualAuthentication,

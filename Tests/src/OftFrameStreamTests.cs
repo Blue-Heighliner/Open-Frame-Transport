@@ -9,8 +9,8 @@ public sealed class OftFrameStreamTests
         OftFrameStream writer = new(stream);
 
         await writer.Write(new Hail { Version = "oft/1", Info = "app" }, CancellationToken.None);
-        await writer.Write(new Packet { Control = 1, Data = ByteString.CopyFromUtf8("hello") }, CancellationToken.None);
-        await writer.Write(new Packet { Control = 0, Data = ByteString.Empty }, CancellationToken.None);
+        await writer.Write(new Packet { Control = 3, Data = ByteString.CopyFromUtf8("hello") }, CancellationToken.None);
+        await writer.Write(new Packet { Control = 2, Data = ByteString.Empty }, CancellationToken.None);
 
         stream.Position = 0;
         OftFrameStream reader = new(stream);
@@ -22,12 +22,12 @@ public sealed class OftFrameStreamTests
 
         Packet? unit = await reader.ReadPacket(CancellationToken.None);
         Assert.NotNull(unit);
-        Assert.Equal(1u, unit!.Control);
+        Assert.Equal(3u, unit!.Control);
         Assert.Equal("hello", unit.Data.ToStringUtf8());
 
         Packet? receipt = await reader.ReadPacket(CancellationToken.None);
         Assert.NotNull(receipt);
-        Assert.Equal(0u, receipt!.Control);
+        Assert.Equal(2u, receipt!.Control);
 
         Packet? end = await reader.ReadPacket(CancellationToken.None);
         Assert.Null(end);

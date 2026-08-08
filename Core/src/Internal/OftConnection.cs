@@ -18,6 +18,17 @@ internal sealed class OftConnection : IOftConnection
 
     private readonly OftConnectionOptions options;
 
+    private readonly X509Certificate2? remoteCertificate;
+
+    /// <summary>
+    /// The certificate chain built while validating <see cref="remoteCertificate"/>, kept alive only
+    /// long enough to pass to <see cref="OftConnectionOptions.ConnectionValidation"/> once during
+    /// <see cref="CompleteHandshake"/>, which disposes it afterward.
+    /// </summary>
+    private readonly X509Chain? remoteCertificateChain;
+
+    private readonly SslPolicyErrors remoteCertificateSslErrors;
+
     private readonly object outboundLock = new();
     private readonly Dictionary<int, Queue<PendingOutboundMessage>> outboundQueues = new();
     private readonly SemaphoreSlim sendSignal = new(0);
@@ -84,7 +95,9 @@ internal sealed class OftConnection : IOftConnection
     private readonly OftBufferedHandlerSlot<Action<IMemoryOwner<byte>>> receivedSlot = new();
     private readonly OftBufferedHandlerSlot<Action<Exception?>> disconnectedSlot = new();
 
-    private OftConnection(TcpClient tcpClient, NetworkStream networkStream, Stream plaintextStream, IOftTlsRekeyableProtocol? tlsProtocol, OftConnectionOptions options)
+    private OftConnection(
+            TcpClient tcpClient, NetworkStream networkStream, Stream plaintextStream, IOftTlsRekeyableProtocol? tlsProtocol,
+            OftConnectionOptions options, X509Certificate2? remoteCertificate, X509Chain? remoteCertificateChain, SslPolicyErrors remoteCertificateSslErrors)
     {
         this.tcpClient = tcpClient;
         this.networkStream = networkStream;
@@ -92,14 +105,19 @@ internal sealed class OftConnection : IOftConnection
         this.tlsProtocol = tlsProtocol;
         this.frameStream = new OftFrameStream(plaintextStream);
         this.options = options;
-        this.RemoteInfo = string.Empty;
+        this.remoteCertificate = remoteCertificate;
+        this.remoteCertificateChain = remoteCertificateChain;
+        this.remoteCertificateSslErrors = remoteCertificateSslErrors;
+        this.Identity = new OftIdentity
+        {
+            EndPoint = (IPEndPoint)tcpClient.Client.RemoteEndPoint!,
+            Certificate = remoteCertificate is null ? null : OftCertificateIdentity.FromCertificate(remoteCertificate),
+            Info = string.Empty,
+        };
     }
 
     /// <inheritdoc />
-    public IPEndPoint RemoteEndPoint => (IPEndPoint)this.tcpClient.Client.RemoteEndPoint!;
-
-    /// <inheritdoc />
-    public string RemoteInfo { get; private set; }
+    public OftIdentity Identity { get; private set; }
 
     /// <inheritdoc />
     public DateTimeOffset ConnectedAt => new(Interlocked.Read(ref this.connectedAtTicks), TimeSpan.Zero);
@@ -109,6 +127,9 @@ internal sealed class OftConnection : IOftConnection
 
     /// <inheritdoc />
     public DateTimeOffset LastReceivedAt => new(Interlocked.Read(ref this.lastReceivedAtTicks), TimeSpan.Zero);
+
+    /// <inheritdoc />
+    public bool IsConnected => !this.closed;
 
     /// <inheritdoc />
     public bool HasPendingData
@@ -149,25 +170,29 @@ internal sealed class OftConnection : IOftConnection
     /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Trusted"/>) and
     /// hail exchange against it, and returns the resulting established connection.
     /// </summary>
-    internal static async Task<OftConnection> EstablishAsClient(TcpClient tcpClient, string targetHost, OftConnectOptions options, CancellationToken cancellationToken)
+    internal static async Task<OftConnection> EstablishAsClient(TcpClient tcpClient, string targetHost, OftConnectionOptions options, CancellationToken cancellationToken)
     {
         NetworkStream networkStream = tcpClient.GetStream();
 
         if (options.SecurityMode == OftSecurityMode.Trusted)
         {
-            OftConnection insecureConnection = new(tcpClient, networkStream, networkStream, tlsProtocol: null, options);
+            OftConnection insecureConnection = new(
+                tcpClient, networkStream, networkStream, tlsProtocol: null, options,
+                remoteCertificate: null, remoteCertificateChain: null, remoteCertificateSslErrors: SslPolicyErrors.None);
             await insecureConnection.CompleteHandshake(cancellationToken).ConfigureAwait(false);
             return insecureConnection;
         }
 
         BcTlsCrypto crypto = new();
         bool skipServerCertificateValidation = options.SecurityMode == OftSecurityMode.Secure;
-        OftTlsClient tlsClient = new(crypto, targetHost, skipServerCertificateValidation, options.ClientCertificates, options.ServerCertificateValidation);
+        OftTlsClient tlsClient = new(crypto, targetHost, skipServerCertificateValidation, options.Certificate, options.CertificateValidation);
         OftTlsClientProtocol protocol = new(networkStream);
 
         await RunBlockingTlsOperation(() => protocol.Connect(tlsClient), tcpClient, cancellationToken).ConfigureAwait(false);
 
-        OftConnection connection = new(tcpClient, networkStream, new OftBlockingStream(protocol.Stream), protocol, options);
+        OftConnection connection = new(
+            tcpClient, networkStream, new OftBlockingStream(protocol.Stream), protocol, options,
+            tlsClient.RemoteCertificate, tlsClient.RemoteCertificateChain, tlsClient.RemoteCertificateSslErrors);
         await connection.CompleteHandshake(cancellationToken).ConfigureAwait(false);
         return connection;
     }
@@ -177,31 +202,35 @@ internal sealed class OftConnection : IOftConnection
     /// <see cref="OftConnectionOptions.SecurityMode"/> is <see cref="OftSecurityMode.Trusted"/>) and
     /// hail exchange against it, and returns the resulting established connection.
     /// </summary>
-    internal static async Task<OftConnection> EstablishAsServer(TcpClient tcpClient, OftHostOptions options, CancellationToken cancellationToken)
+    internal static async Task<OftConnection> EstablishAsServer(TcpClient tcpClient, OftConnectionOptions options, CancellationToken cancellationToken)
     {
         NetworkStream networkStream = tcpClient.GetStream();
 
         if (options.SecurityMode == OftSecurityMode.Trusted)
         {
-            OftConnection insecureConnection = new(tcpClient, networkStream, networkStream, tlsProtocol: null, options);
+            OftConnection insecureConnection = new(
+                tcpClient, networkStream, networkStream, tlsProtocol: null, options,
+                remoteCertificate: null, remoteCertificateChain: null, remoteCertificateSslErrors: SslPolicyErrors.None);
             await insecureConnection.CompleteHandshake(cancellationToken).ConfigureAwait(false);
             return insecureConnection;
         }
 
-        // By this point ServerCertificate is always resolved: for Secure mode, IOftListener.Start
-        // has already replaced it with a listener-lifetime ephemeral certificate; for
+        // By this point Certificate is always resolved: for Secure mode, IOftListener.Start has
+        // already replaced it with a listener-lifetime ephemeral certificate; for
         // ServerAuthentication/DualAuthentication, IOftHoster.Host has already validated the caller
         // supplied a real one.
-        X509Certificate2 serverCertificate = options.ServerCertificate!;
+        X509Certificate2 serverCertificate = options.Certificate!;
 
         BcTlsCrypto crypto = new();
         bool requireClientCertificate = options.SecurityMode == OftSecurityMode.DualAuthentication;
-        OftTlsServer tlsServer = new(crypto, serverCertificate, requireClientCertificate, options.ClientCertificateValidation);
+        OftTlsServer tlsServer = new(crypto, serverCertificate, requireClientCertificate, options.CertificateValidation);
         OftTlsServerProtocol protocol = new(networkStream);
 
         await RunBlockingTlsOperation(() => protocol.Accept(tlsServer), tcpClient, cancellationToken).ConfigureAwait(false);
 
-        OftConnection connection = new(tcpClient, networkStream, new OftBlockingStream(protocol.Stream), protocol, options);
+        OftConnection connection = new(
+            tcpClient, networkStream, new OftBlockingStream(protocol.Stream), protocol, options,
+            tlsServer.RemoteCertificate, tlsServer.RemoteCertificateChain, tlsServer.RemoteCertificateSslErrors);
         await connection.CompleteHandshake(cancellationToken).ConfigureAwait(false);
         return connection;
     }
@@ -237,7 +266,11 @@ internal sealed class OftConnection : IOftConnection
 
     private Task EnqueueMessage(ReadOnlyMemory<byte> data, IMemoryOwner<byte>? owner, int priority, CancellationToken cancellationToken)
     {
-        ObjectDisposedException.ThrowIf(this.closed, this);
+        if (this.closed)
+        {
+            throw new OftDisconnectedException("This connection is no longer connected.");
+        }
+
         ArgumentOutOfRangeException.ThrowIfNegative(priority);
 
         TaskCompletionSource completionSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -273,6 +306,11 @@ internal sealed class OftConnection : IOftConnection
     /// <inheritdoc />
     public async Task Rekey(CancellationToken cancellationToken = default)
     {
+        if (this.closed)
+        {
+            throw new OftDisconnectedException("This connection is no longer connected.");
+        }
+
         if (this.tlsProtocol is null)
         {
             // No-op: an insecure (non-TLS) connection has no TLS session to rekey.
@@ -296,15 +334,12 @@ internal sealed class OftConnection : IOftConnection
     }
 
     /// <inheritdoc />
-    public async Task Disconnect()
-    {
-        await this.Close(null).ConfigureAwait(false);
-    }
+    public void Dispose() => this.Close(null);
 
     /// <inheritdoc />
-    public async ValueTask DisposeAsync()
+    public async Task Disconnect()
     {
-        await this.Close(null).ConfigureAwait(false);
+        this.Close(null);
 
         if (this.receiveLoopTask is not null)
         {
@@ -333,24 +368,41 @@ internal sealed class OftConnection : IOftConnection
 
     private async Task CompleteHandshake(CancellationToken cancellationToken)
     {
-        Task sendHail = this.frameStream.Write(
-            new Hail { Version = OftProtocolVersion.Current, Info = this.options.Info },
-            cancellationToken);
-
-        Hail? received = await this.frameStream.ReadHail(cancellationToken).ConfigureAwait(false);
-        if (received is null)
+        try
         {
-            throw new IOException("Connection closed before completing the OFT hail handshake.");
+            Task sendHail = this.frameStream.Write(
+                new Hail { Version = OftProtocolVersion.Current, Info = this.options.Info },
+                cancellationToken);
+
+            Hail? received = await this.frameStream.ReadHail(cancellationToken).ConfigureAwait(false);
+            if (received is null)
+            {
+                throw new IOException("Connection closed before completing the OFT hail handshake.");
+            }
+
+            await sendHail.ConfigureAwait(false);
+
+            if (received.Version != OftProtocolVersion.Current)
+            {
+                throw new InvalidOperationException($"Incompatible OFT protocol version '{received.Version}'.");
+            }
+
+            this.Identity = this.Identity with { Info = received.Info };
+
+            if (this.options.ConnectionValidation is { } validate)
+            {
+                bool accepted = await validate(this.Identity, this.remoteCertificate, this.remoteCertificateChain, this.remoteCertificateSslErrors).ConfigureAwait(false);
+                if (!accepted)
+                {
+                    throw new AuthenticationException($"The connection from '{this.Identity.EndPoint}' was rejected by ConnectionValidation.");
+                }
+            }
+        }
+        finally
+        {
+            this.remoteCertificateChain?.Dispose();
         }
 
-        await sendHail.ConfigureAwait(false);
-
-        if (received.Version != OftProtocolVersion.Current)
-        {
-            throw new InvalidOperationException($"Incompatible OFT protocol version '{received.Version}'.");
-        }
-
-        this.RemoteInfo = received.Info;
         Interlocked.Exchange(ref this.connectedAtTicks, NowTicks());
         this.UpdateLastSentAt();
         this.UpdateLastReceivedAt();
@@ -425,7 +477,7 @@ internal sealed class OftConnection : IOftConnection
         }
         catch (Exception exception)
         {
-            await this.Close(exception).ConfigureAwait(false);
+            this.Close(exception);
         }
     }
 
@@ -450,12 +502,12 @@ internal sealed class OftConnection : IOftConnection
 
         if (message.CancelRequested && message.Started)
         {
-            packet = new Packet { Control = 3, Data = ByteString.Empty };
+            packet = new Packet { Control = 1, Data = ByteString.Empty };
             finishesMessage = true;
         }
         else if (!message.Started && message.Data.Length <= this.options.MaxPacketDataSize)
         {
-            packet = new Packet { Control = 1, Data = ToByteString(message.Data, message.Owner is not null) };
+            packet = new Packet { Control = 3, Data = ToByteString(message.Data, message.Owner is not null) };
             message.Started = true;
             finishesMessage = true;
         }
@@ -469,7 +521,7 @@ internal sealed class OftConnection : IOftConnection
 
             packet = new Packet
             {
-                Control = isLast ? 2u : (uint)(message.Priority + 4),
+                Control = isLast ? 0u : (uint)(message.Priority + 4),
                 Data = ToByteString(chunk, message.Owner is not null),
             };
             message.BytesSent += chunkSize;
@@ -542,7 +594,7 @@ internal sealed class OftConnection : IOftConnection
                 OftPacketRead read = await this.frameStream.ReadPacketOrPoll(this.lifetimeCts.Token).ConfigureAwait(false);
                 if (read.Kind == OftPacketReadKind.Closed)
                 {
-                    await this.Close(null).ConfigureAwait(false);
+                    this.Close(null);
                     return;
                 }
 
@@ -562,13 +614,13 @@ internal sealed class OftConnection : IOftConnection
         }
         catch (Exception exception)
         {
-            await this.Close(exception).ConfigureAwait(false);
+            this.Close(exception);
         }
     }
 
     private async Task HandlePacket(Packet packet)
     {
-        if (packet.Control == 0)
+        if (packet.Control == 2)
         {
             TaskCompletionSource<bool>? receipt = Interlocked.Exchange(ref this.outstandingReceipt, null);
             receipt?.TrySetResult(true);
@@ -577,13 +629,13 @@ internal sealed class OftConnection : IOftConnection
 
         switch (packet.Control)
         {
-            case 1:
+            case 3:
                 this.RaiseReceived(RentAndCopy(packet.Data.Span));
                 break;
-            case 2:
+            case 0:
                 this.CompleteInboundMessage(packet.Data.Memory, cancelled: false);
                 break;
-            case 3:
+            case 1:
                 this.CompleteInboundMessage(ReadOnlyMemory<byte>.Empty, cancelled: true);
                 break;
             default:
@@ -599,7 +651,7 @@ internal sealed class OftConnection : IOftConnection
                 break;
         }
 
-        await this.frameStream.Write(new Packet { Control = 0, Data = ByteString.Empty }, this.lifetimeCts.Token).ConfigureAwait(false);
+        await this.frameStream.Write(new Packet { Control = 2, Data = ByteString.Empty }, this.lifetimeCts.Token).ConfigureAwait(false);
     }
 
     private void CompleteInboundMessage(ReadOnlyMemory<byte> finalChunk, bool cancelled)
@@ -697,11 +749,19 @@ internal sealed class OftConnection : IOftConnection
         long elapsedTicks = NowTicks() - Interlocked.Read(ref this.lastInboundActivityTicks);
         if (elapsedTicks > this.options.PollTimeout.Ticks)
         {
-            await this.Close(new TimeoutException($"No poll or message was received from the peer within {this.options.PollTimeout}.")).ConfigureAwait(false);
+            this.Close(new TimeoutException($"No poll or message was received from the peer within {this.options.PollTimeout}."));
         }
     }
 
-    private async Task Close(Exception? exception)
+    /// <summary>
+    /// Immediately and synchronously tears down this connection: cancels its background work,
+    /// releases every resource it owns, and notifies <see cref="DisconnectedHandler"/> — but does not
+    /// wait for the background work it just cancelled (the receive and send loops) to actually finish
+    /// running, which happens shortly afterward on their own. <see cref="Dispose"/> and
+    /// <see cref="Disconnect"/> both call this; <see cref="Disconnect"/> additionally awaits that
+    /// background work's completion afterward, for a fully graceful teardown.
+    /// </summary>
+    private void Close(Exception? exception)
     {
         lock (this.closeLock)
         {
@@ -713,7 +773,7 @@ internal sealed class OftConnection : IOftConnection
             this.closed = true;
         }
 
-        await this.lifetimeCts.CancelAsync().ConfigureAwait(false);
+        this.lifetimeCts.Cancel();
         this.rekeyTimer?.Dispose();
         this.pollTimer?.Dispose();
 
@@ -725,7 +785,7 @@ internal sealed class OftConnection : IOftConnection
                 {
                     PendingOutboundMessage message = queue.Dequeue();
                     message.Owner?.Dispose();
-                    message.CompletionSource.TrySetException(exception ?? new ObjectDisposedException(nameof(OftConnection)));
+                    message.CompletionSource.TrySetException(exception ?? new OftDisconnectedException("This connection is no longer connected."));
                 }
             }
         }

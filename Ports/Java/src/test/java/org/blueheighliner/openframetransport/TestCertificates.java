@@ -11,6 +11,8 @@ import java.nio.file.Files;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Generates throwaway self-signed certificates for exercising TLS handshakes in tests, using the
@@ -49,15 +51,36 @@ final class TestCertificates {
         return context;
     }
 
+    /** A freshly generated self-signed certificate (subject and issuer both {@code CN=localhost}), no private key needed by the caller. */
+    static X509Certificate createCertificate() throws Exception {
+        return (X509Certificate) generateKeyStore(null).getCertificate("oft-test");
+    }
+
+    /** A freshly generated self-signed certificate carrying the given Subject Alternative Name DNS entry. */
+    static X509Certificate createCertificateWithDnsName(String dnsName) throws Exception {
+        return (X509Certificate) generateKeyStore("dns:" + dnsName).getCertificate("oft-test");
+    }
+
     private static KeyManager[] generateKeyManagers() throws Exception {
+        KeyStore keyStore = generateKeyStore(null);
+        KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        keyManagerFactory.init(keyStore, "changeit".toCharArray());
+        return keyManagerFactory.getKeyManagers();
+    }
+
+    /**
+     * Generates a throwaway self-signed certificate/private-key pair (alias {@code oft-test}) via
+     * {@code keytool}, optionally carrying a Subject Alternative Name extension (e.g.
+     * {@code "dns:example.com"}), and loads it into a fresh {@link KeyStore}.
+     */
+    private static KeyStore generateKeyStore(String subjectAlternativeName) throws Exception {
         char[] password = "changeit".toCharArray();
         File keystoreFile = File.createTempFile("oft-test", ".p12");
         keystoreFile.delete();
         keystoreFile.deleteOnExit();
 
-        String keytool = System.getProperty("java.home") + File.separator + "bin" + File.separator + "keytool";
-        Process process = new ProcessBuilder(
-                keytool, "-genkeypair",
+        List<String> command = new ArrayList<>(List.of(
+                System.getProperty("java.home") + File.separator + "bin" + File.separator + "keytool", "-genkeypair",
                 "-alias", "oft-test",
                 "-keyalg", "RSA",
                 "-keysize", "2048",
@@ -66,9 +89,14 @@ final class TestCertificates {
                 "-keystore", keystoreFile.getAbsolutePath(),
                 "-storetype", "PKCS12",
                 "-storepass", new String(password),
-                "-keypass", new String(password))
-                .redirectErrorStream(true)
-                .start();
+                "-keypass", new String(password)));
+
+        if (subjectAlternativeName != null) {
+            command.add("-ext");
+            command.add("san=" + subjectAlternativeName);
+        }
+
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
 
         String output = new String(process.getInputStream().readAllBytes());
         int exitCode = process.waitFor();
@@ -81,9 +109,7 @@ final class TestCertificates {
             keyStore.load(in, password);
         }
 
-        KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
-        keyManagerFactory.init(keyStore, password);
-        return keyManagerFactory.getKeyManagers();
+        return keyStore;
     }
 
     private static TrustManager[] trustAllCerts() {

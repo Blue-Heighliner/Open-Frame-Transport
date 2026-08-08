@@ -25,9 +25,11 @@ public interface OftListener extends AutoCloseable {
      * assigned a non-null value, it is synchronously delivered, in order, every connection accepted
      * before that assignment (see README.md), since this listener may accept and establish
      * connections before a caller has had a chance to assign a callback. Assigning {@code null}
-     * afterward simply discards any connection accepted while no callback is assigned (it is not
-     * automatically closed, unlike a discarded received message - the caller may still reach it
-     * later, e.g. by enumerating a peer's tracked connections).
+     * afterward simply discards any connection accepted while no callback is assigned - it is not
+     * automatically closed, unlike a discarded received message, so it stays open and its own
+     * background processing keeps running regardless; it just isn't delivered anywhere, unless the
+     * caller happens to already have some other way of tracking it (this listener itself keeps no
+     * record of accepted connections).
      */
     void setConnectedHandler(Consumer<OftConnection> handler);
 

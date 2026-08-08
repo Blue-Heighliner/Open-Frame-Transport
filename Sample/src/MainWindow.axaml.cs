@@ -10,8 +10,8 @@ internal sealed partial class MainWindow : Window
 {
     private readonly IOftHoster hoster = new OftHoster();
     private readonly IOftConnector connector = new OftConnector();
-    private readonly OftHostOptions hostOptions;
-    private readonly OftConnectOptions connectOptions;
+    private readonly OftConnectionOptions hostOptions;
+    private readonly OftConnectionOptions connectOptions;
     private readonly LagRelayManager lagRelayManager;
     private readonly ObservableCollection<string> logEntries = [];
 
@@ -40,20 +40,20 @@ internal sealed partial class MainWindow : Window
         // sizes, which combined with simulated lag makes priority interruption easy to observe.
         const int maxPacketDataSize = 512;
 
-        this.hostOptions = new OftHostOptions
+        this.hostOptions = new OftConnectionOptions
         {
             Info = info,
             SecurityMode = OftSecurityMode.ServerAuthentication,
-            ServerCertificate = SampleCertificate.Create(),
-            ClientCertificateValidation = acceptAnyCertificate,
+            Certificate = SampleCertificate.Create(),
+            CertificateValidation = acceptAnyCertificate,
             MaxPacketDataSize = maxPacketDataSize,
         };
 
-        this.connectOptions = new OftConnectOptions
+        this.connectOptions = new OftConnectionOptions
         {
             Info = info,
             SecurityMode = OftSecurityMode.ServerAuthentication,
-            ServerCertificateValidation = acceptAnyCertificate,
+            CertificateValidation = acceptAnyCertificate,
             MaxPacketDataSize = maxPacketDataSize,
         };
 
@@ -72,10 +72,7 @@ internal sealed partial class MainWindow : Window
     {
         await this.lagRelayManager.DisposeAsync().ConfigureAwait(false);
 
-        if (this.listener is not null)
-        {
-            await this.listener.DisposeAsync().ConfigureAwait(false);
-        }
+        this.listener?.Dispose();
     }
 
     private void OnLagSliderValueChanged(object? sender, RangeBaseValueChangedEventArgs e)
@@ -106,7 +103,7 @@ internal sealed partial class MainWindow : Window
 
             // A fresh connection per send, closed again once it's done - the connector itself
             // caches nothing (see IOftConnector), unlike the connection-reusing IOftPeer.
-            await using IOftConnection connection = await this.connector.Connect(relay.RelayHost, relay.RelayPort, this.connectOptions).ConfigureAwait(true);
+            using IOftConnection connection = await this.connector.Connect(relay.RelayHost, relay.RelayPort, this.connectOptions).ConfigureAwait(true);
             await connection.Send(payload, priority).ConfigureAwait(true);
 
             this.AppendLog($"Sent {payload.Length} byte(s) to {host}:{port} at priority {priority}.");

@@ -10,6 +10,7 @@ import java.util.Objects;
 public final class OftPeerOptions {
     private final String info;
     private final SSLContext sslContext;
+    private final OftConnectionValidationCallback connectionValidation;
     private final int maxPacketDataSize;
     private final Duration rekeyInterval;
     private final OftSecurityMode securityMode;
@@ -18,12 +19,12 @@ public final class OftPeerOptions {
     private final Duration idleTimeout;
     private final Duration maxConnectionLifetime;
     private final int maxConnectionCount;
-    private final Duration evictionCheckInterval;
 
     private OftPeerOptions(Builder builder) {
         this.info = Objects.requireNonNull(builder.info, "info");
         this.securityMode = Objects.requireNonNull(builder.securityMode, "securityMode");
         this.sslContext = builder.sslContext;
+        this.connectionValidation = builder.connectionValidation;
         this.maxPacketDataSize = builder.maxPacketDataSize;
         this.rekeyInterval = builder.rekeyInterval;
         this.pollInterval = builder.pollInterval;
@@ -31,7 +32,6 @@ public final class OftPeerOptions {
         this.idleTimeout = builder.idleTimeout;
         this.maxConnectionLifetime = builder.maxConnectionLifetime;
         this.maxConnectionCount = builder.maxConnectionCount;
-        this.evictionCheckInterval = builder.evictionCheckInterval;
     }
 
     /** Opaque, application-controlled data sent to every peer in this side's hail (see README.md &sect;3). */
@@ -47,6 +47,17 @@ public final class OftPeerOptions {
      */
     public SSLContext sslContext() {
         return this.sslContext;
+    }
+
+    /**
+     * An optional callback used to validate a fully-established connection, invoked once the OFT
+     * hail exchange completes (see README.md &sect;3), for every {@link #securityMode()} - unlike
+     * the trust manager configured on {@link #sslContext()}, which only runs during the TLS
+     * handshake. When {@code null} (the default), every connection is accepted; otherwise,
+     * establishing the connection fails if the callback returns {@code false}.
+     */
+    public OftConnectionValidationCallback connectionValidation() {
+        return this.connectionValidation;
     }
 
     /** The maximum number of payload bytes carried in a single packet's data field. */
@@ -88,30 +99,39 @@ public final class OftPeerOptions {
         return this.pollTimeout;
     }
 
-    /** How long a connection may sit idle (no send or receive) before it is automatically disconnected. */
+    /**
+     * How long a connection may sit idle (no send or receive) before it is automatically
+     * disconnected. Since eviction is only ever checked once per {@link OftPeer}'s fixed,
+     * non-configurable 30-second eviction check interval (see its own documentation), a value below
+     * 30 seconds here has no effect beyond that floor — the connection is disconnected on the first
+     * check after it goes idle, not the instant it does.
+     */
     public Duration idleTimeout() {
         return this.idleTimeout;
     }
 
-    /** The maximum total lifetime of a connection before it is automatically disconnected, regardless of activity. */
+    /**
+     * The maximum total lifetime of a connection before it is automatically disconnected, regardless
+     * of activity. Since eviction is only ever checked once per {@link OftPeer}'s fixed,
+     * non-configurable 30-second eviction check interval (see its own documentation), a value below
+     * 30 seconds here has no effect beyond that floor — the connection is disconnected on the first
+     * check after it expires, not the instant it does.
+     */
     public Duration maxConnectionLifetime() {
         return this.maxConnectionLifetime;
     }
 
     /**
      * The maximum number of connections this peer keeps at once. When exceeded, the oldest
-     * connections (by when they were established) are disconnected first.
+     * connections (by when they were established) are disconnected first. A connection with
+     * pending data (see {@link OftConnection#hasPendingData()}) is never counted toward this limit
+     * for eviction purposes — an application that briefly sends to more distinct hosts than this at
+     * once is never cut off mid-send; connections beyond the limit are only evicted, oldest first,
+     * once their data has finished sending and a fixed grace period (see {@link OftPeer}'s own
+     * documentation) has passed.
      */
     public int maxConnectionCount() {
         return this.maxConnectionCount;
-    }
-
-    /**
-     * How often the peer checks connections against {@link #idleTimeout()},
-     * {@link #maxConnectionLifetime()}, and {@link #maxConnectionCount()}.
-     */
-    public Duration evictionCheckInterval() {
-        return this.evictionCheckInterval;
     }
 
     /** Creates a new builder. */
@@ -123,15 +143,15 @@ public final class OftPeerOptions {
     public static final class Builder {
         private String info = "";
         private SSLContext sslContext;
+        private OftConnectionValidationCallback connectionValidation;
         private int maxPacketDataSize = 1024;
         private Duration rekeyInterval;
         private OftSecurityMode securityMode = OftSecurityMode.SECURE;
         private Duration pollInterval = Duration.ofSeconds(1);
         private Duration pollTimeout = Duration.ofSeconds(5);
-        private Duration idleTimeout = Duration.ofMinutes(5);
-        private Duration maxConnectionLifetime = Duration.ofHours(1);
-        private int maxConnectionCount = 128;
-        private Duration evictionCheckInterval = Duration.ofSeconds(30);
+        private Duration idleTimeout = Duration.ofHours(2);
+        private Duration maxConnectionLifetime = Duration.ofDays(1);
+        private int maxConnectionCount = 16;
 
         private Builder() {
         }
@@ -143,6 +163,11 @@ public final class OftPeerOptions {
 
         public Builder sslContext(SSLContext sslContext) {
             this.sslContext = sslContext;
+            return this;
+        }
+
+        public Builder connectionValidation(OftConnectionValidationCallback connectionValidation) {
+            this.connectionValidation = connectionValidation;
             return this;
         }
 
@@ -183,11 +208,6 @@ public final class OftPeerOptions {
 
         public Builder maxConnectionCount(int maxConnectionCount) {
             this.maxConnectionCount = maxConnectionCount;
-            return this;
-        }
-
-        public Builder evictionCheckInterval(Duration evictionCheckInterval) {
-            this.evictionCheckInterval = evictionCheckInterval;
             return this;
         }
 

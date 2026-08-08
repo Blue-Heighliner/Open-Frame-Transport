@@ -27,4 +27,19 @@ oft_connection *oft_connection_establish_as_server(
  */
 void oft_connection_start_processing(oft_connection *connection);
 
+/*
+ * Certificate identity duplication, shared between oft_connection.c (where the extraction logic
+ * that first builds an oft_certificate_identity lives) and oft_peer.c (which needs an independent
+ * copy for each oft_peer_reception it delivers, since a reception must stay valid even after the
+ * connection it came from has disconnected - unlike oft_connection_identity(), which is only ever
+ * borrowed from a still-live connection). Not part of the public API in oft/oft.h.
+ */
+
+/* Deep-copies identity, or returns NULL if identity is NULL. Caller must free the result with
+ * oft_certificate_identity_free(). */
+oft_certificate_identity *oft_certificate_identity_copy(const oft_certificate_identity *identity);
+
+/* Frees identity and everything it owns. Safe to call with NULL. */
+void oft_certificate_identity_free(oft_certificate_identity *identity);
+
 #endif

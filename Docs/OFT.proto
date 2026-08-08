@@ -21,24 +21,22 @@ message Hail {
 // A single unit of the OFT packet protocol described in Docs/OFT.md §4. Every
 // message after the initial Hail is a Packet.
 message Packet {
-  // 0 = Receipt, 1 = Unit, 2 = Completion, 3 = Cancellation,
+  // 0 = Completion, 1 = Cancellation, 2 = Receipt, 3 = Unit,
   // >=4 = Data on priority channel (control - 4). Rekeying (Docs/OFT.md §8) has
   // no control value of its own - it's a TLS 1.3 KeyUpdate, invisible at this
   // layer entirely.
   //
-  // Declared `optional` (proto3 explicit field presence) purely so that
-  // `control = 0` (Receipt) still serializes to a nonzero-length frame: without
-  // presence tracking, proto3 never emits a field tag for a default value, so
-  // a Receipt (control = 0, data empty) would serialize identically to Poll's
-  // bare zero-length frame (see Docs/OFT.md §4 and §10) - two different, both
-  // legitimately-sent things becoming indistinguishable on the wire. With
-  // presence tracking, setting `control` explicitly (to any value, including
-  // 0) always emits its tag, so only a Packet with control genuinely *absent*
-  // - which this codebase never constructs - would collide with Poll, and
-  // Poll is written as its own dedicated zero-length frame rather than ever
-  // going through Packet's encoder in the first place.
-  optional uint32 control = 1;
+  // Completion is deliberately the value that coincides with proto3's default
+  // (and therefore the one value plain default-value omission could ever
+  // elide): a Completion packet is only ever the final chunk of a message too
+  // large to fit in one packet (see Docs/OFT.md §4), so its `data` field is
+  // always non-empty and alone always forces a nonzero-length frame even when
+  // `control` itself goes unwritten, keeping it from ever colliding with
+  // Poll's bare zero-length frame (Docs/OFT.md §4, §10). Every other control
+  // value is itself nonzero, which forces serialization independent of
+  // `data`.
+  uint32 control = 1;
 
-  // Payload bytes. Empty for Receipt and Cancellation.
+  // Payload bytes. Empty for Receipt and Cancellation; never empty for Completion.
   bytes data = 2;
 }

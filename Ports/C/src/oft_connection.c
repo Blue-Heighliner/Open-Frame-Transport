@@ -11,6 +11,8 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -142,7 +144,7 @@ struct oft_connection {
      * "active". Guarded by timestamp_lock alongside the fields above. */
     struct timespec last_inbound_activity;
 
-    char *remote_info;
+    oft_identity identity;
 
     pthread_t receive_thread;
     pthread_t send_thread;
@@ -198,6 +200,173 @@ static void ignore_sigpipe(void) {
 static void free_received_buffer_item(void *item);
 static void free_disconnected_buffer_item(void *item);
 
+/* ---- Certificate identity extraction ---- */
+
+/* Extracts the Common Name (CN) relative distinguished name component from name, or NULL if it has
+ * none. Caller owns the returned string (free()). */
+static char *extract_common_name(X509_NAME *name) {
+    if (!name) {
+        return NULL;
+    }
+
+    int index = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
+    if (index < 0) {
+        return NULL;
+    }
+
+    ASN1_STRING *value = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, index));
+
+    unsigned char *utf8 = NULL;
+    int length = ASN1_STRING_to_UTF8(&utf8, value);
+    if (length < 0) {
+        return NULL;
+    }
+
+    char *result = strndup((const char *)utf8, (size_t)length);
+    OPENSSL_free(utf8);
+    return result;
+}
+
+/* Extracts certificate's Subject Alternative Name DNS and IP address entries into *out_names
+ * (caller-owned array of caller-owned strings, freed by oft_certificate_identity_free) and
+ * *out_count. */
+static void extract_subject_alternative_names(X509 *certificate, char ***out_names, size_t *out_count) {
+    *out_names = NULL;
+    *out_count = 0;
+
+    GENERAL_NAMES *names = X509_get_ext_d2i(certificate, NID_subject_alt_name, NULL, NULL);
+    if (!names) {
+        return;
+    }
+
+    int total = sk_GENERAL_NAME_num(names);
+    char **collected = total > 0 ? calloc((size_t)total, sizeof(char *)) : NULL;
+    size_t count = 0;
+
+    if (collected) {
+        for (int i = 0; i < total; i++) {
+            GENERAL_NAME *entry = sk_GENERAL_NAME_value(names, i);
+
+            if (entry->type == GEN_DNS) {
+                unsigned char *utf8 = NULL;
+                int length = ASN1_STRING_to_UTF8(&utf8, entry->d.dNSName);
+                if (length >= 0) {
+                    collected[count++] = strndup((const char *)utf8, (size_t)length);
+                    OPENSSL_free(utf8);
+                }
+            } else if (entry->type == GEN_IPADD) {
+                const unsigned char *data = ASN1_STRING_get0_data(entry->d.iPAddress);
+                int data_length = ASN1_STRING_length(entry->d.iPAddress);
+                char buffer[INET6_ADDRSTRLEN];
+                const char *formatted = NULL;
+
+                if (data_length == 4) {
+                    formatted = inet_ntop(AF_INET, data, buffer, sizeof(buffer));
+                } else if (data_length == 16) {
+                    formatted = inet_ntop(AF_INET6, data, buffer, sizeof(buffer));
+                }
+
+                if (formatted) {
+                    collected[count++] = strdup(formatted);
+                }
+            }
+        }
+    }
+
+    GENERAL_NAMES_free(names);
+
+    *out_names = collected;
+    *out_count = count;
+}
+
+/* Extracts identity information from certificate. Returns NULL if certificate is NULL. */
+static oft_certificate_identity *build_certificate_identity(X509 *certificate) {
+    if (!certificate) {
+        return NULL;
+    }
+
+    oft_certificate_identity *identity = calloc(1, sizeof(oft_certificate_identity));
+    if (!identity) {
+        return NULL;
+    }
+
+    identity->name = extract_common_name(X509_get_subject_name(certificate));
+    identity->issuer = extract_common_name(X509_get_issuer_name(certificate));
+    extract_subject_alternative_names(certificate, &identity->alternative_names, &identity->alternative_name_count);
+
+    return identity;
+}
+
+void oft_certificate_identity_free(oft_certificate_identity *identity) {
+    if (!identity) {
+        return;
+    }
+
+    free(identity->name);
+    free(identity->issuer);
+    for (size_t i = 0; i < identity->alternative_name_count; i++) {
+        free(identity->alternative_names[i]);
+    }
+
+    free(identity->alternative_names);
+    free(identity);
+}
+
+oft_certificate_identity *oft_certificate_identity_copy(const oft_certificate_identity *identity) {
+    if (!identity) {
+        return NULL;
+    }
+
+    oft_certificate_identity *copy = calloc(1, sizeof(oft_certificate_identity));
+    if (!copy) {
+        return NULL;
+    }
+
+    copy->name = identity->name ? strdup(identity->name) : NULL;
+    copy->issuer = identity->issuer ? strdup(identity->issuer) : NULL;
+    copy->alternative_name_count = identity->alternative_name_count;
+
+    if (identity->alternative_name_count > 0) {
+        copy->alternative_names = calloc(identity->alternative_name_count, sizeof(char *));
+        if (copy->alternative_names) {
+            for (size_t i = 0; i < identity->alternative_name_count; i++) {
+                copy->alternative_names[i] = strdup(identity->alternative_names[i]);
+            }
+        }
+    }
+
+    return copy;
+}
+
+/* Captures the peer certificate presented during ssl's now-completed handshake, or NULL if none
+ * was presented (e.g. the server's view of a connection established under
+ * OFT_SECURITY_MODE_SERVER_AUTHENTICATION, which never requests one from the client). */
+static oft_certificate_identity *capture_peer_certificate_identity(SSL *ssl) {
+    X509 *certificate = SSL_get1_peer_certificate(ssl);
+    oft_certificate_identity *identity = build_certificate_identity(certificate);
+    X509_free(certificate);
+    return identity;
+}
+
+/* Captures fd's remote TCP endpoint into *out_identity's host/port fields. */
+static void capture_remote_endpoint(int fd, oft_identity *out_identity) {
+    struct sockaddr_storage address;
+    socklen_t address_length = sizeof(address);
+    if (getpeername(fd, (struct sockaddr *)&address, &address_length) != 0) {
+        return;
+    }
+
+    if (address.ss_family == AF_INET) {
+        struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
+        inet_ntop(AF_INET, &v4->sin_addr, out_identity->host, sizeof(out_identity->host));
+        out_identity->port = ntohs(v4->sin_port);
+    } else if (address.ss_family == AF_INET6) {
+        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
+        inet_ntop(AF_INET6, &v6->sin6_addr, out_identity->host, sizeof(out_identity->host));
+        out_identity->port = ntohs(v6->sin6_port);
+    }
+}
+
 static oft_connection *connection_alloc(int fd, SSL_CTX *ssl_ctx, int owns_ssl_ctx, int is_client, const char *target_host,
                                          int require_client_cert, size_t max_packet_data_size, long rekey_interval_ms,
                                          int insecure, long poll_interval_ms, long poll_timeout_ms) {
@@ -219,7 +388,8 @@ static oft_connection *connection_alloc(int fd, SSL_CTX *ssl_ctx, int owns_ssl_c
     connection->insecure = insecure;
     connection->poll_interval_ms = poll_interval_ms > 0 ? poll_interval_ms : OFT_DEFAULT_POLL_INTERVAL_MS;
     connection->poll_timeout_ms = poll_timeout_ms > 0 ? poll_timeout_ms : OFT_DEFAULT_POLL_TIMEOUT_MS;
-    connection->remote_info = strdup("");
+    connection->identity.info = strdup("");
+    capture_remote_endpoint(fd, &connection->identity);
 
     pthread_mutex_init(&connection->outbound_lock, NULL);
     sem_init(&connection->send_signal, 0, 0);
@@ -274,6 +444,8 @@ static SSL *create_ssl(oft_connection *connection, char *error_buffer, size_t er
         SSL_free(ssl);
         return NULL;
     }
+
+    connection->identity.certificate = capture_peer_certificate_identity(ssl);
 
     return ssl;
 }
@@ -633,10 +805,10 @@ static int send_next_packet(oft_connection *connection, oft_pending_message *mes
     int finishes_message;
 
     if (message->cancel_requested && message->started) {
-        oft_packet_init(&packet, 3, NULL, 0);
+        oft_packet_init(&packet, 1, NULL, 0);
         finishes_message = 1;
     } else if (!message->started && message->length <= connection->max_packet_data_size) {
-        oft_packet_init(&packet, 1, message->data, message->length);
+        oft_packet_init(&packet, 3, message->data, message->length);
         message->started = 1;
         finishes_message = 1;
     } else {
@@ -645,7 +817,7 @@ static int send_next_packet(oft_connection *connection, oft_pending_message *mes
         size_t chunk_size = remaining < connection->max_packet_data_size ? remaining : connection->max_packet_data_size;
         int is_last = message->bytes_sent + chunk_size >= message->length;
 
-        oft_packet_init(&packet, is_last ? 2 : (uint32_t)(message->priority + 4), message->data + message->bytes_sent, chunk_size);
+        oft_packet_init(&packet, is_last ? 0 : (uint32_t)(message->priority + 4), message->data + message->bytes_sent, chunk_size);
         message->bytes_sent += chunk_size;
         finishes_message = is_last;
     }
@@ -784,7 +956,7 @@ static int complete_inbound_message(oft_connection *connection, const uint8_t *f
 }
 
 static int handle_packet(oft_connection *connection, const oft_packet *packet) {
-    if (packet->control == 0) {
+    if (packet->control == 2) {
         pthread_mutex_lock(&connection->receipt_lock);
         oft_event *receipt = connection->outstanding_receipt;
         connection->outstanding_receipt = NULL;
@@ -798,7 +970,7 @@ static int handle_packet(oft_connection *connection, const oft_packet *packet) {
     }
 
     switch (packet->control) {
-        case 1: {
+        case 3: {
             uint8_t *data = NULL;
             if (packet->length > 0) {
                 data = malloc(packet->length);
@@ -812,13 +984,13 @@ static int handle_packet(oft_connection *connection, const oft_packet *packet) {
             raise_received(connection, data, packet->length);
             break;
         }
-        case 2:
+        case 0:
             if (complete_inbound_message(connection, packet->data, packet->length, 0) != 0) {
                 return -1;
             }
 
             break;
-        case 3:
+        case 1:
             if (complete_inbound_message(connection, NULL, 0, 1) != 0) {
                 return -1;
             }
@@ -840,7 +1012,7 @@ static int handle_packet(oft_connection *connection, const oft_packet *packet) {
     }
 
     oft_packet receipt_packet;
-    oft_packet_init(&receipt_packet, 0, NULL, 0);
+    oft_packet_init(&receipt_packet, 2, NULL, 0);
     oft_buffer buffer;
     oft_buffer_init(&buffer);
     int encode_result = oft_packet_encode(&receipt_packet, &buffer);
@@ -1007,7 +1179,10 @@ static void *poll_timer_loop(void *arg) {
 
 /* ---- Handshake ---- */
 
-static int complete_handshake(oft_connection *connection, const char *info, char *error_buffer, size_t error_buffer_size) {
+static int complete_handshake(
+        oft_connection *connection, const char *info,
+        oft_connection_validation_callback connection_validation, void *connection_validation_user_data,
+        char *error_buffer, size_t error_buffer_size) {
     if (connection->insecure) {
         oft_frame_stream_init_plain(&connection->frame_stream, connection->fd);
     } else {
@@ -1058,9 +1233,23 @@ static int complete_handshake(oft_connection *connection, const char *info, char
         return -1;
     }
 
-    free(connection->remote_info);
-    connection->remote_info = strdup(received_hail.info);
+    free(connection->identity.info);
+    connection->identity.info = strdup(received_hail.info);
     oft_hail_free(&received_hail);
+
+    if (connection_validation) {
+        X509 *certificate = connection->ssl ? SSL_get1_peer_certificate(connection->ssl) : NULL;
+        STACK_OF(X509) *chain = connection->ssl ? SSL_get_peer_cert_chain(connection->ssl) : NULL;
+        long verify_result = connection->ssl ? SSL_get_verify_result(connection->ssl) : X509_V_OK;
+
+        int accepted = connection_validation(&connection->identity, certificate, chain, verify_result, connection_validation_user_data);
+        X509_free(certificate);
+
+        if (!accepted) {
+            set_error(error_buffer, error_buffer_size, "the connection was rejected by connection_validation");
+            return -1;
+        }
+    }
 
     pthread_mutex_lock(&connection->timestamp_lock);
     now(&connection->connected_at);
@@ -1143,7 +1332,7 @@ oft_connection *oft_connection_establish_as_client(
         connection->ssl = ssl;
     }
 
-    if (complete_handshake(connection, options->info, error_buffer, error_buffer_size) != 0) {
+    if (complete_handshake(connection, options->info, options->connection_validation, options->connection_validation_user_data, error_buffer, error_buffer_size) != 0) {
         oft_connection_close(connection);
         return NULL;
     }
@@ -1182,7 +1371,7 @@ oft_connection *oft_connection_establish_as_server(
         connection->ssl = ssl;
     }
 
-    if (complete_handshake(connection, options->info, error_buffer, error_buffer_size) != 0) {
+    if (complete_handshake(connection, options->info, options->connection_validation, options->connection_validation_user_data, error_buffer, error_buffer_size) != 0) {
         oft_connection_close(connection);
         return NULL;
     }
@@ -1295,38 +1484,8 @@ void oft_connection_set_disconnected_callback(oft_connection *connection, oft_di
     oft_event_buffer_attach(&connection->disconnected_buffer, callback ? dispatch_disconnected_buffer_item : NULL, &connection->disconnected_target);
 }
 
-const char *oft_connection_remote_info(oft_connection *connection) {
-    return connection->remote_info;
-}
-
-int oft_connection_remote_endpoint(oft_connection *connection, char *host_buffer, size_t host_buffer_size, uint16_t *out_port) {
-    struct sockaddr_storage address;
-    socklen_t address_length = sizeof(address);
-    if (getpeername(connection->fd, (struct sockaddr *)&address, &address_length) != 0) {
-        return OFT_ERROR;
-    }
-
-    if (address.ss_family == AF_INET) {
-        struct sockaddr_in *v4 = (struct sockaddr_in *)&address;
-        if (!inet_ntop(AF_INET, &v4->sin_addr, host_buffer, (socklen_t)host_buffer_size)) {
-            return OFT_ERROR;
-        }
-
-        *out_port = ntohs(v4->sin_port);
-        return OFT_OK;
-    }
-
-    if (address.ss_family == AF_INET6) {
-        struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&address;
-        if (!inet_ntop(AF_INET6, &v6->sin6_addr, host_buffer, (socklen_t)host_buffer_size)) {
-            return OFT_ERROR;
-        }
-
-        *out_port = ntohs(v6->sin6_port);
-        return OFT_OK;
-    }
-
-    return OFT_ERROR;
+const oft_identity *oft_connection_identity(oft_connection *connection) {
+    return &connection->identity;
 }
 
 void oft_connection_connected_at(oft_connection *connection, struct timespec *out_time) {
@@ -1363,6 +1522,10 @@ int oft_connection_has_pending_data(oft_connection *connection) {
     }
 
     return atomic_load(&connection->has_pending_inbound_message);
+}
+
+int oft_connection_is_connected(oft_connection *connection) {
+    return !atomic_load(&connection->closed);
 }
 
 static void close_connection(oft_connection *connection, const char *error_message) {
@@ -1472,7 +1635,8 @@ void oft_connection_close(oft_connection *connection) {
 
     free(connection->inbound_buffers);
     free(connection->target_host);
-    free(connection->remote_info);
+    free(connection->identity.info);
+    oft_certificate_identity_free(connection->identity.certificate);
 
     /* Safe now too, for the same reason as above: the receive thread (the only thread that ever
      * calls oft_event_buffer_raise on these buffers) has fully exited. */

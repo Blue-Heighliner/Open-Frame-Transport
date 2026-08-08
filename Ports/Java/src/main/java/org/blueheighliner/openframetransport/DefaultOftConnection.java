@@ -5,11 +5,15 @@ import org.blueheighliner.openframetransport.proto.Hail;
 import org.blueheighliner.openframetransport.proto.Packet;
 
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.security.cert.Certificate;
+import java.security.cert.X509Certificate;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayDeque;
@@ -105,7 +109,7 @@ final class DefaultOftConnection implements OftConnection {
     private volatile long connectedAtMillis;
     private final AtomicLong lastSentAtMillis = new AtomicLong();
     private final AtomicLong lastReceivedAtMillis = new AtomicLong();
-    private volatile String remoteInfo = "";
+    private final OftIdentity identity;
 
     private Thread receiveThread;
     private Thread sendThread;
@@ -122,7 +126,8 @@ final class DefaultOftConnection implements OftConnection {
             Duration rekeyInterval,
             Duration pollInterval,
             Duration pollTimeout,
-            String info) throws IOException {
+            String info,
+            OftConnectionValidationCallback connectionValidation) throws IOException {
         this.rawSocket = rawSocket;
         this.socket = socket;
         this.sslSocket = sslSocket;
@@ -132,7 +137,46 @@ final class DefaultOftConnection implements OftConnection {
         this.pollInterval = pollInterval;
         this.pollTimeout = pollTimeout;
         this.frameStream = new OftFrameStream(socket.getInputStream(), socket.getOutputStream());
-        completeHandshake(info);
+        String remoteInfo = completeHandshake(info);
+        Certificate[] peerCertificateChain = capturePeerCertificateChain(sslSocket);
+        this.identity = new OftIdentity(
+                (InetSocketAddress) rawSocket.getRemoteSocketAddress(),
+                peerCertificateIdentity(peerCertificateChain),
+                remoteInfo);
+
+        if (connectionValidation != null) {
+            SSLSession session = sslSocket == null ? null : sslSocket.getSession();
+            if (!connectionValidation.validate(this.identity, peerCertificateChain, session)) {
+                throw new IOException("The connection from '" + this.identity.endpoint() + "' was rejected by connectionValidation.");
+            }
+        }
+    }
+
+    /**
+     * Captures the peer's TLS certificate chain (leaf first) from {@code sslSocket}'s
+     * now-established session, or {@code null} if {@code sslSocket} is {@code null} (an insecure
+     * connection, with no TLS session at all) or the peer didn't present one (e.g. the server's view
+     * of a connection established under {@link OftSecurityMode#SERVER_AUTHENTICATION}, which never
+     * requests one from the client).
+     */
+    private static Certificate[] capturePeerCertificateChain(SSLSocket sslSocket) {
+        if (sslSocket == null) {
+            return null;
+        }
+
+        try {
+            Certificate[] certificates = sslSocket.getSession().getPeerCertificates();
+            return certificates.length > 0 ? certificates : null;
+        } catch (SSLPeerUnverifiedException e) {
+            return null;
+        }
+    }
+
+    /** Extracts the peer's TLS certificate identity from {@code peerCertificateChain}'s leaf, or {@code null} if it's {@code null} or its leaf isn't an {@link X509Certificate}. */
+    private static OftCertificateIdentity peerCertificateIdentity(Certificate[] peerCertificateChain) {
+        return peerCertificateChain != null && peerCertificateChain[0] instanceof X509Certificate
+                ? OftCertificateIdentity.fromCertificate((X509Certificate) peerCertificateChain[0])
+                : null;
     }
 
     /**
@@ -145,7 +189,7 @@ final class DefaultOftConnection implements OftConnection {
             return new DefaultOftConnection(
                     rawSocket, rawSocket, null, true,
                     options.maxPacketDataSize(), options.rekeyInterval(),
-                    options.pollInterval(), options.pollTimeout(), options.info());
+                    options.pollInterval(), options.pollTimeout(), options.info(), options.connectionValidation());
         }
 
         SSLContext sslContext = resolveClientSslContext(options);
@@ -158,7 +202,7 @@ final class DefaultOftConnection implements OftConnection {
         return new DefaultOftConnection(
                 rawSocket, sslSocket, sslSocket, false,
                 options.maxPacketDataSize(), options.rekeyInterval(),
-                options.pollInterval(), options.pollTimeout(), options.info());
+                options.pollInterval(), options.pollTimeout(), options.info(), options.connectionValidation());
     }
 
     /**
@@ -203,7 +247,7 @@ final class DefaultOftConnection implements OftConnection {
             return new DefaultOftConnection(
                     rawSocket, rawSocket, null, true,
                     options.maxPacketDataSize(), options.rekeyInterval(),
-                    options.pollInterval(), options.pollTimeout(), options.info());
+                    options.pollInterval(), options.pollTimeout(), options.info(), options.connectionValidation());
         }
 
         // By this point sslContext is always resolved for SECURE mode: IOftListener.host has
@@ -222,7 +266,7 @@ final class DefaultOftConnection implements OftConnection {
         return new DefaultOftConnection(
                 rawSocket, sslSocket, sslSocket, false,
                 options.maxPacketDataSize(), options.rekeyInterval(),
-                options.pollInterval(), options.pollTimeout(), options.info());
+                options.pollInterval(), options.pollTimeout(), options.info(), options.connectionValidation());
     }
 
     /** Restricts the socket to TLS 1.3, the only version OFT ever negotiates (see README.md &sect;1). */
@@ -230,7 +274,7 @@ final class DefaultOftConnection implements OftConnection {
         socket.setEnabledProtocols(new String[] {"TLSv1.3"});
     }
 
-    private void completeHandshake(String info) throws IOException {
+    private String completeHandshake(String info) throws IOException {
         Hail ourHail = Hail.newBuilder().setVersion(OftProtocolVersion.CURRENT).setInfo(info).build();
 
         AtomicReference<IOException> writeFailure = new AtomicReference<>();
@@ -266,12 +310,13 @@ final class DefaultOftConnection implements OftConnection {
             throw new IllegalStateException("Incompatible OFT protocol version '" + received.getVersion() + "'.");
         }
 
-        this.remoteInfo = received.getInfo();
         long now = System.currentTimeMillis();
         this.connectedAtMillis = now;
         this.lastSentAtMillis.set(now);
         this.lastReceivedAtMillis.set(now);
         this.lastInboundActivityMillis.set(now);
+
+        return received.getInfo();
     }
 
     /**
@@ -345,13 +390,8 @@ final class DefaultOftConnection implements OftConnection {
     }
 
     @Override
-    public InetSocketAddress getRemoteEndpoint() {
-        return (InetSocketAddress) this.rawSocket.getRemoteSocketAddress();
-    }
-
-    @Override
-    public String getRemoteInfo() {
-        return this.remoteInfo;
+    public OftIdentity getIdentity() {
+        return this.identity;
     }
 
     @Override
@@ -367,6 +407,11 @@ final class DefaultOftConnection implements OftConnection {
     @Override
     public Instant getLastReceivedAt() {
         return Instant.ofEpochMilli(this.lastReceivedAtMillis.get());
+    }
+
+    @Override
+    public boolean isConnected() {
+        return !this.closed.get();
     }
 
     @Override
@@ -409,7 +454,7 @@ final class DefaultOftConnection implements OftConnection {
         }
 
         if (this.closed.get()) {
-            throw new IllegalStateException("The connection is closed.");
+            throw new OftDisconnectedException("This connection is no longer connected.");
         }
 
         CompletableFuture<Void> future = new CompletableFuture<>();
@@ -436,6 +481,10 @@ final class DefaultOftConnection implements OftConnection {
 
     @Override
     public CompletableFuture<Void> rekey() {
+        if (this.closed.get()) {
+            throw new OftDisconnectedException("This connection is no longer connected.");
+        }
+
         // No-op: an insecure (non-TLS) connection has no TLS session to rekey.
         if (this.insecure) {
             return CompletableFuture.completedFuture(null);
@@ -571,10 +620,10 @@ final class DefaultOftConnection implements OftConnection {
         boolean finishesMessage;
 
         if (message.cancelRequested && message.started) {
-            packet = Packet.newBuilder().setControl(3).setData(ByteString.EMPTY).build();
+            packet = Packet.newBuilder().setControl(1).setData(ByteString.EMPTY).build();
             finishesMessage = true;
         } else if (!message.started && message.data.length <= this.maxPacketDataSize) {
-            packet = Packet.newBuilder().setControl(1).setData(ByteString.copyFrom(message.data)).build();
+            packet = Packet.newBuilder().setControl(3).setData(ByteString.copyFrom(message.data)).build();
             message.started = true;
             finishesMessage = true;
         } else {
@@ -584,7 +633,7 @@ final class DefaultOftConnection implements OftConnection {
             boolean isLast = message.bytesSent + chunkSize >= message.data.length;
 
             packet = Packet.newBuilder()
-                    .setControl(isLast ? 2 : message.priority + 4)
+                    .setControl(isLast ? 0 : message.priority + 4)
                     .setData(ByteString.copyFrom(message.data, message.bytesSent, chunkSize))
                     .build();
             message.bytesSent += chunkSize;
@@ -633,7 +682,7 @@ final class DefaultOftConnection implements OftConnection {
     }
 
     private void handlePacket(Packet packet) throws IOException {
-        if (packet.getControl() == 0) {
+        if (packet.getControl() == 2) {
             CompletableFuture<Void> receipt = this.outstandingReceipt.getAndSet(null);
             if (receipt != null) {
                 receipt.complete(null);
@@ -643,13 +692,13 @@ final class DefaultOftConnection implements OftConnection {
         }
 
         switch (packet.getControl()) {
-            case 1:
+            case 3:
                 raiseReceived(packet.getData().toByteArray());
                 break;
-            case 2:
+            case 0:
                 completeInboundMessage(packet.getData().toByteArray(), false);
                 break;
-            case 3:
+            case 1:
                 completeInboundMessage(new byte[0], true);
                 break;
             default:
@@ -659,7 +708,7 @@ final class DefaultOftConnection implements OftConnection {
                 break;
         }
 
-        this.frameStream.write(Packet.newBuilder().setControl(0).setData(ByteString.EMPTY).build());
+        this.frameStream.write(Packet.newBuilder().setControl(2).setData(ByteString.EMPTY).build());
     }
 
     private void completeInboundMessage(byte[] finalChunk, boolean cancelled) {
@@ -726,7 +775,7 @@ final class DefaultOftConnection implements OftConnection {
 
         for (CompletableFuture<Void> future : cancelledRekeys) {
             future.completeExceptionally(
-                    exception != null ? exception : new IllegalStateException("The connection was disposed."));
+                    exception != null ? exception : new OftDisconnectedException("This connection is no longer connected."));
         }
 
         synchronized (this.outboundLock) {
@@ -734,7 +783,7 @@ final class DefaultOftConnection implements OftConnection {
                 PendingMessage message;
                 while ((message = queue.pollFirst()) != null) {
                     message.future.completeExceptionally(
-                            exception != null ? exception : new IllegalStateException("The connection was disposed."));
+                            exception != null ? exception : new OftDisconnectedException("This connection is no longer connected."));
                 }
             }
         }

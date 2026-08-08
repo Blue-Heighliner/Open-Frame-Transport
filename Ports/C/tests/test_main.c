@@ -75,6 +75,22 @@ static void on_message_capture(oft_connection *connection, uint8_t *data, size_t
     pthread_mutex_unlock(&capture->mutex);
 }
 
+static void on_peer_message_capture(oft_peer_reception *reception, void *user_data) {
+    message_capture *capture = user_data;
+    size_t length = oft_peer_reception_length(reception);
+    uint8_t *data = malloc(length);
+    memcpy(data, oft_peer_reception_data(reception), length);
+    oft_peer_reception_free(reception);
+
+    pthread_mutex_lock(&capture->mutex);
+    free(capture->data);
+    capture->data = data;
+    capture->length = length;
+    capture->received = 1;
+    pthread_cond_broadcast(&capture->cond);
+    pthread_mutex_unlock(&capture->mutex);
+}
+
 static int message_capture_wait(message_capture *capture, int timeout_seconds) {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
@@ -325,21 +341,160 @@ static void test_establish_exchanges_info_as_hail(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    TEST_ASSERT(strcmp(oft_connection_remote_info(pair.client_connection), "server") == 0);
-    TEST_ASSERT(strcmp(oft_connection_remote_info(pair.server_connection), "client") == 0);
+    TEST_ASSERT(strcmp(oft_connection_identity(pair.client_connection)->info, "server") == 0);
+    TEST_ASSERT(strcmp(oft_connection_identity(pair.server_connection)->info, "client") == 0);
 
     destroy_pair(&pair);
+}
+
+static void test_identity_server_authentication_client_sees_server_certificate_identity(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    const oft_certificate_identity *client_certificate = oft_connection_identity(pair.client_connection)->certificate;
+    TEST_ASSERT(client_certificate != NULL);
+    TEST_ASSERT(client_certificate->name != NULL && strcmp(client_certificate->name, "localhost") == 0);
+
+    /* Server authentication only authenticates the server - the server never sees a client
+     * certificate. */
+    TEST_ASSERT(oft_connection_identity(pair.server_connection)->certificate == NULL);
+
+    destroy_pair(&pair);
+}
+
+typedef struct {
+    int called;
+    char info_copy[64];
+    int certificate_non_null;
+    int chain_non_null;
+    long verify_result;
+} validation_capture;
+
+static int record_connection_validation(const oft_identity *identity, X509 *certificate, STACK_OF(X509) *chain, long verify_result, void *user_data) {
+    validation_capture *capture = user_data;
+    capture->called = 1;
+    strncpy(capture->info_copy, identity->info ? identity->info : "", sizeof(capture->info_copy) - 1);
+    capture->certificate_non_null = certificate != NULL;
+    capture->chain_non_null = chain != NULL;
+    capture->verify_result = verify_result;
+    return 1;
+}
+
+static int reject_connection_validation(const oft_identity *identity, X509 *certificate, STACK_OF(X509) *chain, long verify_result, void *user_data) {
+    (void)identity;
+    (void)certificate;
+    (void)chain;
+    (void)verify_result;
+    (void)user_data;
+    return 0;
+}
+
+static void test_connection_validation_server_authentication_sees_identity_certificate_and_chain(void) {
+    SSL_CTX *server_ctx = test_create_server_context();
+    SSL_CTX *client_ctx = test_create_client_context();
+    TEST_ASSERT(server_ctx != NULL && client_ctx != NULL);
+
+    oft_host_options host_options;
+    memset(&host_options, 0, sizeof(host_options));
+    host_options.info = "server";
+    host_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
+
+    char error_buffer[256];
+    oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, server_ctx, error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(listener != NULL);
+
+    validation_capture capture;
+    memset(&capture, 0, sizeof(capture));
+
+    oft_connect_options connect_options;
+    memset(&connect_options, 0, sizeof(connect_options));
+    connect_options.info = "client";
+    connect_options.security_mode = OFT_SECURITY_MODE_SERVER_AUTHENTICATION;
+    connect_options.connection_validation = record_connection_validation;
+    connect_options.connection_validation_user_data = &capture;
+
+    oft_connection *client_connection = oft_connect(
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, client_ctx,
+            error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(client_connection != NULL);
+
+    TEST_ASSERT(capture.called == 1);
+    TEST_ASSERT(strcmp(capture.info_copy, "server") == 0);
+    TEST_ASSERT(capture.certificate_non_null == 1);
+    TEST_ASSERT(capture.chain_non_null == 1);
+
+    oft_connection_close(client_connection);
+    oft_listener_close(listener);
+    SSL_CTX_free(server_ctx);
+    SSL_CTX_free(client_ctx);
+}
+
+static void test_connection_validation_trusted_mode_sees_no_certificate_or_chain(void) {
+    oft_host_options host_options;
+    memset(&host_options, 0, sizeof(host_options));
+    host_options.info = "server";
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
+
+    char error_buffer[256];
+    oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(listener != NULL);
+
+    validation_capture capture;
+    memset(&capture, 0, sizeof(capture));
+    capture.verify_result = -1; /* sentinel: overwritten by the callback if it's actually invoked */
+
+    oft_connect_options connect_options;
+    memset(&connect_options, 0, sizeof(connect_options));
+    connect_options.info = "client";
+    connect_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
+    connect_options.connection_validation = record_connection_validation;
+    connect_options.connection_validation_user_data = &capture;
+
+    oft_connection *client_connection = oft_connect(
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL,
+            error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(client_connection != NULL);
+
+    TEST_ASSERT(capture.called == 1);
+    TEST_ASSERT(capture.certificate_non_null == 0);
+    TEST_ASSERT(capture.chain_non_null == 0);
+    TEST_ASSERT(capture.verify_result == X509_V_OK);
+
+    oft_connection_close(client_connection);
+    oft_listener_close(listener);
+}
+
+static void test_connection_validation_returns_zero_connect_fails(void) {
+    oft_host_options host_options;
+    memset(&host_options, 0, sizeof(host_options));
+    host_options.info = "server";
+    host_options.security_mode = OFT_SECURITY_MODE_SECURE;
+
+    char error_buffer[256];
+    oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(listener != NULL);
+
+    oft_connect_options connect_options;
+    memset(&connect_options, 0, sizeof(connect_options));
+    connect_options.info = "client";
+    connect_options.security_mode = OFT_SECURITY_MODE_SECURE;
+    connect_options.connection_validation = reject_connection_validation;
+
+    oft_connection *client_connection = oft_connect(
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL,
+            error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(client_connection == NULL);
+
+    oft_listener_close(listener);
 }
 
 static void test_remote_endpoint_returns_the_peers_actual_address(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    char host_buffer[64];
-    uint16_t port;
-    TEST_ASSERT(oft_connection_remote_endpoint(pair.server_connection, host_buffer, sizeof(host_buffer), &port) == OFT_OK);
-    TEST_ASSERT(strcmp(host_buffer, "127.0.0.1") == 0);
-    TEST_ASSERT(port != 0);
+    const oft_identity *identity = oft_connection_identity(pair.server_connection);
+    TEST_ASSERT(strcmp(identity->host, "127.0.0.1") == 0);
+    TEST_ASSERT(identity->port != 0);
 
     destroy_pair(&pair);
 }
@@ -360,6 +515,36 @@ static void test_disconnected_callback_reassigned_to_null_ignores_notification(v
     pthread_mutex_unlock(&unexpected.mutex);
 
     closed_capture_destroy(&unexpected);
+    destroy_pair(&pair);
+}
+
+static void test_is_connected_true_until_disconnected(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    TEST_ASSERT(oft_connection_is_connected(pair.client_connection));
+
+    oft_connection_disconnect(pair.client_connection);
+
+    TEST_ASSERT(!oft_connection_is_connected(pair.client_connection));
+
+    destroy_pair(&pair);
+}
+
+static void test_is_connected_false_after_remote_disconnect(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    closed_capture capture;
+    closed_capture_init(&capture);
+    oft_connection_set_disconnected_callback(pair.client_connection, on_closed_capture, &capture);
+
+    oft_connection_disconnect(pair.server_connection);
+
+    TEST_ASSERT(closed_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(!oft_connection_is_connected(pair.client_connection));
+
+    closed_capture_destroy(&capture);
     destroy_pair(&pair);
 }
 
@@ -384,6 +569,25 @@ static void test_send_small_message_delivered_as_unit(void) {
     destroy_pair(&pair);
 }
 
+static void test_send_empty_payload_delivered_as_empty_message(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    message_capture capture;
+    message_capture_init(&capture);
+    oft_connection_set_received_callback(pair.server_connection, on_message_capture, &capture);
+
+    uint64_t message_id;
+    TEST_ASSERT(oft_connection_send(pair.client_connection, NULL, 0, 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
+
+    TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(capture.length == 0);
+
+    message_capture_destroy(&capture);
+    destroy_pair(&pair);
+}
+
 static void test_send_large_message_split_and_reassembled(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16, 0) == 0);
@@ -399,6 +603,35 @@ static void test_send_large_message_split_and_reassembled(void) {
 
     uint64_t message_id;
     TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 3, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
+
+    TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(capture.length == sizeof(payload));
+    TEST_ASSERT(memcmp(capture.data, payload, sizeof(payload)) == 0);
+
+    message_capture_destroy(&capture);
+    destroy_pair(&pair);
+}
+
+static void test_send_one_byte_over_packet_size_split_with_minimal_final_chunk(void) {
+    /* The smallest possible split: one full Data chunk plus a 1-byte Completion chunk. This is the
+     * boundary case the Completion-carries-the-proto3-default-control-value design (README.md §4)
+     * depends on - a Completion packet's data must never be empty, and this is as close to empty as
+     * a real one can get. */
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16, 0) == 0);
+
+    message_capture capture;
+    message_capture_init(&capture);
+    oft_connection_set_received_callback(pair.server_connection, on_message_capture, &capture);
+
+    uint8_t payload[17];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)i;
+    }
+
+    uint64_t message_id;
+    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 1, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
@@ -583,11 +816,9 @@ static void test_remote_endpoint_returns_ipv6_address(void) {
     connection_capture_destroy(&accepted);
     TEST_ASSERT(server_connection != NULL);
 
-    char host_buffer[64];
-    uint16_t port;
-    TEST_ASSERT(oft_connection_remote_endpoint(server_connection, host_buffer, sizeof(host_buffer), &port) == OFT_OK);
-    TEST_ASSERT(strcmp(host_buffer, "::1") == 0);
-    TEST_ASSERT(port != 0);
+    const oft_identity *identity = oft_connection_identity(server_connection);
+    TEST_ASSERT(strcmp(identity->host, "::1") == 0);
+    TEST_ASSERT(identity->port != 0);
 
     oft_connection_close(client_connection);
     oft_connection_close(server_connection);
@@ -1351,8 +1582,8 @@ static test_listening_peer make_listening_peer(const char *info) {
     result.peer = oft_peer_create(&options);
 
     char error_buffer[256];
-    if (oft_peer_open(result.peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) != OFT_OK) {
-        fprintf(stderr, "oft_peer_open failed: %s\n", error_buffer);
+    if (oft_peer_listen(result.peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) != OFT_OK) {
+        fprintf(stderr, "oft_peer_listen failed: %s\n", error_buffer);
     }
 
     return result;
@@ -1368,7 +1599,7 @@ typedef struct {
     SSL_CTX *ssl_ctx;
 } test_outbound_peer;
 
-static test_outbound_peer make_outbound_peer(const char *info, long idle_timeout_ms, long eviction_check_interval_ms) {
+static test_outbound_peer make_outbound_peer(const char *info, long idle_timeout_ms) {
     test_outbound_peer result;
     result.ssl_ctx = test_create_peer_context();
 
@@ -1378,7 +1609,6 @@ static test_outbound_peer make_outbound_peer(const char *info, long idle_timeout
     options.ssl_ctx = result.ssl_ctx;
     options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
     options.idle_timeout_ms = idle_timeout_ms;
-    options.eviction_check_interval_ms = eviction_check_interval_ms;
 
     result.peer = oft_peer_create(&options);
     return result;
@@ -1391,11 +1621,11 @@ static void destroy_outbound_peer(test_outbound_peer *peer) {
 
 static void test_peer_send_reuses_connection(void) {
     test_listening_peer server = make_listening_peer("server");
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     message_capture capture;
     message_capture_init(&capture);
-    oft_peer_set_received_callback(server.peer, on_message_capture, &capture);
+    oft_peer_set_received_callback(server.peer, on_peer_message_capture, &capture);
 
     uint16_t port = (uint16_t)oft_peer_local_port(server.peer);
     char error_buffer[256];
@@ -1426,7 +1656,7 @@ static void test_peer_eviction_disconnects_idle_connections(void) {
     /* idle_timeout_ms must comfortably exceed how long the initial send itself can take (connect +
      * handshake + one round trip), or eviction can race the send and disconnect the connection
      * before it ever finishes. */
-    test_outbound_peer client = make_outbound_peer("client", 3000, 100);
+    test_outbound_peer client = make_outbound_peer("client", 3000);
 
     uint16_t port = (uint16_t)oft_peer_local_port(server.peer);
     char error_buffer[256];
@@ -1439,7 +1669,11 @@ static void test_peer_eviction_disconnects_idle_connections(void) {
     closed_capture_init(&closed);
     oft_connection_set_disconnected_callback(connection, on_closed_capture, &closed);
 
-    TEST_ASSERT(closed_capture_wait(&closed, 20) == 0);
+    /* 120 rather than 20: the connection only becomes an eviction candidate once oft_peer's fixed,
+     * non-configurable 30-second grace period has elapsed, and eviction itself is only ever checked
+     * on a further fixed, non-configurable 30-second interval on top of that (see oft_peer.h's own
+     * documentation). */
+    TEST_ASSERT(closed_capture_wait(&closed, 120) == 0);
 
     closed_capture_destroy(&closed);
     destroy_outbound_peer(&client);
@@ -1455,11 +1689,10 @@ static void test_peer_eviction_disconnects_idle_inbound_connections(void) {
     options.ssl_ctx = ssl_ctx;
     options.security_mode = OFT_SECURITY_MODE_DUAL_AUTHENTICATION;
     options.idle_timeout_ms = 200;
-    options.eviction_check_interval_ms = 50;
 
     oft_peer *peer = oft_peer_create(&options);
     char error_buffer[256];
-    TEST_ASSERT(oft_peer_open(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_listen(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_OK);
 
     /* A peer only ever supports DUAL_AUTHENTICATION (see OFT_SECURITY_MODE_SERVER_AUTHENTICATION's
      * own documentation for why), so the raw client dialing into it below must present its own
@@ -1478,7 +1711,12 @@ static void test_peer_eviction_disconnects_idle_inbound_connections(void) {
     closed_capture_init(&closed);
     oft_connection_set_disconnected_callback(connection, on_closed_capture, &closed);
 
-    TEST_ASSERT(closed_capture_wait(&closed, 10) == 0);
+    /* 120 rather than 10: the connection only becomes an eviction candidate once oft_peer's fixed,
+     * non-configurable 30-second grace period has elapsed, and eviction itself is only ever checked
+     * on a further fixed, non-configurable 30-second interval on top of that - with generous margin
+     * for background timer drift under concurrent test-suite load (see oft_peer.h's own
+     * documentation). */
+    TEST_ASSERT(closed_capture_wait(&closed, 120) == 0);
 
     closed_capture_destroy(&closed);
     oft_connection_close(connection);
@@ -1501,7 +1739,6 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
      * max_connection_count-driven "evict the oldest" path below should ever disconnect anything. */
     options.idle_timeout_ms = 60000;
     options.max_connection_lifetime_ms = 60000;
-    options.eviction_check_interval_ms = 50;
     options.max_connection_count = 1;
 
     oft_peer *client = oft_peer_create(&options);
@@ -1527,7 +1764,12 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
     TEST_ASSERT(oft_peer_send(client, "127.0.0.1", port_b, (const uint8_t *)"hi", 2, 0, &connection_b, &message_id_b, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection_b, message_id_b) == OFT_OK);
 
-    TEST_ASSERT(closed_capture_wait(&closed, 10) == 0);
+    /* 120 rather than 10: connection_a only becomes an eviction candidate once oft_peer's fixed,
+     * non-configurable 30-second grace period has elapsed since it finished sending, and eviction
+     * itself is only ever checked on a further fixed, non-configurable 30-second interval on top of
+     * that - with generous margin for background timer drift under concurrent test-suite load (see
+     * oft_peer.h's own documentation). */
+    TEST_ASSERT(closed_capture_wait(&closed, 120) == 0);
 
     closed_capture_destroy(&closed);
     oft_peer_close(client);
@@ -1537,63 +1779,41 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
 }
 
 static void test_peer_outbound_only_has_no_local_port(void) {
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     TEST_ASSERT(oft_peer_local_port(client.peer) == 0);
 
-    oft_peer_stop(client.peer);
+    oft_peer_stop_listening(client.peer);
 
     destroy_outbound_peer(&client);
 }
 
-static void on_peer_message_reply_pong(oft_connection *connection, uint8_t *data, size_t length, void *user_data) {
-    message_capture *capture = user_data;
+static void test_peer_message_delivered_on_inbound_connection(void) {
+    test_listening_peer listening_peer = make_listening_peer("listener");
+    test_outbound_peer caller = make_outbound_peer("caller", 0);
 
-    pthread_mutex_lock(&capture->mutex);
-    capture->data = data;
-    capture->length = length;
-    capture->received = 1;
-    pthread_cond_broadcast(&capture->cond);
-    pthread_mutex_unlock(&capture->mutex);
+    message_capture received;
+    message_capture_init(&received);
+    oft_peer_set_received_callback(listening_peer.peer, on_peer_message_capture, &received);
 
-    uint64_t reply_id;
-    oft_connection_send(connection, (const uint8_t *)"pong", 4, 0, &reply_id);
-}
-
-static void test_peer_message_delivered_on_both_inbound_and_outbound_connections(void) {
-    test_listening_peer peer_a = make_listening_peer("peerA");
-    test_listening_peer peer_b = make_listening_peer("peerB");
-
-    message_capture a_received;
-    message_capture_init(&a_received);
-    oft_peer_set_received_callback(peer_a.peer, on_message_capture, &a_received);
-
-    message_capture b_received;
-    message_capture_init(&b_received);
-    oft_peer_set_received_callback(peer_b.peer, on_peer_message_reply_pong, &b_received);
-
-    uint16_t port_b = (uint16_t)oft_peer_local_port(peer_b.peer);
+    uint16_t port = (uint16_t)oft_peer_local_port(listening_peer.peer);
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(peer_a.peer, "127.0.0.1", port_b, (const uint8_t *)"ping", 4, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
-    TEST_ASSERT(message_capture_wait(&b_received, 10) == 0);
-    TEST_ASSERT(memcmp(b_received.data, "ping", 4) == 0);
+    TEST_ASSERT(message_capture_wait(&received, 10) == 0);
+    TEST_ASSERT(memcmp(received.data, "hello listener", 14) == 0);
 
-    TEST_ASSERT(message_capture_wait(&a_received, 10) == 0);
-    TEST_ASSERT(memcmp(a_received.data, "pong", 4) == 0);
-
-    message_capture_destroy(&a_received);
-    message_capture_destroy(&b_received);
-    destroy_listening_peer(&peer_a);
-    destroy_listening_peer(&peer_b);
+    message_capture_destroy(&received);
+    destroy_outbound_peer(&caller);
+    destroy_listening_peer(&listening_peer);
 }
 
 static void test_peer_rekey_rekeys_outbound_and_inbound_connections(void) {
     test_listening_peer server = make_listening_peer("server");
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     uint16_t port = (uint16_t)oft_peer_local_port(server.peer);
     char error_buffer[256];
@@ -1607,7 +1827,7 @@ static void test_peer_rekey_rekeys_outbound_and_inbound_connections(void) {
 
     message_capture capture;
     message_capture_init(&capture);
-    oft_peer_set_received_callback(server.peer, on_message_capture, &capture);
+    oft_peer_set_received_callback(server.peer, on_peer_message_capture, &capture);
 
     oft_connection *connection2;
     uint64_t message_id2;
@@ -1622,16 +1842,16 @@ static void test_peer_rekey_rekeys_outbound_and_inbound_connections(void) {
 }
 
 static void test_peer_rekey_no_connections_succeeds(void) {
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     TEST_ASSERT(oft_peer_rekey(client.peer) == OFT_OK);
 
     destroy_outbound_peer(&client);
 }
 
-static void test_peer_disconnect_disconnects_outbound_and_inbound_connections(void) {
+static void test_peer_drop_disconnects_outbound_and_inbound_connections(void) {
     test_listening_peer server = make_listening_peer("server");
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     uint16_t port = (uint16_t)oft_peer_local_port(server.peer);
     char error_buffer[256];
@@ -1644,7 +1864,7 @@ static void test_peer_disconnect_disconnects_outbound_and_inbound_connections(vo
     closed_capture_init(&closed);
     oft_connection_set_disconnected_callback(connection, on_closed_capture, &closed);
 
-    oft_peer_disconnect(client.peer);
+    oft_peer_drop(client.peer);
 
     TEST_ASSERT(closed_capture_wait(&closed, 10) == 0);
 
@@ -1653,9 +1873,9 @@ static void test_peer_disconnect_disconnects_outbound_and_inbound_connections(vo
     destroy_listening_peer(&server);
 }
 
-static void test_peer_disconnect_peer_remains_usable_afterward(void) {
+static void test_peer_drop_peer_remains_usable_afterward(void) {
     test_listening_peer server = make_listening_peer("server");
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     uint16_t port = (uint16_t)oft_peer_local_port(server.peer);
     char error_buffer[256];
@@ -1664,7 +1884,7 @@ static void test_peer_disconnect_peer_remains_usable_afterward(void) {
     TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"first", 5, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
-    oft_peer_disconnect(client.peer);
+    oft_peer_drop(client.peer);
 
     oft_connection *connection2;
     uint64_t message_id2;
@@ -1675,10 +1895,10 @@ static void test_peer_disconnect_peer_remains_usable_afterward(void) {
     destroy_listening_peer(&server);
 }
 
-static void test_peer_disconnect_no_connections_does_not_crash(void) {
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+static void test_peer_drop_no_connections_does_not_crash(void) {
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
-    oft_peer_disconnect(client.peer);
+    oft_peer_drop(client.peer);
 
     destroy_outbound_peer(&client);
 }
@@ -1694,7 +1914,7 @@ static void test_peer_create_server_authentication_mode_fails(void) {
     TEST_ASSERT(oft_peer_create(&options) == NULL);
 }
 
-static void test_peer_open_fails_when_dual_authentication_mode_missing_ssl_ctx(void) {
+static void test_peer_listen_fails_when_dual_authentication_mode_missing_ssl_ctx(void) {
     oft_peer_options options;
     memset(&options, 0, sizeof(options));
     options.info = "peer";
@@ -1703,13 +1923,13 @@ static void test_peer_open_fails_when_dual_authentication_mode_missing_ssl_ctx(v
     oft_peer *peer = oft_peer_create(&options);
 
     char error_buffer[256];
-    TEST_ASSERT(oft_peer_open(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_ERROR);
+    TEST_ASSERT(oft_peer_listen(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_ERROR);
 
     oft_peer_close(peer);
 }
 
 static void test_peer_send_to_unreachable_host_fails(void) {
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     int probe_fd = socket(AF_INET, SOCK_STREAM, 0);
     TEST_ASSERT(probe_fd >= 0);
@@ -1733,7 +1953,7 @@ static void test_peer_send_to_unreachable_host_fails(void) {
 }
 
 static void test_peer_close_called_twice_is_idempotent(void) {
-    test_outbound_peer client = make_outbound_peer("client", 0, 0);
+    test_outbound_peer client = make_outbound_peer("client", 0);
 
     oft_peer_close(client.peer);
     oft_peer_close(client.peer);
@@ -1857,6 +2077,41 @@ static void test_trusted_connection_establishes_and_exchanges_messages(void) {
     oft_listener_close(listener);
 }
 
+static void test_trusted_no_tls_session_identity_has_no_certificate(void) {
+    oft_host_options host_options;
+    memset(&host_options, 0, sizeof(host_options));
+    host_options.info = "server";
+    host_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
+
+    connection_capture accepted;
+    connection_capture_init(&accepted);
+
+    char error_buffer[256];
+    oft_listener *listener = oft_host("127.0.0.1", 0, &host_options, NULL, error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(listener != NULL);
+    oft_listener_set_connected_callback(listener, on_connection_established, &accepted);
+
+    oft_connect_options connect_options;
+    memset(&connect_options, 0, sizeof(connect_options));
+    connect_options.info = "client";
+    connect_options.security_mode = OFT_SECURITY_MODE_TRUSTED;
+
+    oft_connection *client_connection = oft_connect(
+            "127.0.0.1", (uint16_t)oft_listener_local_port(listener), &connect_options, NULL, error_buffer, sizeof(error_buffer));
+    TEST_ASSERT(client_connection != NULL);
+
+    oft_connection *server_connection = connection_capture_wait(&accepted, 10);
+    connection_capture_destroy(&accepted);
+    TEST_ASSERT(server_connection != NULL);
+
+    TEST_ASSERT(oft_connection_identity(client_connection)->certificate == NULL);
+    TEST_ASSERT(oft_connection_identity(server_connection)->certificate == NULL);
+
+    oft_connection_close(client_connection);
+    oft_connection_close(server_connection);
+    oft_listener_close(listener);
+}
+
 static void test_rekey_on_trusted_connection_is_noop(void) {
     oft_host_options host_options;
     memset(&host_options, 0, sizeof(host_options));
@@ -1935,7 +2190,7 @@ static void test_trusted_hail_is_exchanged_directly_over_raw_tcp(void) {
     oft_connection *server_connection = connection_capture_wait(&accepted, 10);
     connection_capture_destroy(&accepted);
     TEST_ASSERT(server_connection != NULL);
-    TEST_ASSERT(strcmp(oft_connection_remote_info(server_connection), "raw-client") == 0);
+    TEST_ASSERT(strcmp(oft_connection_identity(server_connection)->info, "raw-client") == 0);
 
     oft_frame_stream_destroy(&stream);
     close(fd);
@@ -2020,11 +2275,17 @@ static void test_peer_eviction_skips_connections_with_pending_inbound_data(void)
     options.info = "listener";
     options.security_mode = OFT_SECURITY_MODE_TRUSTED;
     options.idle_timeout_ms = 100;
-    options.eviction_check_interval_ms = 25;
+
+    /* Longer than the wait below (which must now cover the fixed 30-second eviction grace period
+     * plus the fixed 30-second eviction check interval, with generous margin for background timer
+     * drift under concurrent test-suite load): without this, a liveness Poll frame (default
+     * interval 1000ms) would arrive on the raw socket mid-wait and be mistaken by the recv()-based
+     * EOF check below for the connection closing. */
+    options.poll_interval_ms = 150000;
 
     oft_peer *peer = oft_peer_create(&options);
     char error_buffer[256];
-    TEST_ASSERT(oft_peer_open(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_listen(peer, "127.0.0.1", 0, error_buffer, sizeof(error_buffer)) == OFT_OK);
 
     int fd = raw_connect((uint16_t)oft_peer_local_port(peer));
     TEST_ASSERT(fd >= 0);
@@ -2049,7 +2310,7 @@ static void test_peer_eviction_skips_connections_with_pending_inbound_data(void)
     /* A non-final chunk (control = priority(0) + 4) leaves an in-progress, never-completed inbound
      * message on the server side - oft_connection_has_pending_data() must report true for it, and
      * the peer's eviction sweep must never disconnect it while that's the case, no matter how many
-     * idle_timeout_ms/eviction_check_interval_ms cycles elapse. */
+     * eviction check cycles elapse. */
     oft_packet chunk_packet;
     oft_packet_init(&chunk_packet, 4, (const uint8_t *)"partial", 7);
     oft_buffer packet_buffer;
@@ -2062,14 +2323,18 @@ static void test_peer_eviction_skips_connections_with_pending_inbound_data(void)
     TEST_ASSERT(oft_frame_stream_read(&stream, &received_data, &received_length) == 1); /* Receipt for the chunk */
     free(received_data);
 
-    usleep(500000); /* comfortably more than idle_timeout_ms and several eviction cycles */
+    usleep(500000); /* comfortably more than idle_timeout_ms; well under the fixed 30-second eviction check interval, so this doesn't need to wait out a whole cycle to prove pending data blocks eviction */
 
     struct pollfd still_open_poll = { .fd = fd, .events = POLLIN };
     TEST_ASSERT(poll(&still_open_poll, 1, 100) == 0); /* no EOF/HUP: still connected */
 
-    /* Completing the message (control 2: final chunk) lets it become eviction-eligible again. */
+    /* Completing the message (control 0: final chunk) lets it become eviction-eligible again. A
+     * genuine Completion packet's data is never empty (see Docs/OFT.md §4) - control 0 is the value
+     * proto3 default-value omission could elide, and an empty-data Completion here would serialize
+     * identically to Poll's bare zero-length frame, so this uses a non-empty final chunk like the
+     * real send path always does. */
     oft_packet final_packet;
-    oft_packet_init(&final_packet, 2, NULL, 0);
+    oft_packet_init(&final_packet, 0, (const uint8_t *)"end", 3);
     oft_buffer final_buffer;
     oft_buffer_init(&final_buffer);
     TEST_ASSERT(oft_packet_encode(&final_packet, &final_buffer) == 0);
@@ -2080,8 +2345,13 @@ static void test_peer_eviction_skips_connections_with_pending_inbound_data(void)
     TEST_ASSERT(oft_frame_stream_read(&stream, &received_data, &received_length) == 1); /* Receipt for the final chunk */
     free(received_data);
 
+    /* 120s rather than 5: the connection only becomes an eviction candidate once oft_peer's fixed,
+     * non-configurable 30-second grace period has elapsed since HasPendingData cleared, and eviction
+     * itself is only ever checked on a further fixed, non-configurable 30-second interval on top of
+     * that - with generous margin for background timer drift under concurrent test-suite load (see
+     * oft_peer.h's own documentation). */
     struct pollfd now_evicted_poll = { .fd = fd, .events = POLLIN };
-    TEST_ASSERT(poll(&now_evicted_poll, 1, 5000) > 0);
+    TEST_ASSERT(poll(&now_evicted_poll, 1, 120000) > 0);
     uint8_t probe;
     TEST_ASSERT(recv(fd, &probe, 1, 0) == 0); /* clean EOF: the server closed it once idle */
 
@@ -2352,10 +2622,18 @@ int main(void) {
     printf("Open Frame Transport - C tests\n");
 
     RUN_TEST(test_establish_exchanges_info_as_hail);
+    RUN_TEST(test_identity_server_authentication_client_sees_server_certificate_identity);
+    RUN_TEST(test_connection_validation_server_authentication_sees_identity_certificate_and_chain);
+    RUN_TEST(test_connection_validation_trusted_mode_sees_no_certificate_or_chain);
+    RUN_TEST(test_connection_validation_returns_zero_connect_fails);
     RUN_TEST(test_remote_endpoint_returns_the_peers_actual_address);
     RUN_TEST(test_disconnected_callback_reassigned_to_null_ignores_notification);
+    RUN_TEST(test_is_connected_true_until_disconnected);
+    RUN_TEST(test_is_connected_false_after_remote_disconnect);
     RUN_TEST(test_send_small_message_delivered_as_unit);
+    RUN_TEST(test_send_empty_payload_delivered_as_empty_message);
     RUN_TEST(test_send_large_message_split_and_reassembled);
+    RUN_TEST(test_send_one_byte_over_packet_size_split_with_minimal_final_chunk);
     RUN_TEST(test_higher_priority_interrupts_lower_priority);
     RUN_TEST(test_cancel_before_start_never_delivered);
     RUN_TEST(test_cancel_after_start_connection_stays_healthy);
@@ -2408,14 +2686,14 @@ int main(void) {
     RUN_TEST(test_peer_eviction_disconnects_idle_inbound_connections);
     RUN_TEST(test_peer_eviction_disconnects_excess_connections_beyond_max_count);
     RUN_TEST(test_peer_outbound_only_has_no_local_port);
-    RUN_TEST(test_peer_message_delivered_on_both_inbound_and_outbound_connections);
+    RUN_TEST(test_peer_message_delivered_on_inbound_connection);
     RUN_TEST(test_peer_rekey_rekeys_outbound_and_inbound_connections);
     RUN_TEST(test_peer_rekey_no_connections_succeeds);
-    RUN_TEST(test_peer_disconnect_disconnects_outbound_and_inbound_connections);
-    RUN_TEST(test_peer_disconnect_peer_remains_usable_afterward);
-    RUN_TEST(test_peer_disconnect_no_connections_does_not_crash);
+    RUN_TEST(test_peer_drop_disconnects_outbound_and_inbound_connections);
+    RUN_TEST(test_peer_drop_peer_remains_usable_afterward);
+    RUN_TEST(test_peer_drop_no_connections_does_not_crash);
     RUN_TEST(test_peer_create_server_authentication_mode_fails);
-    RUN_TEST(test_peer_open_fails_when_dual_authentication_mode_missing_ssl_ctx);
+    RUN_TEST(test_peer_listen_fails_when_dual_authentication_mode_missing_ssl_ctx);
     RUN_TEST(test_peer_send_to_unreachable_host_fails);
     RUN_TEST(test_peer_close_called_twice_is_idempotent);
 
@@ -2424,6 +2702,7 @@ int main(void) {
     RUN_TEST(test_host_close_called_twice_is_idempotent);
     RUN_TEST(test_host_binds_ipv6_loopback);
     RUN_TEST(test_trusted_connection_establishes_and_exchanges_messages);
+    RUN_TEST(test_trusted_no_tls_session_identity_has_no_certificate);
     RUN_TEST(test_rekey_on_trusted_connection_is_noop);
     RUN_TEST(test_trusted_hail_is_exchanged_directly_over_raw_tcp);
     RUN_TEST(test_incompatible_hail_version_rejected);

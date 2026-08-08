@@ -14,71 +14,100 @@ internal sealed class OftTlsClient : DefaultTlsClient
 {
     private readonly string targetHost;
     private readonly bool skipServerCertificateValidation;
-    private readonly X509CertificateCollection? clientCertificates;
+    private readonly X509Certificate2? clientCertificate;
     private readonly RemoteCertificateValidationCallback? serverCertificateValidation;
 
     public OftTlsClient(
             BcTlsCrypto crypto, string targetHost, bool skipServerCertificateValidation,
-            X509CertificateCollection? clientCertificates, RemoteCertificateValidationCallback? serverCertificateValidation)
+            X509Certificate2? clientCertificate, RemoteCertificateValidationCallback? serverCertificateValidation)
         : base(crypto)
     {
         this.targetHost = targetHost;
         this.skipServerCertificateValidation = skipServerCertificateValidation;
-        this.clientCertificates = clientCertificates;
+        this.clientCertificate = clientCertificate;
         this.serverCertificateValidation = serverCertificateValidation;
     }
+
+    /// <summary>
+    /// The certificate the server presented during the TLS handshake, or <see langword="null"/> if
+    /// the handshake hasn't reached that point yet. Captured regardless of
+    /// <see cref="skipServerCertificateValidation"/>, since a caller may still want to know which
+    /// certificate was presented even under <see cref="OftSecurityMode.Secure"/>, where it isn't
+    /// validated.
+    /// </summary>
+    public X509Certificate2? RemoteCertificate { get; private set; }
+
+    /// <summary>
+    /// The certificate chain built while validating <see cref="RemoteCertificate"/>, or
+    /// <see langword="null"/> if <see cref="RemoteCertificate"/> is, or under
+    /// <see cref="OftSecurityMode.Secure"/>, where the certificate is accepted unconditionally
+    /// without building one. Ownership belongs to whoever reads this property; disposed by
+    /// <see cref="OftConnection"/> once it's done with it.
+    /// </summary>
+    public X509Chain? RemoteCertificateChain { get; private set; }
+
+    /// <summary>
+    /// The policy errors found while validating <see cref="RemoteCertificate"/>'s chain, or
+    /// <see cref="SslPolicyErrors.None"/> whenever <see cref="RemoteCertificateChain"/> is
+    /// <see langword="null"/>.
+    /// </summary>
+    public SslPolicyErrors RemoteCertificateSslErrors { get; private set; }
 
     protected override ProtocolVersion[] GetSupportedVersions() => ProtocolVersion.TLSv13.Only();
 
     public override TlsAuthentication GetAuthentication() =>
-        new Authentication(this.m_context, this.targetHost, this.skipServerCertificateValidation, this.clientCertificates, this.serverCertificateValidation);
+        new Authentication(this, this.m_context, this.targetHost, this.skipServerCertificateValidation, this.clientCertificate, this.serverCertificateValidation);
 
     private sealed class Authentication : TlsAuthentication
     {
+        private readonly OftTlsClient owner;
         private readonly TlsClientContext context;
         private readonly string targetHost;
         private readonly bool skipServerCertificateValidation;
-        private readonly X509CertificateCollection? clientCertificates;
+        private readonly X509Certificate2? clientCertificate;
         private readonly RemoteCertificateValidationCallback? serverCertificateValidation;
 
         public Authentication(
-                TlsClientContext context, string targetHost, bool skipServerCertificateValidation,
-                X509CertificateCollection? clientCertificates, RemoteCertificateValidationCallback? serverCertificateValidation)
+                OftTlsClient owner, TlsClientContext context, string targetHost, bool skipServerCertificateValidation,
+                X509Certificate2? clientCertificate, RemoteCertificateValidationCallback? serverCertificateValidation)
         {
+            this.owner = owner;
             this.context = context;
             this.targetHost = targetHost;
             this.skipServerCertificateValidation = skipServerCertificateValidation;
-            this.clientCertificates = clientCertificates;
+            this.clientCertificate = clientCertificate;
             this.serverCertificateValidation = serverCertificateValidation;
         }
 
         public void NotifyServerCertificate(TlsServerCertificate serverCertificate)
         {
+            this.owner.RemoteCertificate = OftTlsCertificates.ExtractLeafCertificate(serverCertificate.Certificate);
+
             if (this.skipServerCertificateValidation)
             {
                 return;
             }
 
-            OftTlsCertificates.Validate(serverCertificate.Certificate, this.serverCertificateValidation, this.targetHost);
+            this.owner.RemoteCertificateChain = OftTlsCertificates.Validate(
+                serverCertificate.Certificate, this.serverCertificateValidation, this.targetHost, out SslPolicyErrors sslErrors);
+            this.owner.RemoteCertificateSslErrors = sslErrors;
         }
 
         public TlsCredentials GetClientCredentials(Org.BouncyCastle.Tls.CertificateRequest certificateRequest)
         {
-            if (this.clientCertificates is null || this.clientCertificates.Count == 0)
+            if (this.clientCertificate is null)
             {
                 return null!;
             }
 
-            X509Certificate2 certificate = this.clientCertificates[0] as X509Certificate2
-                ?? new X509Certificate2(this.clientCertificates[0]);
             BcTlsCrypto crypto = (BcTlsCrypto)this.context.Crypto;
-            SignatureAndHashAlgorithm algorithm = OftTlsCertificates.PickSignatureAndHashAlgorithm(certificate);
+            SignatureAndHashAlgorithm algorithm = OftTlsCertificates.PickSignatureAndHashAlgorithm(this.clientCertificate);
 
             return new BcDefaultTlsCredentialedSigner(
                 new TlsCryptoParameters(this.context),
                 crypto,
-                OftTlsCertificates.ToBcPrivateKey(certificate),
-                OftTlsCertificates.ToBcCertificateChain(certificate, crypto),
+                OftTlsCertificates.ToBcPrivateKey(this.clientCertificate),
+                OftTlsCertificates.ToBcCertificateChain(this.clientCertificate, crypto),
                 algorithm);
         }
     }

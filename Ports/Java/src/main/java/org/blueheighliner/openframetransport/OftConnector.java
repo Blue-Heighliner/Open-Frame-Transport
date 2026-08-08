@@ -33,8 +33,10 @@ public interface OftConnector {
      * @return the established connection
      * @throws IllegalArgumentException {@code options.sslContext()} is {@code null} and
      *                                   {@code options.securityMode()} is
-     *                                   {@link OftSecurityMode#SERVER_AUTHENTICATION} or
-     *                                   {@link OftSecurityMode#DUAL_AUTHENTICATION}
+     *                                   {@link OftSecurityMode#DUAL_AUTHENTICATION} - under
+     *                                   {@link OftSecurityMode#SERVER_AUTHENTICATION}, a {@code null}
+     *                                   {@code sslContext} instead falls back to the JVM's default
+     *                                   trust store
      */
     OftConnection connect(String host, int port, OftConnectOptions options) throws IOException;
 }

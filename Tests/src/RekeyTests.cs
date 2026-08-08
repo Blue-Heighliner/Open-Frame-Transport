@@ -5,7 +5,7 @@ public sealed class RekeyTests
     [Fact]
     public async Task Rekey_ConnectionStillWorksAfterward()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         await pair.ClientConnection.Rekey().WaitAsync(OftTestHarness.DefaultTimeout);
 
@@ -22,7 +22,7 @@ public sealed class RekeyTests
     [Fact]
     public async Task Rekey_InitiatedFromServerSide_Works()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         await pair.ServerConnection.Rekey().WaitAsync(OftTestHarness.DefaultTimeout);
 
@@ -39,7 +39,7 @@ public sealed class RekeyTests
     [Fact]
     public async Task Rekey_InitiatedSimultaneouslyFromBothSides_DoesNotDeadlock()
     {
-        await using OftPair pair = await OftTestHarness.Establish();
+        using OftPair pair = await OftTestHarness.Establish();
 
         Task clientRekey = pair.ClientConnection.Rekey();
         Task serverRekey = pair.ServerConnection.Rekey();
@@ -59,7 +59,7 @@ public sealed class RekeyTests
     [Fact]
     public async Task Rekey_WhileMessageInFlight_StillDeliversMessage()
     {
-        await using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -78,7 +78,7 @@ public sealed class RekeyTests
     [Fact]
     public async Task RekeyInterval_AutomaticallyRekeysWithoutBreakingConnection()
     {
-        await using OftPair pair = await OftTestHarness.Establish(rekeyInterval: TimeSpan.FromMilliseconds(150));
+        using OftPair pair = await OftTestHarness.Establish(rekeyInterval: TimeSpan.FromMilliseconds(150));
 
         await Task.Delay(500);
 

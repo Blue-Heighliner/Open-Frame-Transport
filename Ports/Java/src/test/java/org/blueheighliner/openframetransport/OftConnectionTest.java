@@ -19,6 +19,8 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -29,8 +31,20 @@ final class OftConnectionTest {
     @Test
     void establish_exchangesInfoAsHail() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
-            assertEquals("server", pair.clientConnection().getRemoteInfo());
-            assertEquals("client", pair.serverConnection().getRemoteInfo());
+            assertEquals("server", pair.clientConnection().getIdentity().info());
+            assertEquals("client", pair.serverConnection().getIdentity().info());
+        }
+    }
+
+    @Test
+    void establish_serverAuthentication_clientSeesServerCertificateIdentity() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
+            assertNotNull(pair.clientConnection().getIdentity().certificate());
+            assertEquals("localhost", pair.clientConnection().getIdentity().certificate().name());
+
+            // Server authentication only authenticates the server - the server never sees a client
+            // certificate.
+            assertNull(pair.serverConnection().getIdentity().certificate());
         }
     }
 
@@ -49,6 +63,20 @@ final class OftConnectionTest {
     }
 
     @Test
+    void send_emptyPayload_deliveredAsEmptyMessage() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
+            BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
+            pair.serverConnection().setReceivedHandler(received::add);
+
+            pair.clientConnection().send(new byte[0], 0).completion().get(10, TimeUnit.SECONDS);
+
+            byte[] result = received.poll(10, TimeUnit.SECONDS);
+            assertNotNull(result);
+            assertEquals(0, result.length);
+        }
+    }
+
+    @Test
     void send_largerThanPacketSize_splitAndReassembled() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish(16, null)) {
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
@@ -60,6 +88,28 @@ final class OftConnectionTest {
             }
 
             pair.clientConnection().send(payload, 3).completion().get(10, TimeUnit.SECONDS);
+
+            byte[] result = received.poll(10, TimeUnit.SECONDS);
+            assertArrayEquals(payload, result);
+        }
+    }
+
+    @Test
+    void send_oneByteOverPacketSize_splitWithMinimalFinalChunk() throws Exception {
+        // The smallest possible split: one full Data chunk plus a 1-byte Completion chunk. This is
+        // the boundary case the Completion-carries-the-proto3-default-control-value design (README.md
+        // §4) depends on - a Completion packet's data must never be empty, and this is as close to
+        // empty as a real one can get.
+        try (OftTestHarness.Pair pair = OftTestHarness.establish(16, null)) {
+            BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
+            pair.serverConnection().setReceivedHandler(received::add);
+
+            byte[] payload = new byte[17];
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] = (byte) i;
+            }
+
+            pair.clientConnection().send(payload, 1).completion().get(10, TimeUnit.SECONDS);
 
             byte[] result = received.poll(10, TimeUnit.SECONDS);
             assertArrayEquals(payload, result);
@@ -212,9 +262,100 @@ final class OftConnectionTest {
     }
 
     @Test
-    void getRemoteEndpoint_returnsThePeersActualAddress() throws Exception {
+    void getIdentity_endpointReturnsThePeersActualAddress() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
-            assertEquals(pair.listener().getLocalEndpoint().getPort(), pair.clientConnection().getRemoteEndpoint().getPort());
+            assertEquals(pair.listener().getLocalEndpoint().getPort(), pair.clientConnection().getIdentity().endpoint().getPort());
+        }
+    }
+
+    @Test
+    void establish_connectionValidationNull_allConnectionsAccepted() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
+            assertTrue(pair.clientConnection().isConnected());
+            assertTrue(pair.serverConnection().isConnected());
+        }
+    }
+
+    @Test
+    void establish_serverAuthentication_connectionValidationSeesIdentityAndCertificateChain() throws Exception {
+        CompletableFuture<OftIdentity> observedIdentity = new CompletableFuture<>();
+        CompletableFuture<java.security.cert.Certificate[]> observedChain = new CompletableFuture<>();
+
+        OftHostOptions hostOptions = OftHostOptions.builder()
+                .info("server")
+                .sslContext(TestCertificates.createServerContext())
+                .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
+                .build();
+
+        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+            OftConnectOptions connectOptions = OftConnectOptions.builder()
+                    .info("client")
+                    .sslContext(TestCertificates.createClientContext())
+                    .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
+                    .connectionValidation((identity, certificateChain, session) -> {
+                        observedIdentity.complete(identity);
+                        observedChain.complete(certificateChain);
+                        return true;
+                    })
+                    .build();
+
+            try (OftConnection clientConnection = OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+                OftIdentity identity = observedIdentity.get(10, TimeUnit.SECONDS);
+                java.security.cert.Certificate[] chain = observedChain.get(10, TimeUnit.SECONDS);
+
+                assertEquals("server", identity.info());
+                assertNotNull(chain);
+                assertTrue(chain.length > 0);
+            }
+        }
+    }
+
+    @Test
+    void establish_trustedMode_connectionValidationSeesNoCertificateChainOrSession() throws Exception {
+        CompletableFuture<java.security.cert.Certificate[]> observedChain = new CompletableFuture<>();
+        CompletableFuture<javax.net.ssl.SSLSession> observedSession = new CompletableFuture<>();
+
+        OftHostOptions hostOptions = OftHostOptions.builder()
+                .info("server")
+                .securityMode(OftSecurityMode.TRUSTED)
+                .build();
+
+        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+            OftConnectOptions connectOptions = OftConnectOptions.builder()
+                    .info("client")
+                    .securityMode(OftSecurityMode.TRUSTED)
+                    .connectionValidation((identity, certificateChain, session) -> {
+                        observedChain.complete(certificateChain);
+                        observedSession.complete(session);
+                        return true;
+                    })
+                    .build();
+
+            try (OftConnection clientConnection = OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+                assertNull(observedChain.get(10, TimeUnit.SECONDS));
+                assertNull(observedSession.get(10, TimeUnit.SECONDS));
+            }
+        }
+    }
+
+    @Test
+    void connect_connectionValidationReturnsFalse_throws() throws Exception {
+        OftHostOptions hostOptions = OftHostOptions.builder()
+                .info("server")
+                .securityMode(OftSecurityMode.SECURE)
+                .build();
+
+        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+            OftConnectOptions connectOptions = OftConnectOptions.builder()
+                    .info("client")
+                    .securityMode(OftSecurityMode.SECURE)
+                    .connectionValidation((identity, certificateChain, session) -> false)
+                    .build();
+
+            assertThrows(IOException.class, () -> OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions));
         }
     }
 
@@ -262,7 +403,45 @@ final class OftConnectionTest {
         OftTestHarness.Pair pair = OftTestHarness.establish();
         pair.clientConnection().close();
 
-        assertThrows(IllegalStateException.class, () -> pair.clientConnection().send("hi".getBytes(), 0));
+        assertThrows(OftDisconnectedException.class, () -> pair.clientConnection().send("hi".getBytes(), 0));
+
+        pair.close();
+    }
+
+    @Test
+    void rekey_afterClosed_throws() throws Exception {
+        OftTestHarness.Pair pair = OftTestHarness.establish();
+        pair.clientConnection().close();
+
+        assertThrows(OftDisconnectedException.class, () -> pair.clientConnection().rekey());
+
+        pair.close();
+    }
+
+    @Test
+    void isConnected_trueUntilClosed() throws Exception {
+        OftTestHarness.Pair pair = OftTestHarness.establish();
+
+        assertTrue(pair.clientConnection().isConnected());
+
+        pair.clientConnection().close();
+
+        assertFalse(pair.clientConnection().isConnected());
+
+        pair.close();
+    }
+
+    @Test
+    void isConnected_falseAfterRemoteDisconnect() throws Exception {
+        OftTestHarness.Pair pair = OftTestHarness.establish();
+
+        CompletableFuture<Void> disconnectedFuture = new CompletableFuture<>();
+        pair.clientConnection().setDisconnectedHandler(exception -> disconnectedFuture.complete(null));
+
+        pair.serverConnection().close();
+        disconnectedFuture.get(10, TimeUnit.SECONDS);
+
+        assertFalse(pair.clientConnection().isConnected());
 
         pair.close();
     }

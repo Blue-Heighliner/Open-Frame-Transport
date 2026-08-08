@@ -5,34 +5,63 @@ namespace BlueHeighliner.OpenFrameTransport;
 /// <see cref="IOftConnector"/>. Sending a message to a host/port transparently reuses an existing
 /// connection or creates and caches a new one; idle, expired, or excess cached connections are
 /// disconnected automatically, and connections with a configured
-/// <see cref="OftPeerOptions.RekeyInterval"/> rekey themselves automatically (see Docs/OFT.md §8).
-/// There is no way to enumerate or look up an individual connection this peer holds;
-/// <see cref="Rekey"/> and <see cref="Disconnect"/> act on all of them at once.
+/// <see cref="OftConnectionOptions.RekeyInterval"/> rekey themselves automatically (see Docs/OFT.md §8).
+/// A connection only ever becomes eligible for automatic disconnection once it has had no pending
+/// data (see <see cref="IOftConnection.HasPendingData"/>) for a fixed 30-second grace period — not
+/// configurable — giving the underlying TLS/TCP layers time to actually flush and acknowledge
+/// everything after the last application-level message completes. Eviction itself (checking
+/// connections against <see cref="OftPeerOptions.IdleTimeout"/>,
+/// <see cref="OftPeerOptions.MaxConnectionLifetime"/>, and
+/// <see cref="OftPeerOptions.MaxConnectionCount"/>) is likewise only ever run on a fixed,
+/// non-configurable 30-second interval — so, combined with the grace period above, neither
+/// <see cref="OftPeerOptions.IdleTimeout"/> nor <see cref="OftPeerOptions.MaxConnectionLifetime"/>
+/// can take effect any sooner than roughly 30-60 seconds after it's reached, regardless of how much
+/// shorter either is configured to be. There is no way to enumerate or
+/// look up an individual connection this peer holds;
+/// <see cref="Rekey"/> and <see cref="Drop"/> act on all of them at once.
+/// <see cref="Disconnect"/> and <see cref="IDisposable.Dispose"/> both permanently put this peer
+/// itself into a disconnected state — unlike <see cref="Drop"/>, which only disconnects this peer's
+/// currently held connections and leaves the peer itself usable — after which
+/// <see cref="IsConnected"/> is permanently <see langword="false"/> and every other member below
+/// throws: <see cref="Listen"/>, <see cref="StopListening"/>, and <see cref="Drop"/> throw
+/// <see cref="ObjectDisposedException"/>, while <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>
+/// and <see cref="Rekey"/> throw <see cref="OftDisconnectedException"/>. <see cref="IDisposable.Dispose"/>
+/// does this immediately, without waiting for any background work to finish; call
+/// <see cref="Disconnect"/> instead for a graceful, awaitable teardown that waits for it.
 /// </summary>
-public interface IOftPeer : IAsyncDisposable
+public interface IOftPeer : IDisposable
 {
     /// <summary>
-    /// The endpoint actually being listened on once <see cref="Open"/> has completed, or
+    /// Whether this peer is still connected: <see langword="true"/> until <see cref="Disconnect"/>
+    /// or <see cref="IDisposable.Dispose"/> is called, after which it is permanently
+    /// <see langword="false"/>. Unlike <see cref="IOftConnection.IsConnected"/>, this is unaffected
+    /// by any individual connection this peer holds disconnecting (locally via <see cref="Drop"/> or
+    /// remotely) — connection lifecycle is this peer's own implementation detail (see
+    /// <see cref="ReceivedHandler"/>'s own doc comment).
+    /// </summary>
+    bool IsConnected { get; }
+
+    /// <summary>
+    /// The endpoint actually being listened on once <see cref="Listen"/> has completed, or
     /// <see langword="null"/> if the peer isn't currently listening.
     /// </summary>
     IPEndPoint? LocalEndPoint { get; }
 
     /// <summary>
     /// Called for every message received on any connection this peer holds, both inbound and
-    /// outbound, identifying which one via its <see cref="IOftConnection"/> parameter, with ownership
-    /// of the message's pooled payload — the callback must dispose it (returning its memory to its
-    /// pool) once done with it, e.g. via a <see langword="using"/> statement. <see langword="null"/>
-    /// if no callback is currently assigned. There is only ever one callback at a time — assigning a
-    /// new value here always replaces any previous one, and the same
-    /// buffering-until-first-non-null-assignment guarantee
+    /// outbound, with the received <see cref="IOftPeerReception"/> — the callback must dispose it
+    /// (returning its pooled memory to its pool) once done with it, e.g. via a
+    /// <see langword="using"/> statement. <see langword="null"/> if no callback is currently
+    /// assigned. There is only ever one callback at a time — assigning a new value here always
+    /// replaces any previous one, and the same buffering-until-first-non-null-assignment guarantee
     /// <see cref="IOftConnection.ReceivedHandler"/> itself makes applies here too (see README.md).
-    /// The <see cref="IOftConnection"/> passed here is only for replying on the same connection a
-    /// message arrived on — this peer otherwise deliberately exposes no way to enumerate, look up, or
-    /// be notified about the individual connections it holds (e.g. no disconnected notification):
-    /// connection lifecycle is this peer's own implementation detail, transparently managed
-    /// (reconnecting, evicting, etc.) behind <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>.
+    /// This peer deliberately exposes no way to enumerate, look up, or be notified about the
+    /// individual connections it holds beyond an <see cref="IOftPeerReception"/>'s own
+    /// <see cref="IOftPeerReception.Identity"/> (e.g. no disconnected notification): connection
+    /// lifecycle is this peer's own implementation detail, transparently managed (reconnecting,
+    /// evicting, etc.) behind <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>.
     /// </summary>
-    Action<IOftConnection, IMemoryOwner<byte>>? ReceivedHandler { get; set; }
+    Action<IOftPeerReception>? ReceivedHandler { get; set; }
 
     /// <summary>
     /// Starts listening for inbound connections. A peer that never calls this only ever makes
@@ -41,17 +70,19 @@ public interface IOftPeer : IAsyncDisposable
     /// <param name="listenEndPoint">The local endpoint to listen for incoming TCP connections on.</param>
     /// <param name="cancellationToken">A token that stops listening when cancelled.</param>
     /// <exception cref="ArgumentException">
-    /// <see cref="OftPeerOptions.ServerCertificate"/> was not set and
-    /// <see cref="OftPeerOptions.SecurityMode"/> requires one (see
+    /// <see cref="OftConnectionOptions.Certificate"/> was not set and
+    /// <see cref="OftConnectionOptions.SecurityMode"/> requires one (see
     /// <see cref="OftSecurityMode.DualAuthentication"/> — the only authenticating mode a peer
     /// supports).
     /// </exception>
-    Task Open(IPEndPoint listenEndPoint, CancellationToken cancellationToken = default);
+    /// <exception cref="ObjectDisposedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
+    Task Listen(IPEndPoint listenEndPoint, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Stops listening for new inbound connections. Already-established connections are left open.
     /// </summary>
-    Task Close();
+    /// <exception cref="ObjectDisposedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
+    Task StopListening();
 
     /// <summary>
     /// Sends a message to <paramref name="host"/>:<paramref name="port"/>, reusing a cached
@@ -63,6 +94,7 @@ public interface IOftPeer : IAsyncDisposable
     /// <param name="priority">The priority to send the message at (see Docs/OFT.md §5-§6).</param>
     /// <param name="cancellationToken">A token used to cancel connecting or sending.</param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
+    /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
     Task Send(string host, int port, ReadOnlyMemory<byte> data, int priority = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
@@ -81,25 +113,41 @@ public interface IOftPeer : IAsyncDisposable
     /// <param name="priority">The priority to send the message at (see Docs/OFT.md §5-§6).</param>
     /// <param name="cancellationToken">A token used to cancel connecting or sending.</param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
+    /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
     Task Send(string host, int port, IMemoryOwner<byte> data, int priority = 0, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Requests a TLS 1.3 <c>KeyUpdate</c> (see Docs/OFT.md §8) on every connection this peer
     /// currently holds, both outbound and inbound (a no-op for any held connection established with
-    /// <see cref="OftPeerOptions.SecurityMode"/> set to <see cref="OftSecurityMode.Trusted"/> —
+    /// <see cref="OftConnectionOptions.SecurityMode"/> set to <see cref="OftSecurityMode.Trusted"/> —
     /// there is no TLS session to rekey). Connections established after this call is issued are
     /// unaffected.
     /// </summary>
     /// <param name="cancellationToken">A token used to cancel the requests.</param>
     /// <returns>A task that completes once every connection's local key update request has been sent.</returns>
+    /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
     Task Rekey(CancellationToken cancellationToken = default);
 
     /// <summary>
-    /// Disconnects every connection this peer currently holds, both outbound and inbound. The peer
-    /// itself is left usable - a subsequent <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>
-    /// call creates and caches a new outbound connection as usual, and, if listening, new inbound
-    /// connections keep being accepted.
+    /// Disconnects every connection this peer currently holds, both outbound and inbound. Unlike
+    /// <see cref="Disconnect"/>, this peer itself is left usable afterward - a subsequent
+    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/> call creates and
+    /// caches a new outbound connection as usual, and, if listening, new inbound connections keep
+    /// being accepted.
     /// </summary>
     /// <returns>A task that completes once every connection has disconnected.</returns>
+    /// <exception cref="ObjectDisposedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
+    Task Drop();
+
+    /// <summary>
+    /// Permanently puts this peer itself into a disconnected state: stops listening (if applicable),
+    /// disconnects every connection it currently holds (both outbound and inbound), and waits for
+    /// their background work to fully finish, for a graceful teardown. Equivalent to
+    /// <see cref="IDisposable.Dispose"/> for the purpose of releasing this peer's resources - it is
+    /// already disconnected and its resources already released by the time this returns - but,
+    /// unlike <see cref="IDisposable.Dispose"/>, does not return until that background work has
+    /// completely stopped. Safe to call more than once; every call after the first is a no-op.
+    /// </summary>
+    /// <returns>A task that completes once the peer has fully disconnected.</returns>
     Task Disconnect();
 }

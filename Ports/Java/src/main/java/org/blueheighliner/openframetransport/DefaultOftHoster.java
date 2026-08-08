@@ -17,7 +17,7 @@ final class DefaultOftHoster implements OftHoster {
         if (options.securityMode() == OftSecurityMode.SERVER_AUTHENTICATION || options.securityMode() == OftSecurityMode.DUAL_AUTHENTICATION) {
             if (options.sslContext() == null) {
                 throw new IllegalArgumentException(
-                        "sslContext is required when securityMode is AUTHENTICATION or DUAL_AUTHENTICATION.");
+                        "sslContext is required when securityMode is SERVER_AUTHENTICATION or DUAL_AUTHENTICATION.");
             }
         } else if (options.securityMode() == OftSecurityMode.SECURE) {
             // Resolved once per listener rather than once per accepted connection: nothing
