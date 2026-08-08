@@ -36,7 +36,7 @@ public interface IOftConnection : IDisposable
     /// Whether this connection is still connected: <see langword="true"/> until it closes, for any
     /// reason — a local <see cref="Disconnect"/>/<see cref="IDisposable.Dispose"/> call, the remote
     /// side disconnecting, or an unrecoverable error (e.g. a liveness timeout) — after which it is
-    /// permanently <see langword="false"/>. <see cref="Send(ReadOnlyMemory{byte}, int, CancellationToken)"/>
+    /// permanently <see langword="false"/>. <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>
     /// and <see cref="Rekey"/> both throw <see cref="OftDisconnectedException"/> once this is
     /// <see langword="false"/>.
     /// </summary>
@@ -77,6 +77,23 @@ public interface IOftConnection : IDisposable
     Action<Exception?>? DisconnectedHandler { get; set; }
 
     /// <summary>
+    /// Called whenever a message sent with a non-null <c>tag</c> (see
+    /// <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>) has been fully
+    /// delivered and acknowledged — a <c>Receipt</c> was received for its <c>Unit</c> packet, or for
+    /// its final <c>Completion</c> packet if it was split across multiple packets (see Docs/OFT.md
+    /// §4) — with that same tag. Never called for a message sent with a <see langword="null"/> tag,
+    /// or for one that was cancelled rather than delivered. <see langword="null"/> if no callback is
+    /// currently assigned. There is only ever one callback at a time — assigning a new value here
+    /// always replaces any previous one. Unlike <see cref="ReceivedHandler"/>/
+    /// <see cref="DisconnectedHandler"/>, this does <em>not</em> buffer a raise that happens before a
+    /// callback is ever assigned: this can only ever be raised in response to a
+    /// <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/> call the caller
+    /// itself makes, so there is no message-loss race to guard against — assign this before making
+    /// that call if you want to observe its acknowledgement.
+    /// </summary>
+    Action<object>? AcknowledgedHandler { get; set; }
+
+    /// <summary>
     /// Queues a message for sending at the given priority (see Docs/OFT.md §5-§7). Larger priority
     /// values are sent first; a lower-priority message already being sent is transparently
     /// interrupted and resumed later (Docs/OFT.md §6).
@@ -85,13 +102,19 @@ public interface IOftConnection : IDisposable
     /// <param name="priority">
     /// The priority to send the message at. Larger values are higher priority. Defaults to 0.
     /// </param>
+    /// <param name="tag">
+    /// An opaque, application-controlled value attached to this send, so it can be referenced later —
+    /// passed back to <see cref="AcknowledgedHandler"/> once this message is fully delivered and
+    /// acknowledged, if non-null. <see langword="null"/> (the default) means this send never raises
+    /// <see cref="AcknowledgedHandler"/>.
+    /// </param>
     /// <param name="cancellationToken">
     /// A token that, when cancelled, abandons the message: immediately if it has not yet started
     /// sending, or by sending a <c>Cancellation</c> packet if it has (see Docs/OFT.md §7).
     /// </param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
     /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
-    Task Send(ReadOnlyMemory<byte> data, int priority = 0, CancellationToken cancellationToken = default);
+    Task Send(ReadOnlyMemory<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Queues a message for sending, taking ownership of <paramref name="data"/>: this connection
@@ -99,7 +122,7 @@ public interface IOftConnection : IDisposable
     /// cancelled, or the connection closes, whichever happens first — the caller must not use or
     /// dispose <paramref name="data"/> after calling this. Since this connection owns the memory for
     /// the message's whole lifetime, it is never copied, unlike
-    /// <see cref="Send(ReadOnlyMemory{byte}, int, CancellationToken)"/>.
+    /// <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>.
     /// </summary>
     /// <param name="data">
     /// The message payload, e.g. from <see cref="MemoryPool{T}.Rent"/>. Ownership transfers to this
@@ -108,13 +131,19 @@ public interface IOftConnection : IDisposable
     /// <param name="priority">
     /// The priority to send the message at. Larger values are higher priority. Defaults to 0.
     /// </param>
+    /// <param name="tag">
+    /// An opaque, application-controlled value attached to this send, so it can be referenced later —
+    /// passed back to <see cref="AcknowledgedHandler"/> once this message is fully delivered and
+    /// acknowledged, if non-null. <see langword="null"/> (the default) means this send never raises
+    /// <see cref="AcknowledgedHandler"/>.
+    /// </param>
     /// <param name="cancellationToken">
     /// A token that, when cancelled, abandons the message: immediately if it has not yet started
     /// sending, or by sending a <c>Cancellation</c> packet if it has (see Docs/OFT.md §7).
     /// </param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
     /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
-    Task Send(IMemoryOwner<byte> data, int priority = 0, CancellationToken cancellationToken = default);
+    Task Send(IMemoryOwner<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Requests a TLS 1.3 <c>KeyUpdate</c> (see Docs/OFT.md §8): fresh traffic keys for both

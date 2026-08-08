@@ -39,6 +39,11 @@ typedef struct oft_pending_message {
     int started;
     int cancel_requested;
     size_t bytes_sent;
+
+    /* The opaque tag this send was queued with, or NULL if it wasn't - see acknowledged_callback
+     * below. Not owned by this struct. */
+    void *tag;
+
     oft_event completed; /* result: OFT_OK, OFT_ERROR_CANCELLED, or OFT_ERROR_CLOSED */
     struct oft_pending_message *next_in_queue;
     struct oft_pending_message *next_in_registry;
@@ -162,6 +167,16 @@ struct oft_connection {
      * notification instead of a stream of messages. */
     oft_event_buffer disconnected_buffer;
     oft_disconnected_target disconnected_target;
+
+    /* The (single) callback invoked when data sent with a non-NULL tag has been fully delivered and
+     * acknowledged (see oft_connection_send() and oft_connection_set_acknowledged_callback()).
+     * Deliberately not buffered like received_buffer/disconnected_buffer above: it can only ever be
+     * raised in response to a caller's own oft_connection_send() call, so there's no message-loss
+     * race to guard against by assigning it beforehand - this lock only protects the callback/
+     * user_data pointer pair itself from a torn read/write across threads. */
+    pthread_mutex_t acknowledged_callback_lock;
+    oft_acknowledged_callback acknowledged_callback;
+    void *acknowledged_callback_user_data;
 };
 
 /* ---- Small helpers ---- */
@@ -199,154 +214,6 @@ static void ignore_sigpipe(void) {
 
 static void free_received_buffer_item(void *item);
 static void free_disconnected_buffer_item(void *item);
-
-/* ---- Certificate identity extraction ---- */
-
-/* Extracts the Common Name (CN) relative distinguished name component from name, or NULL if it has
- * none. Caller owns the returned string (free()). */
-static char *extract_common_name(X509_NAME *name) {
-    if (!name) {
-        return NULL;
-    }
-
-    int index = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
-    if (index < 0) {
-        return NULL;
-    }
-
-    ASN1_STRING *value = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(name, index));
-
-    unsigned char *utf8 = NULL;
-    int length = ASN1_STRING_to_UTF8(&utf8, value);
-    if (length < 0) {
-        return NULL;
-    }
-
-    char *result = strndup((const char *)utf8, (size_t)length);
-    OPENSSL_free(utf8);
-    return result;
-}
-
-/* Extracts certificate's Subject Alternative Name DNS and IP address entries into *out_names
- * (caller-owned array of caller-owned strings, freed by oft_certificate_identity_free) and
- * *out_count. */
-static void extract_subject_alternative_names(X509 *certificate, char ***out_names, size_t *out_count) {
-    *out_names = NULL;
-    *out_count = 0;
-
-    GENERAL_NAMES *names = X509_get_ext_d2i(certificate, NID_subject_alt_name, NULL, NULL);
-    if (!names) {
-        return;
-    }
-
-    int total = sk_GENERAL_NAME_num(names);
-    char **collected = total > 0 ? calloc((size_t)total, sizeof(char *)) : NULL;
-    size_t count = 0;
-
-    if (collected) {
-        for (int i = 0; i < total; i++) {
-            GENERAL_NAME *entry = sk_GENERAL_NAME_value(names, i);
-
-            if (entry->type == GEN_DNS) {
-                unsigned char *utf8 = NULL;
-                int length = ASN1_STRING_to_UTF8(&utf8, entry->d.dNSName);
-                if (length >= 0) {
-                    collected[count++] = strndup((const char *)utf8, (size_t)length);
-                    OPENSSL_free(utf8);
-                }
-            } else if (entry->type == GEN_IPADD) {
-                const unsigned char *data = ASN1_STRING_get0_data(entry->d.iPAddress);
-                int data_length = ASN1_STRING_length(entry->d.iPAddress);
-                char buffer[INET6_ADDRSTRLEN];
-                const char *formatted = NULL;
-
-                if (data_length == 4) {
-                    formatted = inet_ntop(AF_INET, data, buffer, sizeof(buffer));
-                } else if (data_length == 16) {
-                    formatted = inet_ntop(AF_INET6, data, buffer, sizeof(buffer));
-                }
-
-                if (formatted) {
-                    collected[count++] = strdup(formatted);
-                }
-            }
-        }
-    }
-
-    GENERAL_NAMES_free(names);
-
-    *out_names = collected;
-    *out_count = count;
-}
-
-/* Extracts identity information from certificate. Returns NULL if certificate is NULL. */
-static oft_certificate_identity *build_certificate_identity(X509 *certificate) {
-    if (!certificate) {
-        return NULL;
-    }
-
-    oft_certificate_identity *identity = calloc(1, sizeof(oft_certificate_identity));
-    if (!identity) {
-        return NULL;
-    }
-
-    identity->name = extract_common_name(X509_get_subject_name(certificate));
-    identity->issuer = extract_common_name(X509_get_issuer_name(certificate));
-    extract_subject_alternative_names(certificate, &identity->alternative_names, &identity->alternative_name_count);
-
-    return identity;
-}
-
-void oft_certificate_identity_free(oft_certificate_identity *identity) {
-    if (!identity) {
-        return;
-    }
-
-    free(identity->name);
-    free(identity->issuer);
-    for (size_t i = 0; i < identity->alternative_name_count; i++) {
-        free(identity->alternative_names[i]);
-    }
-
-    free(identity->alternative_names);
-    free(identity);
-}
-
-oft_certificate_identity *oft_certificate_identity_copy(const oft_certificate_identity *identity) {
-    if (!identity) {
-        return NULL;
-    }
-
-    oft_certificate_identity *copy = calloc(1, sizeof(oft_certificate_identity));
-    if (!copy) {
-        return NULL;
-    }
-
-    copy->name = identity->name ? strdup(identity->name) : NULL;
-    copy->issuer = identity->issuer ? strdup(identity->issuer) : NULL;
-    copy->alternative_name_count = identity->alternative_name_count;
-
-    if (identity->alternative_name_count > 0) {
-        copy->alternative_names = calloc(identity->alternative_name_count, sizeof(char *));
-        if (copy->alternative_names) {
-            for (size_t i = 0; i < identity->alternative_name_count; i++) {
-                copy->alternative_names[i] = strdup(identity->alternative_names[i]);
-            }
-        }
-    }
-
-    return copy;
-}
-
-/* Captures the peer certificate presented during ssl's now-completed handshake, or NULL if none
- * was presented (e.g. the server's view of a connection established under
- * OFT_SECURITY_MODE_SERVER_AUTHENTICATION, which never requests one from the client). */
-static oft_certificate_identity *capture_peer_certificate_identity(SSL *ssl) {
-    X509 *certificate = SSL_get1_peer_certificate(ssl);
-    oft_certificate_identity *identity = build_certificate_identity(certificate);
-    X509_free(certificate);
-    return identity;
-}
 
 /* Captures fd's remote TCP endpoint into *out_identity's host/port fields. */
 static void capture_remote_endpoint(int fd, oft_identity *out_identity) {
@@ -397,6 +264,7 @@ static oft_connection *connection_alloc(int fd, SSL_CTX *ssl_ctx, int owns_ssl_c
     pthread_mutex_init(&connection->receipt_lock, NULL);
     pthread_mutex_init(&connection->rekey_queue_lock, NULL);
     pthread_mutex_init(&connection->timestamp_lock, NULL);
+    pthread_mutex_init(&connection->acknowledged_callback_lock, NULL);
     atomic_init(&connection->closed, 0);
     atomic_init(&connection->has_pending_inbound_message, 0);
     oft_event_buffer_init(&connection->received_buffer, free_received_buffer_item);
@@ -445,7 +313,10 @@ static SSL *create_ssl(oft_connection *connection, char *error_buffer, size_t er
         return NULL;
     }
 
-    connection->identity.certificate = capture_peer_certificate_identity(ssl);
+    /* SSL_get1_peer_certificate returns an owned reference (or NULL if none was presented, e.g. the
+     * server's view of a connection established under OFT_SECURITY_MODE_SERVER_AUTHENTICATION,
+     * which never requests one from the client) - freed via X509_free() when the connection closes. */
+    connection->identity.certificate = SSL_get1_peer_certificate(ssl);
 
     return ssl;
 }
@@ -871,7 +742,22 @@ static int send_next_packet(oft_connection *connection, oft_pending_message *mes
         queue_pop_front(queue);
         pthread_mutex_unlock(&connection->outbound_lock);
 
-        oft_event_signal(&message->completed, message->cancel_requested ? OFT_ERROR_CANCELLED : OFT_OK);
+        if (message->cancel_requested) {
+            oft_event_signal(&message->completed, OFT_ERROR_CANCELLED);
+        } else {
+            oft_event_signal(&message->completed, OFT_OK);
+
+            if (message->tag) {
+                pthread_mutex_lock(&connection->acknowledged_callback_lock);
+                oft_acknowledged_callback callback = connection->acknowledged_callback;
+                void *user_data = connection->acknowledged_callback_user_data;
+                pthread_mutex_unlock(&connection->acknowledged_callback_lock);
+
+                if (callback) {
+                    callback(message->tag, user_data);
+                }
+            }
+        }
     }
 
     return 0;
@@ -1381,7 +1267,7 @@ oft_connection *oft_connection_establish_as_server(
 
 /* ---- Public API ---- */
 
-int oft_connection_send(oft_connection *connection, const uint8_t *data, size_t length, int priority, uint64_t *out_message_id) {
+int oft_connection_send(oft_connection *connection, const uint8_t *data, size_t length, int priority, void *tag, uint64_t *out_message_id) {
     if (atomic_load(&connection->closed)) {
         return OFT_ERROR_CLOSED;
     }
@@ -1397,6 +1283,7 @@ int oft_connection_send(oft_connection *connection, const uint8_t *data, size_t 
 
     message->priority = priority;
     message->length = length;
+    message->tag = tag;
     if (length > 0) {
         message->data = malloc(length);
         if (!message->data) {
@@ -1482,6 +1369,13 @@ void oft_connection_set_disconnected_callback(oft_connection *connection, oft_di
     connection->disconnected_target.callback = callback;
     connection->disconnected_target.user_data = user_data;
     oft_event_buffer_attach(&connection->disconnected_buffer, callback ? dispatch_disconnected_buffer_item : NULL, &connection->disconnected_target);
+}
+
+void oft_connection_set_acknowledged_callback(oft_connection *connection, oft_acknowledged_callback callback, void *user_data) {
+    pthread_mutex_lock(&connection->acknowledged_callback_lock);
+    connection->acknowledged_callback = callback;
+    connection->acknowledged_callback_user_data = user_data;
+    pthread_mutex_unlock(&connection->acknowledged_callback_lock);
 }
 
 const oft_identity *oft_connection_identity(oft_connection *connection) {
@@ -1636,7 +1530,7 @@ void oft_connection_close(oft_connection *connection) {
     free(connection->inbound_buffers);
     free(connection->target_host);
     free(connection->identity.info);
-    oft_certificate_identity_free(connection->identity.certificate);
+    X509_free(connection->identity.certificate);
 
     /* Safe now too, for the same reason as above: the receive thread (the only thread that ever
      * calls oft_event_buffer_raise on these buffers) has fully exited. */
@@ -1649,6 +1543,7 @@ void oft_connection_close(oft_connection *connection) {
     pthread_mutex_destroy(&connection->receipt_lock);
     pthread_mutex_destroy(&connection->rekey_queue_lock);
     pthread_mutex_destroy(&connection->timestamp_lock);
+    pthread_mutex_destroy(&connection->acknowledged_callback_lock);
 
     free(connection);
 }

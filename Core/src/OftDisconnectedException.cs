@@ -1,9 +1,9 @@
 namespace BlueHeighliner.OpenFrameTransport;
 
 /// <summary>
-/// Thrown by <see cref="IOftConnection.Send(ReadOnlyMemory{byte}, int, CancellationToken)"/>,
+/// Thrown by <see cref="IOftConnection.Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>,
 /// <see cref="IOftConnection.Rekey"/>,
-/// <see cref="IOftPeer.Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>, and
+/// <see cref="IOftPeer.Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>, and
 /// <see cref="IOftPeer.Rekey"/> when the connection or peer they were called on is no longer
 /// connected (see <see cref="IOftConnection.IsConnected"/>/<see cref="IOftPeer.IsConnected"/>) —
 /// whether because of a local <c>Disconnect()</c>/<see cref="IDisposable.Dispose"/> call, the

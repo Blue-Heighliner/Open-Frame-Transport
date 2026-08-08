@@ -95,6 +95,18 @@ internal sealed class OftConnection : IOftConnection
     private readonly OftBufferedHandlerSlot<Action<IMemoryOwner<byte>>> receivedSlot = new();
     private readonly OftBufferedHandlerSlot<Action<Exception?>> disconnectedSlot = new();
 
+    /// <summary>
+    /// Deliberately a plain field, not an <see cref="OftBufferedHandlerSlot{TDelegate}"/> like
+    /// <see cref="receivedSlot"/>/<see cref="disconnectedSlot"/>: those exist to buffer a raise that
+    /// happens before a caller has had a chance to assign a callback, which can only happen because
+    /// their triggers (inbound packets, connection closure) can occur autonomously, before the
+    /// caller's next line of code runs. This one can only ever be raised in response to a
+    /// <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/> call the caller
+    /// itself makes - there is nothing for it to race against, since the caller fully controls when
+    /// that first happens and can simply assign this beforehand if it cares.
+    /// </summary>
+    private Action<object>? acknowledgedHandler;
+
     private OftConnection(
             TcpClient tcpClient, NetworkStream networkStream, Stream plaintextStream, IOftTlsRekeyableProtocol? tlsProtocol,
             OftConnectionOptions options, X509Certificate2? remoteCertificate, X509Chain? remoteCertificateChain, SslPolicyErrors remoteCertificateSslErrors)
@@ -111,7 +123,7 @@ internal sealed class OftConnection : IOftConnection
         this.Identity = new OftIdentity
         {
             EndPoint = (IPEndPoint)tcpClient.Client.RemoteEndPoint!,
-            Certificate = remoteCertificate is null ? null : OftCertificateIdentity.FromCertificate(remoteCertificate),
+            Certificate = remoteCertificate,
             Info = string.Empty,
         };
     }
@@ -163,6 +175,13 @@ internal sealed class OftConnection : IOftConnection
     {
         get => this.disconnectedSlot.Handler;
         set => this.disconnectedSlot.Handler = value;
+    }
+
+    /// <inheritdoc />
+    public Action<object>? AcknowledgedHandler
+    {
+        get => this.acknowledgedHandler;
+        set => this.acknowledgedHandler = value;
     }
 
     /// <summary>
@@ -257,14 +276,14 @@ internal sealed class OftConnection : IOftConnection
     }
 
     /// <inheritdoc />
-    public Task Send(ReadOnlyMemory<byte> data, int priority = 0, CancellationToken cancellationToken = default) =>
-        this.EnqueueMessage(data, owner: null, priority, cancellationToken);
+    public Task Send(ReadOnlyMemory<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default) =>
+        this.EnqueueMessage(data, owner: null, priority, tag, cancellationToken);
 
     /// <inheritdoc />
-    public Task Send(IMemoryOwner<byte> data, int priority = 0, CancellationToken cancellationToken = default) =>
-        this.EnqueueMessage(data.Memory, owner: data, priority, cancellationToken);
+    public Task Send(IMemoryOwner<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default) =>
+        this.EnqueueMessage(data.Memory, owner: data, priority, tag, cancellationToken);
 
-    private Task EnqueueMessage(ReadOnlyMemory<byte> data, IMemoryOwner<byte>? owner, int priority, CancellationToken cancellationToken)
+    private Task EnqueueMessage(ReadOnlyMemory<byte> data, IMemoryOwner<byte>? owner, int priority, object? tag, CancellationToken cancellationToken)
     {
         if (this.closed)
         {
@@ -279,6 +298,7 @@ internal sealed class OftConnection : IOftConnection
             Data = data,
             Owner = owner,
             Priority = priority,
+            Tag = tag,
             CompletionSource = completionSource,
             CancellationToken = cancellationToken,
         };
@@ -552,6 +572,11 @@ internal sealed class OftConnection : IOftConnection
             else
             {
                 message.CompletionSource.TrySetResult();
+
+                if (message.Tag is { } tag)
+                {
+                    this.acknowledgedHandler?.Invoke(tag);
+                }
             }
         }
     }
@@ -559,7 +584,7 @@ internal sealed class OftConnection : IOftConnection
     /// <summary>
     /// When <paramref name="owned"/>, wraps <paramref name="data"/> into a <see cref="ByteString"/>
     /// without copying it — safe only because the connection owns that memory exclusively for the
-    /// message's whole lifetime (see <see cref="Send(IMemoryOwner{byte}, int, CancellationToken)"/>)
+    /// message's whole lifetime (see <see cref="Send(IMemoryOwner{byte}, int, object?, CancellationToken)"/>)
     /// and the packet built from it is serialized and written before the next chunk is touched.
     /// Otherwise copies, since the caller retains ownership and may reuse or mutate the buffer.
     /// </summary>
@@ -838,7 +863,7 @@ internal sealed class OftConnection : IOftConnection
 
         /// <summary>
         /// Owns <see cref="Data"/>'s backing memory when the caller transferred ownership via
-        /// <see cref="Send(IMemoryOwner{byte}, int, CancellationToken)"/>, or
+        /// <see cref="Send(IMemoryOwner{byte}, int, object?, CancellationToken)"/>, or
         /// <see langword="null"/> when <see cref="Data"/> is caller-owned (and was therefore copied
         /// into each packet's payload rather than referenced directly). Disposed exactly once, at
         /// whichever of send completion, cancellation, or connection close happens first.
@@ -846,6 +871,13 @@ internal sealed class OftConnection : IOftConnection
         public IMemoryOwner<byte>? Owner { get; init; }
 
         public required int Priority { get; init; }
+
+        /// <summary>
+        /// The opaque tag this send was queued with, or <see langword="null"/> if it wasn't. When
+        /// non-null, raises <see cref="AcknowledgedHandler"/> with this value once this message is
+        /// fully delivered and acknowledged (see <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>).
+        /// </summary>
+        public object? Tag { get; init; }
 
         public required TaskCompletionSource CompletionSource { get; init; }
 

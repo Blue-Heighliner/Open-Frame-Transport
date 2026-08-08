@@ -37,25 +37,6 @@ enum oft_result {
 };
 
 /*
- * Identity information extracted from an X.509 certificate presented during a TLS handshake.
- */
-typedef struct {
-    /* The Common Name (CN) of the certificate's subject, or NULL if it has none. Owned by this
-     * struct. */
-    char *name;
-
-    /* The Common Name (CN) of the certificate's issuer, or NULL if it has none. Owned by this
-     * struct. */
-    char *issuer;
-
-    /* This certificate's Subject Alternative Name DNS and IP address entries, in the order they
-     * appear on the certificate. NULL if alternative_name_count is 0. Both the array and every
-     * entry in it are owned by this struct. */
-    char **alternative_names;
-    size_t alternative_name_count;
-} oft_certificate_identity;
-
-/*
  * The identity of an OFT connection's remote side.
  */
 typedef struct {
@@ -63,12 +44,12 @@ typedef struct {
     char host[INET6_ADDRSTRLEN];
     uint16_t port;
 
-    /* The remote side's TLS certificate identity, or NULL if it didn't present one - always NULL
-     * for a connection established with OFT_SECURITY_MODE_TRUSTED (no TLS at all), and also NULL
-     * for the accepting side of a connection established under a mode that never requests a client
+    /* The remote side's TLS certificate, or NULL if it didn't present one - always NULL for a
+     * connection established with OFT_SECURITY_MODE_TRUSTED (no TLS at all), and also NULL for the
+     * accepting side of a connection established under a mode that never requests a client
      * certificate (see OFT_SECURITY_MODE_DUAL_AUTHENTICATION). Owned by the enclosing
      * oft_connection. */
-    oft_certificate_identity *certificate;
+    X509 *certificate;
 
     /* The opaque, application-controlled data the remote side sent in its hail (see Docs/OFT.md
      * §3). Owned by the enclosing oft_connection. */
@@ -117,6 +98,21 @@ typedef void (*oft_received_callback)(oft_connection *connection, uint8_t *data,
 
 /* Called once, when a connection closes for any reason. `error_message` is NULL if it closed cleanly. */
 typedef void (*oft_disconnected_callback)(oft_connection *connection, const char *error_message, void *user_data);
+
+/*
+ * Called when data sent via oft_connection_send() with a non-NULL `tag` has been fully delivered
+ * and acknowledged (a Receipt received for the data's Unit packet, or its final Completion packet -
+ * see Docs/OFT.md §5-§7). `tag` is the same pointer passed to oft_connection_send(). Never raised
+ * for a send with a NULL tag, or for a cancelled send (see oft_connection_cancel()).
+ *
+ * Unlike oft_received_callback/oft_disconnected_callback (see
+ * oft_connection_set_received_callback()/oft_connection_set_disconnected_callback()), this callback
+ * is never buffered: it can only ever be raised in response to the caller's own
+ * oft_connection_send() call, so there is no message-loss race to guard against by assigning it
+ * beforehand - assigning it after the triggering send call (but before that send completes) simply
+ * misses the notification for that specific send, by design.
+ */
+typedef void (*oft_acknowledged_callback)(void *tag, void *user_data);
 
 /* Called whenever an oft_listener accepts and establishes a new inbound connection. */
 typedef void (*oft_connected_callback)(oft_listener *listener, oft_connection *connection, void *user_data);
@@ -200,11 +196,15 @@ typedef struct {
  * are sent first; a lower-priority message already being sent is transparently interrupted and
  * resumed later (Docs/OFT.md §6). Returns immediately once the message is queued.
  *
+ * `tag` is an opaque, application-controlled value attached to this send, NULL by default,
+ * referenced later via the callback assigned with oft_connection_set_acknowledged_callback() once
+ * this specific message has been fully delivered and acknowledged.
+ *
  * On success, writes an identifier for the message to *out_message_id, usable with
  * oft_connection_wait() and oft_connection_cancel(). Returns OFT_OK, or OFT_ERROR_CLOSED if the
  * connection is already closed.
  */
-int oft_connection_send(oft_connection *connection, const uint8_t *data, size_t length, int priority, uint64_t *out_message_id);
+int oft_connection_send(oft_connection *connection, const uint8_t *data, size_t length, int priority, void *tag, uint64_t *out_message_id);
 
 /*
  * Blocks the calling thread until the message identified by message_id has been fully delivered,
@@ -251,6 +251,17 @@ void oft_connection_set_received_callback(oft_connection *connection, oft_receiv
  * this one-shot notification instead of a stream of messages.
  */
 void oft_connection_set_disconnected_callback(oft_connection *connection, oft_disconnected_callback callback, void *user_data);
+
+/*
+ * Assigns the (single) callback invoked whenever data sent via oft_connection_send() with a
+ * non-NULL tag has been fully delivered and acknowledged (see oft_acknowledged_callback's own
+ * documentation for exactly when), replacing any previously assigned one. Pass NULL to clear it.
+ * Not safe to call concurrently with itself.
+ *
+ * Unlike oft_connection_set_received_callback()/oft_connection_set_disconnected_callback(), this
+ * callback is not buffered - see oft_acknowledged_callback's own documentation for why that's safe.
+ */
+void oft_connection_set_acknowledged_callback(oft_connection *connection, oft_acknowledged_callback callback, void *user_data);
 
 /*
  * This connection's remote identity: its TCP endpoint, its TLS certificate (if any was presented),

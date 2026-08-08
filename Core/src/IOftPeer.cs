@@ -24,7 +24,7 @@ namespace BlueHeighliner.OpenFrameTransport;
 /// currently held connections and leaves the peer itself usable — after which
 /// <see cref="IsConnected"/> is permanently <see langword="false"/> and every other member below
 /// throws: <see cref="Listen"/>, <see cref="StopListening"/>, and <see cref="Drop"/> throw
-/// <see cref="ObjectDisposedException"/>, while <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>
+/// <see cref="ObjectDisposedException"/>, while <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>
 /// and <see cref="Rekey"/> throw <see cref="OftDisconnectedException"/>. <see cref="IDisposable.Dispose"/>
 /// does this immediately, without waiting for any background work to finish; call
 /// <see cref="Disconnect"/> instead for a graceful, awaitable teardown that waits for it.
@@ -49,19 +49,33 @@ public interface IOftPeer : IDisposable
 
     /// <summary>
     /// Called for every message received on any connection this peer holds, both inbound and
-    /// outbound, with the received <see cref="IOftPeerReception"/> — the callback must dispose it
-    /// (returning its pooled memory to its pool) once done with it, e.g. via a
-    /// <see langword="using"/> statement. <see langword="null"/> if no callback is currently
-    /// assigned. There is only ever one callback at a time — assigning a new value here always
-    /// replaces any previous one, and the same buffering-until-first-non-null-assignment guarantee
-    /// <see cref="IOftConnection.ReceivedHandler"/> itself makes applies here too (see README.md).
-    /// This peer deliberately exposes no way to enumerate, look up, or be notified about the
-    /// individual connections it holds beyond an <see cref="IOftPeerReception"/>'s own
-    /// <see cref="IOftPeerReception.Identity"/> (e.g. no disconnected notification): connection
-    /// lifecycle is this peer's own implementation detail, transparently managed (reconnecting,
-    /// evicting, etc.) behind <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/>.
+    /// outbound, with the identity of the connection it arrived on and ownership of its pooled
+    /// payload — the callback must dispose the payload (returning its memory to its pool) once done
+    /// with it, e.g. via a <see langword="using"/> statement. <see langword="null"/> if no callback
+    /// is currently assigned. There is only ever one callback at a time — assigning a new value here
+    /// always replaces any previous one, and the same buffering-until-first-non-null-assignment
+    /// guarantee <see cref="IOftConnection.ReceivedHandler"/> itself makes applies here too (see
+    /// README.md). This peer deliberately exposes no way to enumerate, look up, or be notified about
+    /// the individual connections it holds beyond the identity passed here (e.g. no disconnected
+    /// notification): connection lifecycle is this peer's own implementation detail, transparently
+    /// managed (reconnecting, evicting, etc.) behind
+    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>.
     /// </summary>
-    Action<IOftPeerReception>? ReceivedHandler { get; set; }
+    Action<OftIdentity, IMemoryOwner<byte>>? ReceivedHandler { get; set; }
+
+    /// <summary>
+    /// Called whenever a message sent with a non-null <c>tag</c> (see
+    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>) has
+    /// been fully delivered and acknowledged (see
+    /// <see cref="IOftConnection.AcknowledgedHandler"/>), with the identity of the connection it was
+    /// sent over and that same tag. Never called for a message sent with a <see langword="null"/> tag,
+    /// or for one that was cancelled rather than delivered. <see langword="null"/> if no callback is
+    /// currently assigned. There is only ever one callback at a time — assigning a new value here
+    /// always replaces any previous one. Unlike <see cref="ReceivedHandler"/>, this does <em>not</em>
+    /// buffer a raise that happens before a callback is ever assigned — see
+    /// <see cref="IOftConnection.AcknowledgedHandler"/>'s own doc comment for why that's safe.
+    /// </summary>
+    Action<OftIdentity, object>? AcknowledgedHandler { get; set; }
 
     /// <summary>
     /// Starts listening for inbound connections. A peer that never calls this only ever makes
@@ -92,15 +106,22 @@ public interface IOftPeer : IDisposable
     /// <param name="port">The remote port to send to.</param>
     /// <param name="data">The message payload.</param>
     /// <param name="priority">The priority to send the message at (see Docs/OFT.md §5-§6).</param>
+    /// <param name="tag">
+    /// An opaque, application-controlled value attached to this send, so it can be referenced later —
+    /// passed back to <see cref="AcknowledgedHandler"/>, along with the identity of the connection it
+    /// was sent over, once this message is fully delivered and acknowledged, if non-null.
+    /// <see langword="null"/> (the default) means this send never raises
+    /// <see cref="AcknowledgedHandler"/>.
+    /// </param>
     /// <param name="cancellationToken">A token used to cancel connecting or sending.</param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
     /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
-    Task Send(string host, int port, ReadOnlyMemory<byte> data, int priority = 0, CancellationToken cancellationToken = default);
+    Task Send(string host, int port, ReadOnlyMemory<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Sends a message to <paramref name="host"/>:<paramref name="port"/>, taking ownership of
     /// <paramref name="data"/> (see
-    /// <see cref="IOftConnection.Send(IMemoryOwner{byte}, int, CancellationToken)"/>):
+    /// <see cref="IOftConnection.Send(IMemoryOwner{byte}, int, object?, CancellationToken)"/>):
     /// reusing a cached connection if one already exists, or creating and caching a new one
     /// otherwise. The caller must not use or dispose <paramref name="data"/> after calling this.
     /// </summary>
@@ -111,10 +132,17 @@ public interface IOftPeer : IDisposable
     /// underlying connection.
     /// </param>
     /// <param name="priority">The priority to send the message at (see Docs/OFT.md §5-§6).</param>
+    /// <param name="tag">
+    /// An opaque, application-controlled value attached to this send, so it can be referenced later —
+    /// passed back to <see cref="AcknowledgedHandler"/>, along with the identity of the connection it
+    /// was sent over, once this message is fully delivered and acknowledged, if non-null.
+    /// <see langword="null"/> (the default) means this send never raises
+    /// <see cref="AcknowledgedHandler"/>.
+    /// </param>
     /// <param name="cancellationToken">A token used to cancel connecting or sending.</param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
     /// <exception cref="OftDisconnectedException"><see cref="IsConnected"/> is <see langword="false"/>.</exception>
-    Task Send(string host, int port, IMemoryOwner<byte> data, int priority = 0, CancellationToken cancellationToken = default);
+    Task Send(string host, int port, IMemoryOwner<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default);
 
     /// <summary>
     /// Requests a TLS 1.3 <c>KeyUpdate</c> (see Docs/OFT.md §8) on every connection this peer
@@ -131,7 +159,7 @@ public interface IOftPeer : IDisposable
     /// <summary>
     /// Disconnects every connection this peer currently holds, both outbound and inbound. Unlike
     /// <see cref="Disconnect"/>, this peer itself is left usable afterward - a subsequent
-    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, CancellationToken)"/> call creates and
+    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/> call creates and
     /// caches a new outbound connection as usual, and, if listening, new inbound connections keep
     /// being accepted.
     /// </summary>

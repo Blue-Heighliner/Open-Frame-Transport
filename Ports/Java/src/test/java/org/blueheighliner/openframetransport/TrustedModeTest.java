@@ -26,7 +26,7 @@ final class TrustedModeTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] payload = "hello over plain tcp".getBytes();
-            pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertEquals("hello over plain tcp", new String(received.poll(10, TimeUnit.SECONDS)));
         }

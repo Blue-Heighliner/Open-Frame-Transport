@@ -23,20 +23,28 @@ blocking call style); this document covers the Java-specific API in detail, with
   `OftPeer.create(OftPeerOptions)` — a peer has no client/server delineation, so use
   `DUAL_AUTHENTICATION` instead.
 - `OftConnection.getIdentity()` — an `OftIdentity` record describing the connection's remote side:
-  `endpoint()`, `certificate()` (an `OftCertificateIdentity`, or `null` if the remote side didn't
-  present a TLS certificate), and `info()` (the opaque hail data).
-- `OftCertificateIdentity` — `name()`/`issuer()` (the Common Name of a certificate's subject/issuer)
-  and `alternativeNames()`, extracted from an `X509Certificate` via
-  `OftCertificateIdentity.fromCertificate`.
-- `OftPeerReception` / `DefaultOftPeerReception` — the type delivered to
-  `OftPeer.setReceivedHandler`: `data()` (the message payload) and `identity()` (the sending
-  connection's `OftIdentity`).
-- `OftConnection.setReceivedHandler`/`.setDisconnectedHandler`, `OftListener.setConnectedHandler`,
-  `OftPeer.setReceivedHandler` — single-slot `Consumer<T>` callback setters, one per notification
-  kind, assigned directly (no handler-object interface to implement). Assigning a new value
-  (including `null`) always replaces any previous one, and each notification kind is assigned
-  independently of the others. `OftPeer` has no `setDisconnectedHandler`/`setConnectedHandler` of its
-  own — see its own type doc comment for why.
+  `endpoint()`, `certificate()` (an `X509Certificate`, or `null` if the remote side didn't present a
+  TLS certificate), and `info()` (the opaque hail data).
+- `OftConnection.setReceivedHandler`/`.setDisconnectedHandler`, `OftListener.setConnectedHandler` —
+  single-slot `Consumer<T>` callback setters, one per notification kind, assigned directly (no
+  handler-object interface to implement). Assigning a new value (including `null`) always replaces
+  any previous one, and each notification kind is assigned independently of the others. `OftPeer` has
+  no `setDisconnectedHandler`/`setConnectedHandler` of its own — see its own type doc comment for why.
+- `OftPeer.setReceivedHandler` — a `BiConsumer<OftIdentity, byte[]>`: the sending connection's
+  identity plus the same payload `OftConnection.setReceivedHandler` delivers, as two separate
+  arguments rather than one bundled type.
+- `OftConnection.setAcknowledgedHandler`/`OftPeer.setAcknowledgedHandler` — a
+  `Consumer<Object>`/`BiConsumer<OftIdentity, Object>` invoked once data sent with a non-`null` tag
+  has been fully delivered and acknowledged (see `send`'s `tag` parameter below). Unlike every other
+  handler setter above, this one is **not** buffered (see
+  [Buffered notifications](Architecture.md#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
+  in Architecture.md): it can only ever be raised in response to the caller's own `send` call, so
+  there's no message-loss race to guard against by assigning it beforehand.
+- `send`'s `tag` parameter — an application-controlled `Object` (pass `null` if unused) attached to a
+  send, referenced later via `setAcknowledgedHandler`: once that message is fully delivered and
+  acknowledged (a `Receipt` for its `Unit` packet, or for its final `Completion` packet if split — see
+  [OFT.md §4](OFT.md#4-packets)), the acknowledged handler is raised with the tag (`OftConnection`) or
+  the identity and tag (`OftPeer`). A `null` tag never raises it, and neither does a cancelled send.
 - `OftSendHandle` — returned by `send`, exposes `completion()` (a `CompletableFuture<Void>`) and
   `cancel()`.
 - `OftConnection extends AutoCloseable`: `close()` closes the connection and waits for its
@@ -77,7 +85,7 @@ OftConnectOptions connectOptions = OftConnectOptions.builder()
         .build();
 
 OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000, connectOptions);
-connection.send("hello".getBytes(), /* priority */ 0);
+connection.send("hello".getBytes(), /* priority */ 0, /* tag */ null);
 ```
 
 `options` is optional on both `connect` and `host` — the no-options overloads
@@ -92,10 +100,9 @@ System.out.println("Remote endpoint: " + identity.endpoint());
 System.out.println("Hail info: " + identity.info());
 
 if (identity.certificate() != null) {
-    OftCertificateIdentity certificate = identity.certificate();
-    System.out.println("Certificate subject CN: " + certificate.name());
-    System.out.println("Certificate issuer CN: " + certificate.issuer());
-    System.out.println("Certificate SANs: " + certificate.alternativeNames());
+    X509Certificate certificate = identity.certificate();
+    System.out.println("Certificate subject: " + certificate.getSubjectX500Principal());
+    System.out.println("Certificate issuer: " + certificate.getIssuerX500Principal());
 }
 ```
 
@@ -116,31 +123,30 @@ OftPeerOptions options = OftPeerOptions.builder()
         .build();
 
 OftPeer peer = OftPeer.create(options);
-peer.setReceivedHandler(reception -> System.out.println(
-        "Received from " + reception.identity().endpoint() + ": " + new String(reception.data())));
+peer.setReceivedHandler((identity, data) -> System.out.println(
+        "Received from " + identity.endpoint() + ": " + new String(data)));
 
 // Optional: also accept inbound connections into the same pool.
 peer.listen(new InetSocketAddress("0.0.0.0", 5001));
 
 // Sending to a host:port transparently reuses a cached connection or creates and caches a new one.
-peer.send("127.0.0.1", 5001, "hello".getBytes(), /* priority */ 0);
+peer.send("127.0.0.1", 5001, "hello".getBytes(), /* priority */ 0, /* tag */ null);
 
 peer.close();
 ```
 
-`OftPeer.setReceivedHandler` delivers an `OftPeerReception` — its `identity()` (an `OftIdentity`) is
-only for identifying which connection a message arrived on, e.g. to decide how to respond via
-`send`; a peer deliberately exposes no other way to enumerate, look up, or be notified about the
-individual connections it holds (there is no `setDisconnectedHandler`/`setConnectedHandler`):
-connection lifecycle is the peer's own implementation detail, transparently managed (reconnecting,
-evicting, etc.) behind `send`.
+`OftPeer.setReceivedHandler`'s `OftIdentity` argument is only for identifying which connection a
+message arrived on, e.g. to decide how to respond via `send`; a peer deliberately exposes no other
+way to enumerate, look up, or be notified about the individual connections it holds (there is no
+`setDisconnectedHandler`/`setConnectedHandler`): connection lifecycle is the peer's own
+implementation detail, transparently managed (reconnecting, evicting, etc.) behind `send`.
 
 ## Waiting for delivery and cancellation
 
 `send` returns an `OftSendHandle`:
 
 ```java
-OftSendHandle handle = connection.send(payload, /* priority */ 0);
+OftSendHandle handle = connection.send(payload, /* priority */ 0, /* tag */ null);
 
 // Block until fully delivered, cancelled, or the connection closes:
 handle.completion().get(10, TimeUnit.SECONDS);

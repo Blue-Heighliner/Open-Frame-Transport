@@ -191,41 +191,6 @@ internal static class OftTlsCertificates
     }
 
     /// <summary>
-    /// Extracts <paramref name="certificate"/>'s Subject Alternative Name DNS and IP address entries,
-    /// in the order they appear on the certificate.
-    /// </summary>
-    /// <param name="certificate">The certificate to extract Subject Alternative Names from.</param>
-    /// <returns>
-    /// Every DNS name and IP address entry's value, or an empty list if the certificate has no
-    /// Subject Alternative Name extension.
-    /// </returns>
-    internal static IReadOnlyList<string> ExtractSubjectAlternativeNames(X509Certificate2 certificate) =>
-        EnumerateSubjectAlternativeNameEntries(certificate)
-            .Where(entry => entry.Kind is "DNS Name" or "DNS" or "IP Address")
-            .Select(entry => entry.Value)
-            .ToList();
-
-    /// <summary>
-    /// Extracts the Common Name (CN) relative distinguished name component from
-    /// <paramref name="distinguishedName"/> (a certificate's <c>SubjectName</c> or
-    /// <c>IssuerName</c>).
-    /// </summary>
-    /// <param name="distinguishedName">The distinguished name to extract a Common Name from.</param>
-    /// <returns>The Common Name, or <see langword="null"/> if it has none.</returns>
-    internal static string? ExtractCommonName(X500DistinguishedName distinguishedName)
-    {
-        foreach (X500RelativeDistinguishedName rdn in distinguishedName.EnumerateRelativeDistinguishedNames())
-        {
-            if (!rdn.HasMultipleElements && rdn.GetSingleElementType().Value == "2.5.4.3")
-            {
-                return rdn.GetSingleElementValue();
-            }
-        }
-
-        return null;
-    }
-
-    /// <summary>
     /// Parses <paramref name="certificate"/>'s Subject Alternative Name extension, if it has one,
     /// into kind/value pairs (e.g. <c>("DNS", "example.com")</c>).
     /// </summary>

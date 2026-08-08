@@ -73,16 +73,38 @@ public interface OftConnection extends AutoCloseable {
     Consumer<Throwable> getDisconnectedHandler();
 
     /**
+     * Called whenever a message sent with a non-null {@code tag} (see {@link #send}) has been fully
+     * delivered and acknowledged - a {@code Receipt} was received for its {@code Unit} packet, or for
+     * its final {@code Completion} packet if it was split across multiple packets (see README.md
+     * &sect;4) - with that same tag. Never called for a message sent with a {@code null} tag, or for
+     * one that was cancelled rather than delivered. {@code null} if no callback is currently assigned.
+     * There is only ever one callback at a time - assigning a new value here always replaces any
+     * previous one. Unlike {@link #setReceivedHandler}/{@link #setDisconnectedHandler}, this does
+     * <em>not</em> buffer a raise that happens before a callback is ever assigned: this can only ever
+     * be raised in response to a {@link #send} call the caller itself makes, so there is no
+     * message-loss race to guard against - assign this before making that call if you want to observe
+     * its acknowledgement.
+     */
+    void setAcknowledgedHandler(Consumer<Object> handler);
+
+    /** The callback currently assigned via {@link #setAcknowledgedHandler}, or {@code null} if none is. */
+    Consumer<Object> getAcknowledgedHandler();
+
+    /**
      * Queues a message for sending at the given priority (see README.md &sect;5-&sect;7). Larger
      * priority values are sent first; a lower-priority message already being sent is transparently
      * interrupted and resumed later (README.md &sect;6).
      *
      * @param data     the message payload
      * @param priority the priority to send the message at; larger values are higher priority
+     * @param tag      an opaque, application-controlled value attached to this send, so it can be
+     *                 referenced later - passed back to {@link #setAcknowledgedHandler}'s callback
+     *                 once this message is fully delivered and acknowledged, if non-null; {@code null}
+     *                 means this send never raises it
      * @return a handle that can be used to wait for delivery or cancel the message
      * @throws OftDisconnectedException {@link #isConnected()} is {@code false}
      */
-    OftSendHandle send(byte[] data, int priority);
+    OftSendHandle send(byte[] data, int priority, Object tag);
 
     /**
      * Requests a TLS 1.3 {@code KeyUpdate} on this connection (see README.md &sect;8): fresh

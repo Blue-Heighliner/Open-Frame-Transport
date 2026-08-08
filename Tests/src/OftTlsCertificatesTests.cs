@@ -271,46 +271,4 @@ public sealed class OftTlsCertificatesTests
         Assert.NotNull(leaf);
         Assert.Equal(certificate.RawData, leaf!.RawData);
     }
-
-    [Fact]
-    public void ExtractCommonName_CertificateHasCommonName_ReturnsIt()
-    {
-        using X509Certificate2 certificate = TestCertificate.Create();
-
-        Assert.Equal("localhost", OftTlsCertificates.ExtractCommonName(certificate.SubjectName));
-    }
-
-    [Fact]
-    public void ExtractCommonName_NoCommonName_ReturnsNull()
-    {
-        using RSA rsa = RSA.Create(2048);
-        System.Security.Cryptography.X509Certificates.CertificateRequest request = new("O=NoCommonNameHere", rsa, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        using X509Certificate2 certificate = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddMinutes(-5), DateTimeOffset.UtcNow.AddDays(1));
-
-        Assert.Null(OftTlsCertificates.ExtractCommonName(certificate.SubjectName));
-    }
-
-    [Fact]
-    public void ExtractSubjectAlternativeNames_NoSanExtension_ReturnsEmpty()
-    {
-        using X509Certificate2 certificate = TestCertificate.Create();
-
-        Assert.Empty(OftTlsCertificates.ExtractSubjectAlternativeNames(certificate));
-    }
-
-    [Fact]
-    public void ExtractSubjectAlternativeNames_DnsSan_ReturnsIt()
-    {
-        using X509Certificate2 certificate = TestCertificate.CreateWithDnsName("example.oft.test");
-
-        Assert.Equal(["example.oft.test"], OftTlsCertificates.ExtractSubjectAlternativeNames(certificate));
-    }
-
-    [Fact]
-    public void ExtractSubjectAlternativeNames_IpAddressSan_ReturnsIt()
-    {
-        using X509Certificate2 certificate = TestCertificate.CreateWithIpAddress(IPAddress.Loopback);
-
-        Assert.Equal(["127.0.0.1"], OftTlsCertificates.ExtractSubjectAlternativeNames(certificate));
-    }
 }

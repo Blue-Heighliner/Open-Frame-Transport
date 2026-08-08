@@ -37,10 +37,10 @@ final class OftConnectionTest {
     }
 
     @Test
-    void establish_serverAuthentication_clientSeesServerCertificateIdentity() throws Exception {
+    void establish_serverAuthentication_clientSeesServerCertificate() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
             assertNotNull(pair.clientConnection().getIdentity().certificate());
-            assertEquals("localhost", pair.clientConnection().getIdentity().certificate().name());
+            assertEquals("CN=localhost", pair.clientConnection().getIdentity().certificate().getSubjectX500Principal().getName());
 
             // Server authentication only authenticates the server - the server never sees a client
             // certificate.
@@ -55,7 +55,7 @@ final class OftConnectionTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] payload = "hello".getBytes();
-            pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             byte[] result = received.poll(10, TimeUnit.SECONDS);
             assertArrayEquals(payload, result);
@@ -68,7 +68,7 @@ final class OftConnectionTest {
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
             pair.serverConnection().setReceivedHandler(received::add);
 
-            pair.clientConnection().send(new byte[0], 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(new byte[0], 0, null).completion().get(10, TimeUnit.SECONDS);
 
             byte[] result = received.poll(10, TimeUnit.SECONDS);
             assertNotNull(result);
@@ -87,7 +87,7 @@ final class OftConnectionTest {
                 payload[i] = (byte) i;
             }
 
-            pair.clientConnection().send(payload, 3).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 3, null).completion().get(10, TimeUnit.SECONDS);
 
             byte[] result = received.poll(10, TimeUnit.SECONDS);
             assertArrayEquals(payload, result);
@@ -109,7 +109,7 @@ final class OftConnectionTest {
                 payload[i] = (byte) i;
             }
 
-            pair.clientConnection().send(payload, 1).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 1, null).completion().get(10, TimeUnit.SECONDS);
 
             byte[] result = received.poll(10, TimeUnit.SECONDS);
             assertArrayEquals(payload, result);
@@ -129,9 +129,9 @@ final class OftConnectionTest {
             byte[] lowPriorityPayload = new byte[500];
             byte[] highPriorityPayload = new byte[24];
 
-            OftSendHandle lowSend = pair.clientConnection().send(lowPriorityPayload, 0);
+            OftSendHandle lowSend = pair.clientConnection().send(lowPriorityPayload, 0, null);
             Thread.sleep(20);
-            OftSendHandle highSend = pair.clientConnection().send(highPriorityPayload, 5);
+            OftSendHandle highSend = pair.clientConnection().send(highPriorityPayload, 5, null);
 
             assertTrue(bothReceived.await(10, TimeUnit.SECONDS));
             lowSend.completion().get(10, TimeUnit.SECONDS);
@@ -147,7 +147,7 @@ final class OftConnectionTest {
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
             pair.serverConnection().setReceivedHandler(received::add);
 
-            OftSendHandle handle = pair.clientConnection().send("should not arrive".getBytes(), 0);
+            OftSendHandle handle = pair.clientConnection().send("should not arrive".getBytes(), 0, null);
             handle.cancel();
 
             CompletableFuture<Void> completion = handle.completion();
@@ -161,7 +161,7 @@ final class OftConnectionTest {
     void send_cancelledAfterStart_sendsCancellationAndConnectionStaysHealthy() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish(8, null)) {
             byte[] payload = new byte[400];
-            OftSendHandle handle = pair.clientConnection().send(payload, 0);
+            OftSendHandle handle = pair.clientConnection().send(payload, 0, null);
             Thread.sleep(50);
             handle.cancel();
 
@@ -172,7 +172,7 @@ final class OftConnectionTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] followUp = "still alive".getBytes();
-            pair.clientConnection().send(followUp, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(followUp, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(followUp, received.poll(10, TimeUnit.SECONDS));
         }
@@ -187,7 +187,7 @@ final class OftConnectionTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] payload = "post-rekey".getBytes();
-            pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(payload, received.poll(10, TimeUnit.SECONDS));
         }
@@ -202,7 +202,7 @@ final class OftConnectionTest {
             pair.clientConnection().setReceivedHandler(received::add);
 
             byte[] payload = "post-rekey-from-server".getBytes();
-            pair.serverConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.serverConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(payload, received.poll(10, TimeUnit.SECONDS));
         }
@@ -220,7 +220,7 @@ final class OftConnectionTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] payload = "after simultaneous rekey".getBytes();
-            pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(payload, received.poll(10, TimeUnit.SECONDS));
         }
@@ -235,7 +235,7 @@ final class OftConnectionTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] payload = "still here".getBytes();
-            pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(payload, received.poll(10, TimeUnit.SECONDS));
         }
@@ -366,12 +366,12 @@ final class OftConnectionTest {
             pair.serverConnection().setReceivedHandler(data -> invocationCount.incrementAndGet());
             pair.serverConnection().setReceivedHandler(null);
 
-            pair.clientConnection().send("ignored".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send("ignored".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             MessageCapture capture = new MessageCapture();
             pair.serverConnection().setReceivedHandler(capture::set);
 
-            pair.clientConnection().send("after".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send("after".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
             capture.await(10);
 
             assertEquals(0, invocationCount.get());
@@ -392,9 +392,81 @@ final class OftConnectionTest {
     }
 
     @Test
+    void send_withTag_raisesAcknowledgedHandlerWithTag() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
+            Object tag = new Object();
+            CompletableFuture<Object> acknowledged = new CompletableFuture<>();
+            pair.clientConnection().setAcknowledgedHandler(acknowledged::complete);
+
+            pair.clientConnection().send("hello".getBytes(), 0, tag).completion().get(10, TimeUnit.SECONDS);
+
+            Object acknowledgedTag = acknowledged.get(10, TimeUnit.SECONDS);
+            assertTrue(tag == acknowledgedTag);
+        }
+    }
+
+    @Test
+    void send_withTagLargerThanPacketSize_raisesAcknowledgedHandlerOnlyAfterFinalCompletion() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish(16, null)) {
+            Object tag = new Object();
+            CompletableFuture<Object> acknowledged = new CompletableFuture<>();
+            pair.clientConnection().setAcknowledgedHandler(acknowledged::complete);
+
+            byte[] payload = new byte[1000];
+            for (int i = 0; i < payload.length; i++) {
+                payload[i] = (byte) i;
+            }
+            OftSendHandle sendHandle = pair.clientConnection().send(payload, 0, tag);
+
+            Object acknowledgedTag = acknowledged.get(10, TimeUnit.SECONDS);
+            assertTrue(tag == acknowledgedTag);
+            sendHandle.completion().get(10, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void send_withNullTag_neverRaisesAcknowledgedHandler() throws Exception {
+        try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
+            java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
+            pair.clientConnection().setAcknowledgedHandler(tag -> acknowledgedHandlerRaised.set(true));
+
+            BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
+            pair.serverConnection().setReceivedHandler(received::add);
+
+            pair.clientConnection().send("hello".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
+
+            assertArrayEquals("hello".getBytes(), received.poll(10, TimeUnit.SECONDS));
+            assertFalse(acknowledgedHandlerRaised.get());
+        }
+    }
+
+    @Test
+    void send_cancelledWithTag_neverRaisesAcknowledgedHandler() throws Exception {
+        // Unlike C#'s equivalent test, this cancels mid-transfer (via a multi-packet payload plus a
+        // short delay) rather than immediately after send() returns: Java's OftSendHandle#cancel(),
+        // unlike a pre-cancelled CancellationToken, races against the send loop for a single-packet
+        // message and can't deterministically preempt it.
+        try (OftTestHarness.Pair pair = OftTestHarness.establish(8, null)) {
+            java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
+            pair.clientConnection().setAcknowledgedHandler(tag -> acknowledgedHandlerRaised.set(true));
+
+            byte[] payload = new byte[400];
+            OftSendHandle handle = pair.clientConnection().send(payload, 0, new Object());
+            Thread.sleep(50);
+            handle.cancel();
+
+            CompletableFuture<Void> completion = handle.completion();
+            assertThrows(Exception.class, () -> completion.get(10, TimeUnit.SECONDS));
+
+            Thread.sleep(200);
+            assertFalse(acknowledgedHandlerRaised.get());
+        }
+    }
+
+    @Test
     void send_negativePriority_throws() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
-            assertThrows(IllegalArgumentException.class, () -> pair.clientConnection().send("hi".getBytes(), -1));
+            assertThrows(IllegalArgumentException.class, () -> pair.clientConnection().send("hi".getBytes(), -1, null));
         }
     }
 
@@ -403,7 +475,7 @@ final class OftConnectionTest {
         OftTestHarness.Pair pair = OftTestHarness.establish();
         pair.clientConnection().close();
 
-        assertThrows(OftDisconnectedException.class, () -> pair.clientConnection().send("hi".getBytes(), 0));
+        assertThrows(OftDisconnectedException.class, () -> pair.clientConnection().send("hi".getBytes(), 0, null));
 
         pair.close();
     }

@@ -89,8 +89,10 @@ implementing several notification methods at once, and no multicast event/listen
 |---|---|---|---|
 | Connection received | `IOftConnection.ReceivedHandler` (`Action<T>`) | `OftConnection.setReceivedHandler` (`Consumer<T>`) | `oft_connection_set_received_callback` |
 | Connection disconnected | `.DisconnectedHandler` | `.setDisconnectedHandler` | `oft_connection_set_disconnected_callback` |
+| Connection send acknowledged (tagged) | `.AcknowledgedHandler` | `.setAcknowledgedHandler` | `oft_connection_set_acknowledged_callback` |
 | Listener accepted a connection | `IOftListener.ConnectedHandler` | `OftListener.setConnectedHandler` | `oft_listener_set_connected_callback` |
 | Peer received (any held connection) | `IOftPeer.ReceivedHandler` | `OftPeer.setReceivedHandler` | `oft_peer_set_received_callback` |
+| Peer send acknowledged (tagged) | `IOftPeer.AcknowledgedHandler` | `OftPeer.setAcknowledgedHandler` | `oft_peer_set_acknowledged_callback` |
 
 A peer deliberately has no disconnected/connected slot of its own — see [Components](#components)
 above for why. Each slot on a given connection/listener/peer is assigned (or reassigned)
@@ -101,17 +103,24 @@ unambiguous who owns any data the notification carries (see [Memory ownership](#
 below): unlike a multicast design, no two subscribers can both think they own the same data.
 
 C#'s callbacks are plain `Action<T>` properties assigned a lambda or method group directly, no
-interface to implement; Java mirrors this with `Consumer<T>` setter methods. C, lacking both
-interfaces and lambdas, uses a function pointer plus a `void *user_data`. A connection's or
-listener's own callback passes a plain payload/connection argument in every port, but a peer's
-received callback bundles the payload with an identity snapshot into one type instead —
-`IOftPeerReception` in C# (`Action<IOftPeerReception>`), `OftPeerReception` in Java
-(`Consumer<OftPeerReception>`), and `oft_peer_reception *` in C — since a peer, unlike a connection
-or listener, never exposes the underlying connection a message arrived on. All three hide the
-concrete implementation behind an interface (C#'s `IOftPeerReception`/internal `OftPeerReception`,
-Java's `OftPeerReception`/package-private `DefaultOftPeerReception`) or an opaque handle with
-accessor functions (C's `oft_peer_reception`), matching how every other peer-visible type here is
-exposed.
+interface to implement; Java mirrors this with `Consumer<T>`/`BiConsumer<T, U>` setter methods. C,
+lacking both interfaces and lambdas, uses a function pointer plus a `void *user_data`. A connection's
+or listener's own callback passes a plain payload/connection argument in every port. A peer's
+received callback identifies which connection a message arrived on the same way in all three: an
+`OftIdentity`/`oft_identity *` argument alongside the payload, as two separate arguments — the same
+shape a connection's own received callback already uses. C#'s `OftIdentity` is a self-contained
+record, safe to keep referencing after the callback returns (garbage-collected like any other
+object); Java's is likewise a self-contained record; C's `const oft_identity *` is instead borrowed
+from the underlying connection and valid only for the duration of that one call, matching how every
+other borrowed-identity pointer in this port works (e.g. `oft_connection_identity()`'s own return
+value) — a caller that needs it afterward must copy out whatever fields it cares about itself.
+
+Tagged-send acknowledgement (`Send`'s/`send`'s/`oft_connection_send()`'s `tag` parameter, and the
+`AcknowledgedHandler`/`setAcknowledgedHandler`/`oft_connection_set_acknowledged_callback` notification
+it's later reported through) is mirrored identically across all three, at both the connection and
+peer level. See [Buffered notifications](#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
+below for the one respect in which this notification deliberately behaves differently from every
+other one.
 
 ### Buffered notifications prevent a connect/disconnect/receive message-loss race
 
@@ -146,6 +155,19 @@ notifications from that point on, not the earlier history. This matters for test
 code alike: assigning a callback after an earlier, unrelated send has already happened means seeing
 that earlier message (delivered via the backlog) before whatever the caller actually intended to
 observe next.
+
+#### `AcknowledgedHandler` is deliberately *not* buffered
+
+Every notification above needs this buffering because its trigger — an inbound packet, a connection
+closing, a listener accepting — can happen autonomously, at any time, independent of anything the
+caller does. `AcknowledgedHandler`/`setAcknowledgedHandler`/`oft_connection_set_acknowledged_callback`
+(and the peer-level equivalents) are different: the *only* way to ever trigger one is the caller's own
+`Send`/`send`/`oft_connection_send()` call with a non-`null`/non-`NULL` tag. Since the caller fully
+controls when that first happens, there is no message-loss race to guard against, and all three ports
+implement this one as a plain, unbuffered field — assigning it after the triggering send call (but
+before that send completes) simply misses the notification for that specific send, by design; the
+caller is expected to assign it before issuing a tagged send it cares about being notified for, not
+rely on any backlog to catch up later.
 
 ### Where a port's flow differs from this
 
@@ -307,17 +329,19 @@ model:
   prompt reuse) returns the memory to its pool. Data passed to `Send` is either copied (plain
   `ReadOnlyMemory<byte>` overload) or ownership-transferred (`IMemoryOwner<byte>` overload, disposed
   by the connection once the send completes), matching this repository's general pooled-memory
-  conventions (see [`AGENTS.md`](../AGENTS.md)). A peer's `IOftPeerReception` wraps this same pooled
-  memory alongside an `OftIdentity` snapshot; disposing the reception disposes both.
+  conventions (see [`AGENTS.md`](../AGENTS.md)). A peer's `ReceivedHandler` delivers this same pooled
+  memory as its own argument, alongside a separate `OftIdentity` argument rather than one bundled type.
 - **Java** delivers received data as an ordinary `byte[]`; the JVM garbage collector reclaims it once
   the received callback is done with it — no explicit release needed.
-  `OftConnection.send(byte[], int)` copies its input; the caller retains ownership of its own buffer.
-  A peer's `OftPeerReception` needs no explicit release either, for the same reason.
+  `OftConnection.send(byte[], int, Object)` copies its input; the caller retains ownership of its own
+  buffer. A peer's `setReceivedHandler` delivers this same `byte[]` as its own argument, alongside a
+  separate `OftIdentity` argument, needing no explicit release either.
 - **C** delivers received data as a `malloc()`-allocated `uint8_t *`/`length`; ownership passes to the
   received callback, which **must** `free()` it when done. `oft_connection_send()` copies the data
-  it's given; the caller retains ownership of its own buffer. A peer's `oft_peer_reception` bundles
-  this same payload with an independent `oft_identity` copy; `oft_peer_reception_free()` frees both
-  together, rather than freeing `data` and the identity's owned fields separately.
+  it's given; the caller retains ownership of its own buffer. A peer's `oft_peer_received_callback`
+  delivers this same `malloc()`-allocated payload directly, alongside a separate `const oft_identity *`
+  argument — borrowed from the underlying connection, valid only for the duration of that one call,
+  and never freed by the callee (unlike the payload, which it must `free()`).
 
 ## See also
 

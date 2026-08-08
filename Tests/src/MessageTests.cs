@@ -176,4 +176,72 @@ public sealed class MessageTests
         using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
         Assert.Equal(followUp, data.Memory.ToArray());
     }
+
+    [Fact]
+    public async Task Send_WithTag_RaisesAcknowledgedHandlerWithTag()
+    {
+        using OftPair pair = await OftTestHarness.Establish();
+
+        object tag = new();
+        TaskCompletionSource<object> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.AcknowledgedHandler = acknowledgedTag => acknowledged.TrySetResult(acknowledgedTag);
+
+        await pair.ClientConnection.Send("hello"u8.ToArray(), tag: tag);
+
+        object acknowledgedTag = await acknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Same(tag, acknowledgedTag);
+    }
+
+    [Fact]
+    public async Task Send_WithTagLargerThanPacketSize_RaisesAcknowledgedHandlerOnlyAfterFinalCompletion()
+    {
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
+
+        object tag = new();
+        TaskCompletionSource<object> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.AcknowledgedHandler = acknowledgedTag => acknowledged.TrySetResult(acknowledgedTag);
+
+        byte[] payload = [.. Enumerable.Range(0, 1000).Select(i => (byte)i)];
+        Task sendTask = pair.ClientConnection.Send(payload, tag: tag);
+
+        object acknowledgedTag = await acknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Same(tag, acknowledgedTag);
+        await sendTask.WaitAsync(OftTestHarness.DefaultTimeout);
+    }
+
+    [Fact]
+    public async Task Send_WithNullTag_NeverRaisesAcknowledgedHandler()
+    {
+        using OftPair pair = await OftTestHarness.Establish();
+
+        bool acknowledgedHandlerRaised = false;
+        pair.ClientConnection.AcknowledgedHandler = _ => acknowledgedHandlerRaised = true;
+
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
+
+        await pair.ClientConnection.Send("hello"u8.ToArray());
+
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal("hello"u8.ToArray(), data.Memory.ToArray());
+        Assert.False(acknowledgedHandlerRaised);
+    }
+
+    [Fact]
+    public async Task Send_CancelledBeforeStartWithTag_NeverRaisesAcknowledgedHandler()
+    {
+        using OftPair pair = await OftTestHarness.Establish();
+
+        bool acknowledgedHandlerRaised = false;
+        pair.ClientConnection.AcknowledgedHandler = _ => acknowledgedHandlerRaised = true;
+
+        using CancellationTokenSource cts = new();
+        cts.Cancel();
+        Task sendTask = pair.ClientConnection.Send("should not arrive"u8.ToArray(), tag: new object(), cancellationToken: cts.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sendTask);
+
+        await Task.Delay(200);
+        Assert.False(acknowledgedHandlerRaised);
+    }
 }

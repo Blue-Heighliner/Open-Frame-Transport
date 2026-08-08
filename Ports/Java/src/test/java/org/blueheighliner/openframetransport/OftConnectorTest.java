@@ -27,7 +27,7 @@ final class OftConnectorTest {
             // the very first thing once the listener starts processing this connection, immediately
             // after this callback returns: about as fast as a peer's first message could possibly
             // arrive.
-            listener.setConnectedHandler(connection -> connection.send("immediate".getBytes(), 0));
+            listener.setConnectedHandler(connection -> connection.send("immediate".getBytes(), 0, null));
 
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
@@ -52,7 +52,7 @@ final class OftConnectorTest {
     @Test
     void connect_noOptions_receivedNeverMissesAMessageSentImmediately() throws Exception {
         try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0))) {
-            listener.setConnectedHandler(connection -> connection.send("immediate".getBytes(), 0));
+            listener.setConnectedHandler(connection -> connection.send("immediate".getBytes(), 0, null));
 
             OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort());
 

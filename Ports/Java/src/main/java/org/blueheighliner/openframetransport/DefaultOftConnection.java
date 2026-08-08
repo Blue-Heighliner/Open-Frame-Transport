@@ -117,6 +117,17 @@ final class DefaultOftConnection implements OftConnection {
     private final BufferedHandlerSlot<Consumer<byte[]>> receivedSlot = new BufferedHandlerSlot<>();
     private final BufferedHandlerSlot<Consumer<Throwable>> disconnectedSlot = new BufferedHandlerSlot<>();
 
+    /**
+     * Deliberately a plain field, not a {@link BufferedHandlerSlot} like {@link #receivedSlot}/
+     * {@link #disconnectedSlot}: those exist to buffer a raise that happens before a caller has had a
+     * chance to assign a callback, which can only happen because their triggers (inbound packets,
+     * connection closure) can occur autonomously, before the caller's next line of code runs. This one
+     * can only ever be raised in response to a {@link #send} call the caller itself makes - there is
+     * nothing for it to race against, since the caller fully controls when that first happens and can
+     * simply assign this beforehand if it cares.
+     */
+    private volatile Consumer<Object> acknowledgedHandler;
+
     private DefaultOftConnection(
             Socket rawSocket,
             Socket socket,
@@ -141,7 +152,7 @@ final class DefaultOftConnection implements OftConnection {
         Certificate[] peerCertificateChain = capturePeerCertificateChain(sslSocket);
         this.identity = new OftIdentity(
                 (InetSocketAddress) rawSocket.getRemoteSocketAddress(),
-                peerCertificateIdentity(peerCertificateChain),
+                peerLeafCertificate(peerCertificateChain),
                 remoteInfo);
 
         if (connectionValidation != null) {
@@ -172,10 +183,10 @@ final class DefaultOftConnection implements OftConnection {
         }
     }
 
-    /** Extracts the peer's TLS certificate identity from {@code peerCertificateChain}'s leaf, or {@code null} if it's {@code null} or its leaf isn't an {@link X509Certificate}. */
-    private static OftCertificateIdentity peerCertificateIdentity(Certificate[] peerCertificateChain) {
+    /** {@code peerCertificateChain}'s leaf certificate, or {@code null} if it's {@code null} or its leaf isn't an {@link X509Certificate}. */
+    private static X509Certificate peerLeafCertificate(Certificate[] peerCertificateChain) {
         return peerCertificateChain != null && peerCertificateChain[0] instanceof X509Certificate
-                ? OftCertificateIdentity.fromCertificate((X509Certificate) peerCertificateChain[0])
+                ? (X509Certificate) peerCertificateChain[0]
                 : null;
     }
 
@@ -448,7 +459,17 @@ final class DefaultOftConnection implements OftConnection {
     }
 
     @Override
-    public OftSendHandle send(byte[] data, int priority) {
+    public void setAcknowledgedHandler(Consumer<Object> handler) {
+        this.acknowledgedHandler = handler;
+    }
+
+    @Override
+    public Consumer<Object> getAcknowledgedHandler() {
+        return this.acknowledgedHandler;
+    }
+
+    @Override
+    public OftSendHandle send(byte[] data, int priority, Object tag) {
         if (priority < 0) {
             throw new IllegalArgumentException("priority must not be negative");
         }
@@ -458,7 +479,7 @@ final class DefaultOftConnection implements OftConnection {
         }
 
         CompletableFuture<Void> future = new CompletableFuture<>();
-        PendingMessage message = new PendingMessage(data, priority, future);
+        PendingMessage message = new PendingMessage(data, priority, tag, future);
 
         synchronized (this.outboundLock) {
             this.outboundQueues.computeIfAbsent(priority, key -> new ArrayDeque<>()).addLast(message);
@@ -661,6 +682,13 @@ final class DefaultOftConnection implements OftConnection {
                 message.future.completeExceptionally(new CancellationException("Message was cancelled."));
             } else {
                 message.future.complete(null);
+
+                if (message.tag != null) {
+                    Consumer<Object> handler = this.acknowledgedHandler;
+                    if (handler != null) {
+                        handler.accept(message.tag);
+                    }
+                }
             }
         }
     }
@@ -819,14 +847,19 @@ final class DefaultOftConnection implements OftConnection {
     private static final class PendingMessage {
         final byte[] data;
         final int priority;
+
+        /** The opaque tag this send was queued with, or {@code null} if it wasn't (see {@link #acknowledgedHandler}). */
+        final Object tag;
+
         final CompletableFuture<Void> future;
         volatile boolean cancelRequested;
         volatile boolean started;
         int bytesSent;
 
-        PendingMessage(byte[] data, int priority, CompletableFuture<Void> future) {
+        PendingMessage(byte[] data, int priority, Object tag, CompletableFuture<Void> future) {
             this.data = data;
             this.priority = priority;
+            this.tag = tag;
             this.future = future;
         }
     }

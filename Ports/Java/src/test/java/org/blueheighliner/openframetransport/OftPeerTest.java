@@ -63,14 +63,14 @@ final class OftPeerTest {
     @Test
     void handler_reassignedToNull_stopsReceivingMessages() throws Exception {
         try (OftTestHarness.TrackedListener listener = createListeningListener("server"); OftPeer client = createOutboundOnlyPeer("client")) {
-            listener.onConnectedExtra = connection -> connection.send("payload".getBytes(), 0);
+            listener.onConnectedExtra = connection -> connection.send("payload".getBytes(), 0, null);
 
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(2);
-            client.setReceivedHandler(reception -> received.add(reception.data()));
+            client.setReceivedHandler((identity, data) -> received.add(data));
             client.setReceivedHandler(null);
 
             int port = listener.getLocalEndpoint().getPort();
-            client.send("127.0.0.1", port, "hello".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            client.send("127.0.0.1", port, "hello".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertNull(received.poll(2, TimeUnit.SECONDS));
         }
@@ -83,8 +83,8 @@ final class OftPeerTest {
             listener.onConnectedExtra = connection -> connection.setReceivedHandler(received::add);
 
             int port = listener.getLocalEndpoint().getPort();
-            client.send("127.0.0.1", port, "first".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
-            client.send("127.0.0.1", port, "second".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            client.send("127.0.0.1", port, "first".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
+            client.send("127.0.0.1", port, "second".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertEquals("first", new String(received.poll(10, TimeUnit.SECONDS)));
             assertEquals("second", new String(received.poll(10, TimeUnit.SECONDS)));
@@ -107,7 +107,7 @@ final class OftPeerTest {
 
             try {
                 int port = listener.getLocalEndpoint().getPort();
-                client.send("127.0.0.1", port, "hi".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+                client.send("127.0.0.1", port, "hi".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
                 assertEquals(1, listener.getConnections().size());
 
                 // 120s rather than 20: the connection only becomes an eviction candidate once
@@ -172,14 +172,51 @@ final class OftPeerTest {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
             listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
 
-            BlockingQueue<OftPeerReception> received = new ArrayBlockingQueue<>(1);
-            listeningPeer.setReceivedHandler(received::add);
+            BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
+            listeningPeer.setReceivedHandler((identity, data) -> received.add(data));
 
             int port = listeningPeer.getLocalEndpoint().getPort();
-            caller.send("127.0.0.1", port, "hello listener".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            caller.send("127.0.0.1", port, "hello listener".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
-            OftPeerReception reception = received.poll(10, TimeUnit.SECONDS);
-            assertEquals("hello listener", new String(reception.data()));
+            byte[] data = received.poll(10, TimeUnit.SECONDS);
+            assertEquals("hello listener", new String(data));
+        }
+    }
+
+    @Test
+    void send_withTag_raisesAcknowledgedHandlerWithIdentityAndTag() throws Exception {
+        try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
+            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+
+            Object tag = new Object();
+            CompletableFuture<OftIdentity> acknowledgedIdentity = new CompletableFuture<>();
+            CompletableFuture<Object> acknowledgedTag = new CompletableFuture<>();
+            caller.setAcknowledgedHandler((identity, receivedTag) -> {
+                acknowledgedIdentity.complete(identity);
+                acknowledgedTag.complete(receivedTag);
+            });
+
+            int port = listeningPeer.getLocalEndpoint().getPort();
+            caller.send("127.0.0.1", port, "hello listener".getBytes(), 0, tag).completion().get(10, TimeUnit.SECONDS);
+
+            assertTrue(tag == acknowledgedTag.get(10, TimeUnit.SECONDS));
+            assertEquals("listener", acknowledgedIdentity.get(10, TimeUnit.SECONDS).info());
+        }
+    }
+
+    @Test
+    void send_withoutTag_neverRaisesAcknowledgedHandler() throws Exception {
+        try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
+            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+
+            java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
+            caller.setAcknowledgedHandler((identity, tag) -> acknowledgedHandlerRaised.set(true));
+
+            int port = listeningPeer.getLocalEndpoint().getPort();
+            caller.send("127.0.0.1", port, "hello listener".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
+
+            Thread.sleep(200);
+            assertFalse(acknowledgedHandlerRaised.get());
         }
     }
 
@@ -193,7 +230,7 @@ final class OftPeerTest {
     @Test
     void send_connectFailure_propagatesIOException() throws Exception {
         try (OftPeer client = createOutboundOnlyPeer("client")) {
-            assertThrows(java.io.IOException.class, () -> client.send("127.0.0.1", 1, "hi".getBytes(), 0));
+            assertThrows(java.io.IOException.class, () -> client.send("127.0.0.1", 1, "hi".getBytes(), 0, null));
         }
     }
 
@@ -209,8 +246,8 @@ final class OftPeerTest {
                     .build());
 
             try {
-                client.send("127.0.0.1", listenerA.getLocalEndpoint().getPort(), "a".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
-                client.send("127.0.0.1", listenerB.getLocalEndpoint().getPort(), "b".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+                client.send("127.0.0.1", listenerA.getLocalEndpoint().getPort(), "a".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
+                client.send("127.0.0.1", listenerB.getLocalEndpoint().getPort(), "b".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
                 // Duration.ofSeconds(120) rather than 15: connectionA only becomes an eviction
                 // candidate once OftPeer's fixed, non-configurable 30-second grace period has
@@ -244,7 +281,7 @@ final class OftPeerTest {
                 java.util.Arrays.fill(payload, (byte) 7);
 
                 CompletableFuture<Void> sendFuture =
-                        sender.send("127.0.0.1", receiverListener.getLocalEndpoint().getPort(), payload, 0).completion();
+                        sender.send("127.0.0.1", receiverListener.getLocalEndpoint().getPort(), payload, 0, null).completion();
 
                 Thread.sleep(400);
                 assertFalse(sendFuture.isDone());
@@ -274,15 +311,15 @@ final class OftPeerTest {
             // avoids seeing that earlier, unrelated message instead of the post-rekey one this test
             // actually cares about.
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(2);
-            listeningPeer.setReceivedHandler(reception -> received.add(reception.data()));
+            listeningPeer.setReceivedHandler((identity, data) -> received.add(data));
 
             int port = listeningPeer.getLocalEndpoint().getPort();
-            caller.send("127.0.0.1", port, "hello".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            caller.send("127.0.0.1", port, "hello".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             caller.rekey().get(10, TimeUnit.SECONDS);
             listeningPeer.rekey().get(10, TimeUnit.SECONDS);
 
-            caller.send("127.0.0.1", port, "post-rekey".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            caller.send("127.0.0.1", port, "post-rekey".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertEquals("hello", new String(received.poll(10, TimeUnit.SECONDS)));
             assertEquals("post-rekey", new String(received.poll(10, TimeUnit.SECONDS)));
@@ -303,7 +340,7 @@ final class OftPeerTest {
             listener.onConnectedExtra = inboundConnections::add;
 
             int port = listener.getLocalEndpoint().getPort();
-            client.send("127.0.0.1", port, "hi".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            client.send("127.0.0.1", port, "hi".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             OftConnection inboundOnListener = inboundConnections.poll(10, TimeUnit.SECONDS);
             assertEquals(1, listener.getConnections().size());
@@ -326,12 +363,12 @@ final class OftPeerTest {
     void drop_peerRemainsUsableAfterward() throws Exception {
         try (OftTestHarness.TrackedListener listener = createListeningListener("server"); OftPeer client = createOutboundOnlyPeer("client")) {
             int port = listener.getLocalEndpoint().getPort();
-            client.send("127.0.0.1", port, "first".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            client.send("127.0.0.1", port, "first".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             client.drop();
 
             assertTrue(client.isConnected());
-            client.send("127.0.0.1", port, "second".getBytes(), 0).completion().get(10, TimeUnit.SECONDS);
+            client.send("127.0.0.1", port, "second".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
         }
     }
 
@@ -395,6 +432,6 @@ final class OftPeerTest {
         OftPeer client = createOutboundOnlyPeer("client");
         client.close();
 
-        assertThrows(OftDisconnectedException.class, () -> client.send("127.0.0.1", 12345, "hi".getBytes(), 0));
+        assertThrows(OftDisconnectedException.class, () -> client.send("127.0.0.1", 12345, "hi".getBytes(), 0, null));
     }
 }

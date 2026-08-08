@@ -32,12 +32,12 @@ public sealed class HandshakeTests
     }
 
     [Fact]
-    public async Task Establish_ServerAuthentication_ClientSeesServerCertificateIdentity()
+    public async Task Establish_ServerAuthentication_ClientSeesServerCertificate()
     {
         using OftPair pair = await OftTestHarness.Establish(securityMode: OftSecurityMode.ServerAuthentication);
 
         Assert.NotNull(pair.ClientConnection.Identity.Certificate);
-        Assert.Equal("localhost", pair.ClientConnection.Identity.Certificate!.Name);
+        Assert.Equal("localhost", pair.ClientConnection.Identity.Certificate!.GetNameInfo(X509NameType.SimpleName, forIssuer: false));
 
         // Server authentication only authenticates the server - the server never sees a client
         // certificate.

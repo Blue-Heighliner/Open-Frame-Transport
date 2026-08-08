@@ -156,8 +156,8 @@ public sealed class PooledMemoryTests
         });
         await listeningPeer.Listen(new IPEndPoint(IPAddress.Loopback, 0));
 
-        TaskCompletionSource<IOftPeerReception> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listeningPeer.ReceivedHandler = reception => received.TrySetResult(reception);
+        TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        listeningPeer.ReceivedHandler = (_, data) => received.TrySetResult(data);
 
         using IOftPeer caller = factory.Create(new OftPeerOptions
         {
@@ -170,8 +170,8 @@ public sealed class PooledMemoryTests
 
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, owner).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        using IOftPeerReception reception = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, reception.Data.ToArray());
+        using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
         Assert.Equal(1, owner.DisposeCount);
     }
 }

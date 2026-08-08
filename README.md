@@ -88,7 +88,7 @@ await connection.Send(Encoding.UTF8.GetBytes("hello"));
 using BlueHeighliner.OpenFrameTransport;
 
 IOftPeer peer = new OftPeerFactory().Create();
-peer.ReceivedHandler = reception => Console.WriteLine(Encoding.UTF8.GetString(reception.Data.Span));
+peer.ReceivedHandler = (identity, data) => Console.WriteLine(Encoding.UTF8.GetString(data.Memory.Span));
 
 await peer.Listen(new IPEndPoint(IPAddress.Any, 5001)); // optional: also accept inbound connections
 await peer.Send("127.0.0.1", 5001, Encoding.UTF8.GetBytes("hello"));
@@ -107,7 +107,7 @@ listener.setConnectedHandler(connection -> connection.setReceivedHandler(data ->
 
 // Client
 OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000);
-connection.send("hello".getBytes(), 0);
+connection.send("hello".getBytes(), 0, null);
 ```
 
 #### Peer-to-peer
@@ -116,10 +116,10 @@ connection.send("hello".getBytes(), 0);
 import org.blueheighliner.openframetransport.*;
 
 OftPeer peer = OftPeer.create(OftPeerOptions.builder().build());
-peer.setReceivedHandler(reception -> System.out.println(new String(reception.data())));
+peer.setReceivedHandler((identity, data) -> System.out.println(new String(data)));
 
 peer.listen(new InetSocketAddress("0.0.0.0", 5001)); // optional: also accept inbound connections
-peer.send("127.0.0.1", 5001, "hello".getBytes(), 0);
+peer.send("127.0.0.1", 5001, "hello".getBytes(), 0, null);
 ```
 
 ### C
@@ -148,7 +148,7 @@ oft_listener_set_connected_callback(listener, on_connected, NULL);
 oft_connection *connection = oft_connect("127.0.0.1", 5000, NULL, NULL, error_buffer, sizeof(error_buffer));
 
 uint64_t message_id;
-oft_connection_send(connection, (const uint8_t *)"hello", 5, 0, &message_id);
+oft_connection_send(connection, (const uint8_t *)"hello", 5, 0, NULL, &message_id);
 ```
 
 #### Peer-to-peer
@@ -156,9 +156,9 @@ oft_connection_send(connection, (const uint8_t *)"hello", 5, 0, &message_id);
 ```c
 #include "oft/oft_peer.h"
 
-static void on_peer_received(oft_peer_reception *reception, void *user_data) {
-    printf("%.*s\n", (int)oft_peer_reception_length(reception), oft_peer_reception_data(reception));
-    oft_peer_reception_free(reception); // also frees its payload and identity
+static void on_peer_received(const oft_identity *identity, uint8_t *data, size_t length, void *user_data) {
+    printf("%.*s\n", (int)length, data);
+    free(data); // ownership passes to this callback
 }
 
 oft_peer_options options = {0};
@@ -169,7 +169,7 @@ char error_buffer[256];
 oft_peer_listen(peer, "0.0.0.0", 5001, error_buffer, sizeof(error_buffer)); // optional: also accept inbound connections
 
 uint64_t message_id;
-oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, 0, NULL, &message_id, error_buffer, sizeof(error_buffer));
+oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, 0, NULL, NULL, &message_id, error_buffer, sizeof(error_buffer));
 ```
 
 See [Docs/CSharp.md](Docs/CSharp.md), [Docs/Java.md](Docs/Java.md), and [Docs/C.md](Docs/C.md) for

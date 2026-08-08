@@ -3,7 +3,7 @@ package org.blueheighliner.openframetransport;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.concurrent.CompletableFuture;
-import java.util.function.Consumer;
+import java.util.function.BiConsumer;
 
 /**
  * A peer-to-peer convenience layer over {@link OftHoster}/{@link OftListener} and
@@ -69,20 +69,34 @@ public interface OftPeer extends AutoCloseable {
 
     /**
      * Called for every message received on any connection this peer holds, both inbound and
-     * outbound, with the received {@link OftPeerReception}, or {@code null} if no callback is
-     * currently assigned. There is only ever one callback at a time - assigning a new value here
-     * always replaces any previous one, and the same buffering-until-first-non-null-assignment
+     * outbound, with the identity of the connection it arrived on and its payload, or {@code null} if
+     * no callback is currently assigned. There is only ever one callback at a time - assigning a new
+     * value here always replaces any previous one, and the same buffering-until-first-non-null-assignment
      * guarantee {@link OftConnection#setReceivedHandler} itself makes applies here too (see
      * README.md). This peer deliberately exposes no way to enumerate, look up, or be notified about
-     * the individual connections it holds beyond an {@link OftPeerReception}'s own
-     * {@link OftPeerReception#identity()} (e.g. no disconnected notification): connection lifecycle
-     * is this peer's own implementation detail, transparently managed (reconnecting, evicting, etc.)
-     * behind {@link #send}.
+     * the individual connections it holds beyond the identity passed here (e.g. no disconnected
+     * notification): connection lifecycle is this peer's own implementation detail, transparently
+     * managed (reconnecting, evicting, etc.) behind {@link #send}.
      */
-    void setReceivedHandler(Consumer<OftPeerReception> handler);
+    void setReceivedHandler(BiConsumer<OftIdentity, byte[]> handler);
 
     /** The callback currently assigned via {@link #setReceivedHandler}, or {@code null} if none is. */
-    Consumer<OftPeerReception> getReceivedHandler();
+    BiConsumer<OftIdentity, byte[]> getReceivedHandler();
+
+    /**
+     * Called whenever a message sent with a non-null {@code tag} (see {@link #send}) has been fully
+     * delivered and acknowledged (see {@link OftConnection#setAcknowledgedHandler}), with the identity
+     * of the connection it was sent over and that same tag. Never called for a message sent with a
+     * {@code null} tag, or for one that was cancelled rather than delivered. {@code null} if no
+     * callback is currently assigned. There is only ever one callback at a time - assigning a new
+     * value here always replaces any previous one. Unlike {@link #setReceivedHandler}, this does
+     * <em>not</em> buffer a raise that happens before a callback is ever assigned - see
+     * {@link OftConnection#setAcknowledgedHandler}'s own doc comment for why that's safe.
+     */
+    void setAcknowledgedHandler(BiConsumer<OftIdentity, Object> handler);
+
+    /** The callback currently assigned via {@link #setAcknowledgedHandler}, or {@code null} if none is. */
+    BiConsumer<OftIdentity, Object> getAcknowledgedHandler();
 
     /**
      * Starts listening for inbound connections. A peer that never calls this only ever makes
@@ -111,10 +125,15 @@ public interface OftPeer extends AutoCloseable {
      * @param port     the remote port to send to
      * @param data     the message payload
      * @param priority the priority to send the message at (see README.md &sect;5-&sect;6)
+     * @param tag      an opaque, application-controlled value attached to this send, so it can be
+     *                 referenced later - passed back to {@link #setAcknowledgedHandler}'s callback,
+     *                 along with the identity of the connection it was sent over, once this message is
+     *                 fully delivered and acknowledged, if non-null; {@code null} means this send
+     *                 never raises it
      * @return a handle that can be used to wait for delivery or cancel the message
      * @throws OftDisconnectedException {@link #isConnected()} is {@code false}
      */
-    OftSendHandle send(String host, int port, byte[] data, int priority) throws IOException;
+    OftSendHandle send(String host, int port, byte[] data, int priority, Object tag) throws IOException;
 
     /**
      * Requests a TLS 1.3 {@code KeyUpdate} (see README.md &sect;8) on every connection this peer

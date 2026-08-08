@@ -132,15 +132,53 @@ public sealed class OftPeerTests
         using IOftPeer listeningPeer = CreateListeningPeer();
         await listeningPeer.Listen(new IPEndPoint(IPAddress.Loopback, 0));
 
-        TaskCompletionSource<IOftPeerReception> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listeningPeer.ReceivedHandler = reception => received.TrySetResult(reception);
+        TaskCompletionSource<(OftIdentity Identity, IMemoryOwner<byte> Data)> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        listeningPeer.ReceivedHandler = (identity, data) => received.TrySetResult((identity, data));
 
         using IOftPeer caller = CreatePeer();
         byte[] payload = "hello listener"u8.ToArray();
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, payload).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        using IOftPeerReception reception = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, reception.Data.ToArray());
+        (OftIdentity identity, IMemoryOwner<byte> data) = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        using (data)
+        {
+            Assert.Equal(payload, data.Memory.ToArray());
+            Assert.Equal("peer", identity.Info);
+        }
+    }
+
+    [Fact]
+    public async Task Send_WithTag_RaisesAcknowledgedHandlerWithIdentityAndTag()
+    {
+        using IOftPeer listeningPeer = CreateListeningPeer();
+        await listeningPeer.Listen(new IPEndPoint(IPAddress.Loopback, 0));
+
+        object tag = new();
+        TaskCompletionSource<(OftIdentity Identity, object Tag)> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using IOftPeer caller = CreatePeer();
+        caller.AcknowledgedHandler = (identity, acknowledgedTag) => acknowledged.TrySetResult((identity, acknowledgedTag));
+
+        await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, "hello listener"u8.ToArray(), tag: tag).WaitAsync(OftTestHarness.DefaultTimeout);
+
+        (OftIdentity identity, object acknowledgedTag) = await acknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Same(tag, acknowledgedTag);
+        Assert.Equal("listener", identity.Info);
+    }
+
+    [Fact]
+    public async Task Send_WithoutTag_NeverRaisesAcknowledgedHandler()
+    {
+        using IOftPeer listeningPeer = CreateListeningPeer();
+        await listeningPeer.Listen(new IPEndPoint(IPAddress.Loopback, 0));
+
+        bool acknowledgedHandlerRaised = false;
+        using IOftPeer caller = CreatePeer();
+        caller.AcknowledgedHandler = (_, _) => acknowledgedHandlerRaised = true;
+
+        await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, "hello listener"u8.ToArray()).WaitAsync(OftTestHarness.DefaultTimeout);
+
+        await Task.Delay(200);
+        Assert.False(acknowledgedHandlerRaised);
     }
 
     [Fact]
@@ -230,16 +268,16 @@ public sealed class OftPeerTests
         // after the "hello" send below avoids seeing that earlier, unrelated message instead of the
         // post-rekey one this test actually cares about.
         byte[] payload = "post-rekey"u8.ToArray();
-        TaskCompletionSource<IOftPeerReception> receivedPostRekey = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        listeningPeer.ReceivedHandler = reception =>
+        TaskCompletionSource<IMemoryOwner<byte>> receivedPostRekey = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        listeningPeer.ReceivedHandler = (_, data) =>
         {
-            if (reception.Data.Span.SequenceEqual(payload))
+            if (data.Memory.Span.SequenceEqual(payload))
             {
-                receivedPostRekey.TrySetResult(reception);
+                receivedPostRekey.TrySetResult(data);
             }
             else
             {
-                reception.Dispose();
+                data.Dispose();
             }
         };
 
@@ -251,8 +289,8 @@ public sealed class OftPeerTests
 
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, payload).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        using IOftPeerReception reception = await receivedPostRekey.Task.WaitAsync(OftTestHarness.DefaultTimeout);
-        Assert.Equal(payload, reception.Data.ToArray());
+        using IMemoryOwner<byte> data = await receivedPostRekey.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal(payload, data.Memory.ToArray());
     }
 
     [Fact]

@@ -9,13 +9,13 @@ public sealed record OftIdentity
     public required IPEndPoint EndPoint { get; init; }
 
     /// <summary>
-    /// The remote side's TLS certificate identity, or <see langword="null"/> if it didn't present one
-    /// — always <see langword="null"/> for a connection established with
-    /// <see cref="OftSecurityMode.Trusted"/> (no TLS at all), and also <see langword="null"/> for the
-    /// accepting side of a connection established under a mode that never requests a client
-    /// certificate (see <see cref="OftSecurityMode.DualAuthentication"/>).
+    /// The remote side's TLS certificate, or <see langword="null"/> if it didn't present one — always
+    /// <see langword="null"/> for a connection established with <see cref="OftSecurityMode.Trusted"/>
+    /// (no TLS at all), and also <see langword="null"/> for the accepting side of a connection
+    /// established under a mode that never requests a client certificate (see
+    /// <see cref="OftSecurityMode.DualAuthentication"/>).
     /// </summary>
-    public required OftCertificateIdentity? Certificate { get; init; }
+    public required X509Certificate2? Certificate { get; init; }
 
     /// <summary>
     /// The opaque, application-controlled data the remote side sent in its hail (see

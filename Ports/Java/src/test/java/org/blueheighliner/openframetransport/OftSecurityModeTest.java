@@ -24,7 +24,7 @@ final class OftSecurityModeTest {
             pair.serverConnection().setReceivedHandler(received::add);
 
             byte[] payload = "hello under secure mode".getBytes();
-            pair.clientConnection().send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            pair.clientConnection().send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(payload, received.poll(10, TimeUnit.SECONDS));
         }
@@ -82,7 +82,7 @@ final class OftSecurityModeTest {
             serverConnection.setReceivedHandler(received::add);
 
             byte[] payload = "hello under mutual tls".getBytes();
-            clientConnection.send(payload, 0).completion().get(10, TimeUnit.SECONDS);
+            clientConnection.send(payload, 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals(payload, received.poll(10, TimeUnit.SECONDS));
 

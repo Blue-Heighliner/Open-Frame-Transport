@@ -75,12 +75,9 @@ static void on_message_capture(oft_connection *connection, uint8_t *data, size_t
     pthread_mutex_unlock(&capture->mutex);
 }
 
-static void on_peer_message_capture(oft_peer_reception *reception, void *user_data) {
+static void on_peer_message_capture(const oft_identity *identity, uint8_t *data, size_t length, void *user_data) {
+    (void)identity;
     message_capture *capture = user_data;
-    size_t length = oft_peer_reception_length(reception);
-    uint8_t *data = malloc(length);
-    memcpy(data, oft_peer_reception_data(reception), length);
-    oft_peer_reception_free(reception);
 
     pthread_mutex_lock(&capture->mutex);
     free(capture->data);
@@ -106,6 +103,99 @@ static int message_capture_wait(message_capture *capture, int timeout_seconds) {
     int received = capture->received;
     pthread_mutex_unlock(&capture->mutex);
     return received && !timed_out ? 0 : -1;
+}
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    void *tag;
+    int raised;
+} tag_capture;
+
+static void tag_capture_init(tag_capture *capture) {
+    pthread_mutex_init(&capture->mutex, NULL);
+    pthread_cond_init(&capture->cond, NULL);
+    capture->tag = NULL;
+    capture->raised = 0;
+}
+
+static void tag_capture_destroy(tag_capture *capture) {
+    pthread_mutex_destroy(&capture->mutex);
+    pthread_cond_destroy(&capture->cond);
+}
+
+static void on_acknowledged_capture(void *tag, void *user_data) {
+    tag_capture *capture = user_data;
+    pthread_mutex_lock(&capture->mutex);
+    capture->tag = tag;
+    capture->raised = 1;
+    pthread_cond_broadcast(&capture->cond);
+    pthread_mutex_unlock(&capture->mutex);
+}
+
+static int tag_capture_wait(tag_capture *capture, int timeout_seconds) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_seconds;
+
+    pthread_mutex_lock(&capture->mutex);
+    int timed_out = 0;
+    while (!capture->raised && !timed_out) {
+        if (pthread_cond_timedwait(&capture->cond, &capture->mutex, &deadline) != 0) {
+            timed_out = 1;
+        }
+    }
+    int raised = capture->raised;
+    pthread_mutex_unlock(&capture->mutex);
+    return raised && !timed_out ? 0 : -1;
+}
+
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    void *tag;
+    char info_copy[64];
+    int raised;
+} peer_tag_capture;
+
+static void peer_tag_capture_init(peer_tag_capture *capture) {
+    pthread_mutex_init(&capture->mutex, NULL);
+    pthread_cond_init(&capture->cond, NULL);
+    capture->tag = NULL;
+    capture->info_copy[0] = '\0';
+    capture->raised = 0;
+}
+
+static void peer_tag_capture_destroy(peer_tag_capture *capture) {
+    pthread_mutex_destroy(&capture->mutex);
+    pthread_cond_destroy(&capture->cond);
+}
+
+static void on_peer_acknowledged_capture(const oft_identity *identity, void *tag, void *user_data) {
+    peer_tag_capture *capture = user_data;
+    pthread_mutex_lock(&capture->mutex);
+    capture->tag = tag;
+    strncpy(capture->info_copy, identity->info ? identity->info : "", sizeof(capture->info_copy) - 1);
+    capture->raised = 1;
+    pthread_cond_broadcast(&capture->cond);
+    pthread_mutex_unlock(&capture->mutex);
+}
+
+static int peer_tag_capture_wait(peer_tag_capture *capture, int timeout_seconds) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_seconds;
+
+    pthread_mutex_lock(&capture->mutex);
+    int timed_out = 0;
+    while (!capture->raised && !timed_out) {
+        if (pthread_cond_timedwait(&capture->cond, &capture->mutex, &deadline) != 0) {
+            timed_out = 1;
+        }
+    }
+    int raised = capture->raised;
+    pthread_mutex_unlock(&capture->mutex);
+    return raised && !timed_out ? 0 : -1;
 }
 
 #define MAX_ORDERED_MESSAGES 16
@@ -347,13 +437,16 @@ static void test_establish_exchanges_info_as_hail(void) {
     destroy_pair(&pair);
 }
 
-static void test_identity_server_authentication_client_sees_server_certificate_identity(void) {
+static void test_identity_server_authentication_client_sees_server_certificate(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    const oft_certificate_identity *client_certificate = oft_connection_identity(pair.client_connection)->certificate;
+    X509 *client_certificate = oft_connection_identity(pair.client_connection)->certificate;
     TEST_ASSERT(client_certificate != NULL);
-    TEST_ASSERT(client_certificate->name != NULL && strcmp(client_certificate->name, "localhost") == 0);
+
+    char common_name[256] = {0};
+    TEST_ASSERT(X509_NAME_get_text_by_NID(X509_get_subject_name(client_certificate), NID_commonName, common_name, sizeof(common_name)) > 0);
+    TEST_ASSERT(strcmp(common_name, "localhost") == 0);
 
     /* Server authentication only authenticates the server - the server never sees a client
      * certificate. */
@@ -558,7 +651,7 @@ static void test_send_small_message_delivered_as_unit(void) {
 
     const char *payload = "hello";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
@@ -578,7 +671,7 @@ static void test_send_empty_payload_delivered_as_empty_message(void) {
     oft_connection_set_received_callback(pair.server_connection, on_message_capture, &capture);
 
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, NULL, 0, 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, NULL, 0, 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
@@ -602,7 +695,7 @@ static void test_send_large_message_split_and_reassembled(void) {
     }
 
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 3, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 3, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
@@ -631,7 +724,7 @@ static void test_send_one_byte_over_packet_size_split_with_minimal_final_chunk(v
     }
 
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 1, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 1, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
@@ -663,10 +756,10 @@ static void test_higher_priority_interrupts_lower_priority(void) {
 
     uint64_t low_id;
     uint64_t high_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, low_payload, low_payload_size, 0, &low_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, low_payload, low_payload_size, 0, NULL, &low_id) == OFT_OK);
     free(low_payload); /* oft_connection_send() copies it. */
     usleep(20000);
-    TEST_ASSERT(oft_connection_send(pair.client_connection, high_payload, sizeof(high_payload), 5, &high_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, high_payload, sizeof(high_payload), 5, NULL, &high_id) == OFT_OK);
 
     /* Not TEST_ASSERT below: this test's connection carries ~2500 sequential, fully-acknowledged
      * round trips (one packet may be in flight at a time), so on failure it's important to still
@@ -707,7 +800,7 @@ static void test_cancel_before_start_never_delivered(void) {
 
     const char *payload = "should not arrive";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     oft_connection_cancel(pair.client_connection, message_id);
 
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_ERROR_CANCELLED);
@@ -725,7 +818,7 @@ static void test_cancel_after_start_connection_stays_healthy(void) {
     memset(payload, 9, sizeof(payload));
 
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 0, NULL, &message_id) == OFT_OK);
     usleep(50000);
     oft_connection_cancel(pair.client_connection, message_id);
 
@@ -738,12 +831,104 @@ static void test_cancel_after_start_connection_stays_healthy(void) {
 
     const char *follow_up = "still alive";
     uint64_t follow_up_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)follow_up, strlen(follow_up), 0, &follow_up_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)follow_up, strlen(follow_up), 0, NULL, &follow_up_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, follow_up_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, follow_up, capture.length) == 0);
 
     message_capture_destroy(&capture);
+    destroy_pair(&pair);
+}
+
+static void test_send_with_tag_raises_acknowledged_callback_with_tag(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    tag_capture capture;
+    tag_capture_init(&capture);
+    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+
+    int tag_value;
+    const char *payload = "hello";
+    uint64_t message_id;
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &tag_value, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
+
+    TEST_ASSERT(tag_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(capture.tag == &tag_value);
+
+    tag_capture_destroy(&capture);
+    destroy_pair(&pair);
+}
+
+static void test_send_with_tag_larger_than_packet_size_raises_acknowledged_callback_only_after_final_completion(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16, 0) == 0);
+
+    tag_capture capture;
+    tag_capture_init(&capture);
+    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+
+    int tag_value;
+    uint8_t payload[1000];
+    for (size_t i = 0; i < sizeof(payload); i++) {
+        payload[i] = (uint8_t)i;
+    }
+
+    uint64_t message_id;
+    TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 0, &tag_value, &message_id) == OFT_OK);
+
+    TEST_ASSERT(tag_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(capture.tag == &tag_value);
+    TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
+
+    tag_capture_destroy(&capture);
+    destroy_pair(&pair);
+}
+
+static void test_send_with_null_tag_never_raises_acknowledged_callback(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    tag_capture capture;
+    tag_capture_init(&capture);
+    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+
+    message_capture received;
+    message_capture_init(&received);
+    oft_connection_set_received_callback(pair.server_connection, on_message_capture, &received);
+
+    const char *payload = "hello";
+    uint64_t message_id;
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
+    TEST_ASSERT(message_capture_wait(&received, 10) == 0);
+
+    TEST_ASSERT(tag_capture_wait(&capture, 1) != 0);
+
+    message_capture_destroy(&received);
+    tag_capture_destroy(&capture);
+    destroy_pair(&pair);
+}
+
+static void test_cancel_before_start_with_tag_never_raises_acknowledged_callback(void) {
+    test_pair pair;
+    TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
+
+    tag_capture capture;
+    tag_capture_init(&capture);
+    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+
+    int tag_value;
+    const char *payload = "should not arrive";
+    uint64_t message_id;
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &tag_value, &message_id) == OFT_OK);
+    oft_connection_cancel(pair.client_connection, message_id);
+
+    TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_ERROR_CANCELLED);
+    TEST_ASSERT(tag_capture_wait(&capture, 1) != 0);
+
+    tag_capture_destroy(&capture);
     destroy_pair(&pair);
 }
 
@@ -754,7 +939,7 @@ static void test_send_after_close_fails(void) {
     oft_connection_close(pair.client_connection);
 
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)"x", 1, 0, &message_id) == OFT_ERROR_CLOSED);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)"x", 1, 0, NULL, &message_id) == OFT_ERROR_CLOSED);
 
     pair.client_connection = NULL; /* already closed above */
     destroy_pair(&pair);
@@ -765,7 +950,7 @@ static void test_send_negative_priority_fails(void) {
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)"x", 1, -1, &message_id) == OFT_ERROR);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)"x", 1, -1, NULL, &message_id) == OFT_ERROR);
 
     destroy_pair(&pair);
 }
@@ -855,7 +1040,7 @@ static void test_rekey_from_client(void) {
 
     const char *payload = "post-rekey";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, payload, capture.length) == 0);
@@ -876,7 +1061,7 @@ static void test_rekey_from_server(void) {
 
     const char *payload = "post-rekey-from-server";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.server_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.server_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.server_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, payload, capture.length) == 0);
@@ -919,7 +1104,7 @@ static void test_rekey_simultaneous_does_not_deadlock(void) {
 
     const char *payload = "after simultaneous rekey";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
 
@@ -939,7 +1124,7 @@ static void test_rekey_interval_automatically_rekeys(void) {
 
     const char *payload = "still here";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
 
@@ -1072,7 +1257,7 @@ static void on_immediate_reply_established(oft_listener *listener, oft_connectio
      * exists yet (see oft_connection_start_processing) - so it's flushed as the very first thing
      * once the listener starts processing this connection, immediately after this callback
      * returns: about as fast as a peer's first message could possibly arrive. */
-    oft_connection_send(connection, (const uint8_t *)"immediate", 9, 0, NULL);
+    oft_connection_send(connection, (const uint8_t *)"immediate", 9, 0, NULL, NULL);
 }
 
 static void test_connect_received_never_misses_a_message_sent_immediately(void) {
@@ -1201,7 +1386,7 @@ static void test_listener_close_does_not_affect_already_accepted_connections(voi
 
     const char *payload = "still alive";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, payload, capture.length) == 0);
@@ -1632,14 +1817,14 @@ static void test_peer_send_reuses_connection(void) {
 
     oft_connection *connection1;
     uint64_t message_id1;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"first", 5, 0, &connection1, &message_id1, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"first", 5, 0, NULL, &connection1, &message_id1, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection1, message_id1) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, "first", 5) == 0);
 
     oft_connection *connection2;
     uint64_t message_id2;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"second", 6, 0, &connection2, &message_id2, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"second", 6, 0, NULL, &connection2, &message_id2, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection2, message_id2) == OFT_OK);
 
     /* Same underlying connection returned both times: the second send reused the cached outbound
@@ -1662,7 +1847,7 @@ static void test_peer_eviction_disconnects_idle_connections(void) {
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hi", 2, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hi", 2, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
     closed_capture closed;
@@ -1749,7 +1934,7 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
     char error_buffer[256];
     oft_connection *connection_a;
     uint64_t message_id_a;
-    TEST_ASSERT(oft_peer_send(client, "127.0.0.1", port_a, (const uint8_t *)"hi", 2, 0, &connection_a, &message_id_a, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client, "127.0.0.1", port_a, (const uint8_t *)"hi", 2, 0, NULL, &connection_a, &message_id_a, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection_a, message_id_a) == OFT_OK);
 
     closed_capture closed;
@@ -1761,7 +1946,7 @@ static void test_peer_eviction_disconnects_excess_connections_beyond_max_count(v
      * both its idle timeout and max lifetime. */
     oft_connection *connection_b;
     uint64_t message_id_b;
-    TEST_ASSERT(oft_peer_send(client, "127.0.0.1", port_b, (const uint8_t *)"hi", 2, 0, &connection_b, &message_id_b, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client, "127.0.0.1", port_b, (const uint8_t *)"hi", 2, 0, NULL, &connection_b, &message_id_b, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection_b, message_id_b) == OFT_OK);
 
     /* 120 rather than 10: connection_a only becomes an eviction candidate once oft_peer's fixed,
@@ -1800,13 +1985,60 @@ static void test_peer_message_delivered_on_inbound_connection(void) {
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
     TEST_ASSERT(message_capture_wait(&received, 10) == 0);
     TEST_ASSERT(memcmp(received.data, "hello listener", 14) == 0);
 
     message_capture_destroy(&received);
+    destroy_outbound_peer(&caller);
+    destroy_listening_peer(&listening_peer);
+}
+
+static void test_peer_send_with_tag_raises_acknowledged_callback_with_identity_and_tag(void) {
+    test_listening_peer listening_peer = make_listening_peer("listener");
+    test_outbound_peer caller = make_outbound_peer("caller", 0);
+
+    peer_tag_capture capture;
+    peer_tag_capture_init(&capture);
+    oft_peer_set_acknowledged_callback(caller.peer, on_peer_acknowledged_capture, &capture);
+
+    uint16_t port = (uint16_t)oft_peer_local_port(listening_peer.peer);
+    char error_buffer[256];
+    int tag_value;
+    oft_connection *connection;
+    uint64_t message_id;
+    TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, &tag_value, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
+
+    TEST_ASSERT(peer_tag_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(capture.tag == &tag_value);
+    TEST_ASSERT(strcmp(capture.info_copy, "listener") == 0);
+
+    peer_tag_capture_destroy(&capture);
+    destroy_outbound_peer(&caller);
+    destroy_listening_peer(&listening_peer);
+}
+
+static void test_peer_send_without_tag_never_raises_acknowledged_callback(void) {
+    test_listening_peer listening_peer = make_listening_peer("listener");
+    test_outbound_peer caller = make_outbound_peer("caller", 0);
+
+    peer_tag_capture capture;
+    peer_tag_capture_init(&capture);
+    oft_peer_set_acknowledged_callback(caller.peer, on_peer_acknowledged_capture, &capture);
+
+    uint16_t port = (uint16_t)oft_peer_local_port(listening_peer.peer);
+    char error_buffer[256];
+    oft_connection *connection;
+    uint64_t message_id;
+    TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
+
+    TEST_ASSERT(peer_tag_capture_wait(&capture, 1) != 0);
+
+    peer_tag_capture_destroy(&capture);
     destroy_outbound_peer(&caller);
     destroy_listening_peer(&listening_peer);
 }
@@ -1819,7 +2051,7 @@ static void test_peer_rekey_rekeys_outbound_and_inbound_connections(void) {
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hello", 5, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hello", 5, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
     TEST_ASSERT(oft_peer_rekey(client.peer) == OFT_OK);
@@ -1831,7 +2063,7 @@ static void test_peer_rekey_rekeys_outbound_and_inbound_connections(void) {
 
     oft_connection *connection2;
     uint64_t message_id2;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"post-rekey", 10, 0, &connection2, &message_id2, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"post-rekey", 10, 0, NULL, &connection2, &message_id2, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection2, message_id2) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, "post-rekey", 10) == 0);
@@ -1857,7 +2089,7 @@ static void test_peer_drop_disconnects_outbound_and_inbound_connections(void) {
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hi", 2, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hi", 2, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
     closed_capture closed;
@@ -1881,14 +2113,14 @@ static void test_peer_drop_peer_remains_usable_afterward(void) {
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"first", 5, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"first", 5, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
     oft_peer_drop(client.peer);
 
     oft_connection *connection2;
     uint64_t message_id2;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"second", 6, 0, &connection2, &message_id2, error_buffer, sizeof(error_buffer)) == OFT_OK);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"second", 6, 0, NULL, &connection2, &message_id2, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection2, message_id2) == OFT_OK);
 
     destroy_outbound_peer(&client);
@@ -1947,7 +2179,7 @@ static void test_peer_send_to_unreachable_host_fails(void) {
     char error_buffer[256];
     oft_connection *connection;
     uint64_t message_id;
-    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hi", 2, 0, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_ERROR);
+    TEST_ASSERT(oft_peer_send(client.peer, "127.0.0.1", port, (const uint8_t *)"hi", 2, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_ERROR);
 
     destroy_outbound_peer(&client);
 }
@@ -2066,7 +2298,7 @@ static void test_trusted_connection_establishes_and_exchanges_messages(void) {
 
     const char *payload = "hello over plain tcp";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, payload, strlen(payload)) == 0);
@@ -2397,7 +2629,7 @@ static void test_secure_no_ssl_ctx_configured_connection_establishes_and_exchang
 
     const char *payload = "hello under secure mode";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, payload, strlen(payload)) == 0);
@@ -2491,7 +2723,7 @@ static void test_dual_authentication_both_sides_present_certificates_connection_
 
     const char *payload = "hello under mutual tls";
     uint64_t message_id;
-    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, &message_id) == OFT_OK);
+    TEST_ASSERT(oft_connection_send(client_connection, (const uint8_t *)payload, strlen(payload), 0, NULL, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&capture, 10) == 0);
     TEST_ASSERT(memcmp(capture.data, payload, strlen(payload)) == 0);
@@ -2622,7 +2854,7 @@ int main(void) {
     printf("Open Frame Transport - C tests\n");
 
     RUN_TEST(test_establish_exchanges_info_as_hail);
-    RUN_TEST(test_identity_server_authentication_client_sees_server_certificate_identity);
+    RUN_TEST(test_identity_server_authentication_client_sees_server_certificate);
     RUN_TEST(test_connection_validation_server_authentication_sees_identity_certificate_and_chain);
     RUN_TEST(test_connection_validation_trusted_mode_sees_no_certificate_or_chain);
     RUN_TEST(test_connection_validation_returns_zero_connect_fails);
@@ -2637,6 +2869,10 @@ int main(void) {
     RUN_TEST(test_higher_priority_interrupts_lower_priority);
     RUN_TEST(test_cancel_before_start_never_delivered);
     RUN_TEST(test_cancel_after_start_connection_stays_healthy);
+    RUN_TEST(test_send_with_tag_raises_acknowledged_callback_with_tag);
+    RUN_TEST(test_send_with_tag_larger_than_packet_size_raises_acknowledged_callback_only_after_final_completion);
+    RUN_TEST(test_send_with_null_tag_never_raises_acknowledged_callback);
+    RUN_TEST(test_cancel_before_start_with_tag_never_raises_acknowledged_callback);
     RUN_TEST(test_send_after_close_fails);
     RUN_TEST(test_send_negative_priority_fails);
     RUN_TEST(test_wait_unknown_message_id_fails);
@@ -2687,6 +2923,8 @@ int main(void) {
     RUN_TEST(test_peer_eviction_disconnects_excess_connections_beyond_max_count);
     RUN_TEST(test_peer_outbound_only_has_no_local_port);
     RUN_TEST(test_peer_message_delivered_on_inbound_connection);
+    RUN_TEST(test_peer_send_with_tag_raises_acknowledged_callback_with_identity_and_tag);
+    RUN_TEST(test_peer_send_without_tag_never_raises_acknowledged_callback);
     RUN_TEST(test_peer_rekey_rekeys_outbound_and_inbound_connections);
     RUN_TEST(test_peer_rekey_no_connections_succeeds);
     RUN_TEST(test_peer_drop_disconnects_outbound_and_inbound_connections);

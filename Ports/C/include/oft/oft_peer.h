@@ -34,29 +34,25 @@ extern "C" {
 typedef struct oft_peer oft_peer;
 
 /*
- * A message received via oft_peer_set_received_callback(): its payload plus the identity of the
- * connection it arrived on. Both are owned by this struct - a snapshot, independent of the
- * connection's own lifetime, safe to use even after that connection has disconnected - freed
- * together via oft_peer_reception_free(). Opaque; use oft_peer_reception_data()/_length()/
- * _identity() to read it.
+ * Called for every message received on any connection an oft_peer holds. `identity` is the
+ * identity of the connection it arrived on - borrowed from that connection, valid only for the
+ * duration of this call; do not retain the pointer. `data` is heap-allocated and owned by the
+ * callee: it must be free()d when no longer needed.
  */
-typedef struct oft_peer_reception oft_peer_reception;
+typedef void (*oft_peer_received_callback)(const oft_identity *identity, uint8_t *data, size_t length, void *user_data);
 
-/* Called for every message received on any connection an oft_peer holds. */
-typedef void (*oft_peer_received_callback)(oft_peer_reception *reception, void *user_data);
-
-/* reception's payload. Borrowed; valid until reception is freed. */
-const uint8_t *oft_peer_reception_data(const oft_peer_reception *reception);
-
-/* The length in bytes of reception's payload. */
-size_t oft_peer_reception_length(const oft_peer_reception *reception);
-
-/* The identity of the connection reception arrived on. Borrowed; valid until reception is freed. */
-const oft_identity *oft_peer_reception_identity(const oft_peer_reception *reception);
-
-/* Frees reception and everything it owns (its payload and identity, including any certificate
- * identity carried by its identity field). Safe to call with NULL. */
-void oft_peer_reception_free(oft_peer_reception *reception);
+/*
+ * Called when data sent via oft_peer_send() with a non-NULL `tag` has been fully delivered and
+ * acknowledged on the connection it was sent on (see oft_acknowledged_callback's own documentation,
+ * in oft.h, for exactly when). `identity` is that connection's identity - borrowed, valid only for
+ * the duration of this call; do not retain the pointer. `tag` is the same pointer passed to
+ * oft_peer_send(). Never raised for a send with a NULL tag.
+ *
+ * Same non-buffering caveat as oft_acknowledged_callback: this can only ever be raised in response
+ * to the caller's own oft_peer_send() call, so there is no message-loss race to guard against by
+ * assigning it beforehand.
+ */
+typedef void (*oft_peer_acknowledged_callback)(const oft_identity *identity, void *tag, void *user_data);
 
 typedef struct {
     /* Opaque, application-controlled data sent to every peer in this side's hail. Copied. */
@@ -160,13 +156,25 @@ int oft_peer_local_port(oft_peer *peer);
 void oft_peer_set_received_callback(oft_peer *peer, oft_peer_received_callback callback, void *user_data);
 
 /*
+ * Assigns the (single) callback invoked whenever data sent via oft_peer_send() with a non-NULL tag
+ * has been fully delivered and acknowledged, replacing any previously assigned one. Pass NULL to
+ * clear it. Not safe to call concurrently with itself. Not buffered - see
+ * oft_peer_acknowledged_callback's own documentation for why that's safe.
+ */
+void oft_peer_set_acknowledged_callback(oft_peer *peer, oft_peer_acknowledged_callback callback, void *user_data);
+
+/*
  * Sends a message to host:port, reusing a cached connection if one already exists, or creating and
  * caching a new one otherwise. On success, writes the message id to *out_message_id (usable with
  * oft_connection_wait()/oft_connection_cancel() on *out_connection, if given) and returns OFT_OK.
  * Returns OFT_ERROR on failure (with a message written to error_buffer, if given). out_connection
  * may be NULL if the caller doesn't need it.
+ *
+ * `tag` is an opaque, application-controlled value attached to this send, referenced later via the
+ * callback assigned with oft_peer_set_acknowledged_callback() once this specific message has been
+ * fully delivered and acknowledged - see oft_connection_send()'s own documentation for `tag`.
  */
-int oft_peer_send(oft_peer *peer, const char *host, uint16_t port, const uint8_t *data, size_t length, int priority,
+int oft_peer_send(oft_peer *peer, const char *host, uint16_t port, const uint8_t *data, size_t length, int priority, void *tag,
                    oft_connection **out_connection, uint64_t *out_message_id, char *error_buffer, size_t error_buffer_size);
 
 /*

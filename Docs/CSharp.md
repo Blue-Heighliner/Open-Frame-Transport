@@ -28,19 +28,23 @@ covers the C#-specific API in detail, with examples.
   `IOftPeerFactory.Create` — a peer has no client/server delineation, so use `DualAuthentication`
   instead.
 - `IOftConnection.Identity` — an `OftIdentity` record describing the connection's remote side:
-  `EndPoint`, `Certificate` (an `OftCertificateIdentity?`, present only if the remote side presented a
-  TLS certificate), and `Info` (the opaque hail data).
-- `OftCertificateIdentity` — `Name`/`Issuer` (the Common Name of a certificate's subject/issuer) and
-  `AlternativeNames`, extracted from an `X509Certificate2` via `OftCertificateIdentity.FromCertificate`.
-- `IOftPeerReception` — the type delivered to `IOftPeer.ReceivedHandler`: `Data` (the message payload)
-  and `Identity` (the sending connection's `OftIdentity`), backed by pooled memory the callback must
-  dispose.
-- `IOftConnection.ReceivedHandler`/`.DisconnectedHandler`, `IOftListener.ConnectedHandler`,
-  `IOftPeer.ReceivedHandler` — single-slot `Action<T>` properties assigned directly (no handler-object
-  interface to implement), one per notification kind. Assigning a new value (including `null`) always
-  replaces any previous one, and each notification kind is assigned independently of the others.
-  `IOftPeer` has no `DisconnectedHandler`/`ConnectedHandler` of its own — see its own type doc comment
-  for why.
+  `EndPoint`, `Certificate` (an `X509Certificate2?`, present only if the remote side presented a TLS
+  certificate), and `Info` (the opaque hail data).
+- `IOftConnection.ReceivedHandler`/`.DisconnectedHandler`/`.AcknowledgedHandler`,
+  `IOftListener.ConnectedHandler`, `IOftPeer.ReceivedHandler`/`.AcknowledgedHandler` — single-slot
+  `Action<T>` properties assigned directly (no handler-object interface to implement), one per
+  notification kind. Assigning a new value (including `null`) always replaces any previous one, and
+  each notification kind is assigned independently of the others. `IOftPeer` has no
+  `DisconnectedHandler`/`ConnectedHandler` of its own — see its own type doc comment for why.
+  `IOftPeer.ReceivedHandler` is `Action<OftIdentity, IMemoryOwner<byte>>` — the sending connection's
+  identity plus the same pooled payload `IOftConnection.ReceivedHandler` delivers, which the callback
+  must dispose.
+- `Send`'s `tag` parameter — an optional, application-controlled `object?` (default `null`) attached to
+  a send, referenced later via `AcknowledgedHandler`: once that message is fully delivered and
+  acknowledged (a `Receipt` for its `Unit` packet, or for its final `Completion` packet if split — see
+  [OFT.md §4](OFT.md#4-packets)), `AcknowledgedHandler` is raised with the tag (`IOftConnection`) or the
+  identity and tag (`IOftPeer`). A `null` tag never raises `AcknowledgedHandler`, and neither does a
+  cancelled send.
 - `IOftConnection`/`IOftListener`/`IOftPeer` implement `IDisposable`, not `IAsyncDisposable`:
   `Dispose()` immediately terminates whatever it's called on and releases its resources, without
   waiting for any background work to finish. Each has its own separate `async` method for a graceful,
@@ -100,9 +104,8 @@ Console.WriteLine($"Hail info: {identity.Info}");
 
 if (identity.Certificate is { } certificate)
 {
-    Console.WriteLine($"Certificate subject CN: {certificate.Name}");
-    Console.WriteLine($"Certificate issuer CN: {certificate.Issuer}");
-    Console.WriteLine($"Certificate SANs: {string.Join(", ", certificate.AlternativeNames)}");
+    Console.WriteLine($"Certificate subject: {certificate.SubjectName.Name}");
+    Console.WriteLine($"Certificate issuer: {certificate.IssuerName.Name}");
 }
 ```
 
@@ -123,12 +126,12 @@ IOftPeer peer = peerFactory.Create(new OftPeerOptions
     SecurityMode = OftSecurityMode.Secure,
 });
 
-peer.ReceivedHandler = reception =>
+peer.ReceivedHandler = (identity, data) =>
 {
-    using (reception)
+    using (data)
     {
-        string text = Encoding.UTF8.GetString(reception.Data.Span);
-        Console.WriteLine($"Received from {reception.Identity.EndPoint}: {text}");
+        string text = Encoding.UTF8.GetString(data.Memory.Span);
+        Console.WriteLine($"Received from {identity.EndPoint}: {text}");
     }
 };
 
@@ -141,12 +144,11 @@ await peer.Send("127.0.0.1", 5001, Encoding.UTF8.GetBytes("hello"), priority: 0)
 peer.Dispose();
 ```
 
-`IOftPeer.ReceivedHandler` delivers an `IOftPeerReception` — its `Identity` (an `OftIdentity`) is only
-for identifying which connection a message arrived on, e.g. to decide how to respond via `Send`; a
-peer deliberately exposes no other way to enumerate, look up, or be notified about the individual
-connections it holds (there is no `IOftPeer.DisconnectedHandler`/`ConnectedHandler`): connection
-lifecycle is the peer's own implementation detail, transparently managed (reconnecting, evicting,
-etc.) behind `Send`.
+`IOftPeer.ReceivedHandler`'s `OftIdentity` argument is only for identifying which connection a message
+arrived on, e.g. to decide how to respond via `Send`; a peer deliberately exposes no other way to
+enumerate, look up, or be notified about the individual connections it holds (there is no
+`IOftPeer.DisconnectedHandler`/`ConnectedHandler`): connection lifecycle is the peer's own
+implementation detail, transparently managed (reconnecting, evicting, etc.) behind `Send`.
 
 ## Sending with pooled memory
 
@@ -177,10 +179,9 @@ connection.ReceivedHandler = data =>
 };
 ```
 
-`IOftPeer.ReceivedHandler` delivers the same pooled memory wrapped in an `IOftPeerReception` instead
-(see the peer-to-peer example above) — its `Data` property exposes the payload, and disposing the
-`IOftPeerReception` itself (rather than `Data` directly, which has no `Dispose` of its own) returns the
-underlying memory to its pool.
+`IOftPeer.ReceivedHandler` delivers the same pooled memory directly, as its own `IMemoryOwner<byte>`
+argument alongside the sending connection's `OftIdentity` (see the peer-to-peer example above) —
+disposing it returns the underlying memory to its pool exactly like `IOftConnection.ReceivedHandler`.
 
 ## Disposal vs. graceful teardown
 

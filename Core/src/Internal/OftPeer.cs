@@ -17,7 +17,16 @@ internal sealed class OftPeer : IOftPeer
     private readonly List<IOftConnection> inboundConnections = [];
     private readonly object inboundLock = new();
 
-    private readonly OftBufferedHandlerSlot<Action<IOftPeerReception>> receivedSlot = new();
+    private readonly OftBufferedHandlerSlot<Action<OftIdentity, IMemoryOwner<byte>>> receivedSlot = new();
+
+    /// <summary>
+    /// Deliberately a plain field, not an <see cref="OftBufferedHandlerSlot{TDelegate}"/> like
+    /// <see cref="receivedSlot"/>: this can only ever be raised in response to a
+    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/> call
+    /// the caller itself makes - there is nothing for it to race against, since the caller fully
+    /// controls when that first happens and can simply assign this beforehand if it cares.
+    /// </summary>
+    private Action<OftIdentity, object>? acknowledgedHandler;
 
     /// <summary>
     /// How long a connection must have had no pending data (see
@@ -94,10 +103,17 @@ internal sealed class OftPeer : IOftPeer
     }
 
     /// <inheritdoc />
-    public Action<IOftPeerReception>? ReceivedHandler
+    public Action<OftIdentity, IMemoryOwner<byte>>? ReceivedHandler
     {
         get => this.receivedSlot.Handler;
         set => this.receivedSlot.Handler = value;
+    }
+
+    /// <inheritdoc />
+    public Action<OftIdentity, object>? AcknowledgedHandler
+    {
+        get => this.acknowledgedHandler;
+        set => this.acknowledgedHandler = value;
     }
 
     /// <inheritdoc />
@@ -145,7 +161,7 @@ internal sealed class OftPeer : IOftPeer
     }
 
     /// <inheritdoc />
-    public async Task Send(string host, int port, ReadOnlyMemory<byte> data, int priority = 0, CancellationToken cancellationToken = default)
+    public async Task Send(string host, int port, ReadOnlyMemory<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default)
     {
         if (this.disconnected)
         {
@@ -153,11 +169,11 @@ internal sealed class OftPeer : IOftPeer
         }
 
         IOftConnection connection = await this.GetOrCreateConnection(host, port, cancellationToken).ConfigureAwait(false);
-        await connection.Send(data, priority, cancellationToken).ConfigureAwait(false);
+        await connection.Send(data, priority, tag, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
-    public async Task Send(string host, int port, IMemoryOwner<byte> data, int priority = 0, CancellationToken cancellationToken = default)
+    public async Task Send(string host, int port, IMemoryOwner<byte> data, int priority = 0, object? tag = null, CancellationToken cancellationToken = default)
     {
         if (this.disconnected)
         {
@@ -165,7 +181,7 @@ internal sealed class OftPeer : IOftPeer
         }
 
         IOftConnection connection = await this.GetOrCreateConnection(host, port, cancellationToken).ConfigureAwait(false);
-        await connection.Send(data, priority, cancellationToken).ConfigureAwait(false);
+        await connection.Send(data, priority, tag, cancellationToken).ConfigureAwait(false);
     }
 
     /// <inheritdoc />
@@ -323,20 +339,18 @@ internal sealed class OftPeer : IOftPeer
     }
 
     /// <summary>
-    /// Forwards a tracked connection's received messages to this peer's own
-    /// <see cref="ReceivedHandler"/>, and runs <paramref name="onDisconnectedTrackingCleanup"/> when
-    /// it disconnects to untrack it (from <see cref="outboundConnections"/> or
-    /// <see cref="inboundConnections"/> as appropriate) — this peer has no external disconnected
-    /// notification of its own to forward to (see <see cref="IOftPeer.ReceivedHandler"/>'s own doc
-    /// comment for why).
+    /// Forwards a tracked connection's received messages and acknowledgements to this peer's own
+    /// <see cref="ReceivedHandler"/>/<see cref="AcknowledgedHandler"/>, and runs
+    /// <paramref name="onDisconnectedTrackingCleanup"/> when it disconnects to untrack it (from
+    /// <see cref="outboundConnections"/> or <see cref="inboundConnections"/> as appropriate) — this
+    /// peer has no external disconnected notification of its own to forward to (see
+    /// <see cref="IOftPeer.ReceivedHandler"/>'s own doc comment for why).
     /// </summary>
     private void TrackConnection(IOftConnection connection, Action<IOftConnection> onDisconnectedTrackingCleanup)
     {
         connection.ReceivedHandler = data =>
-        {
-            OftPeerReception reception = new(data, connection.Identity);
-            this.receivedSlot.Raise(callback => callback(reception), discardedDisposable: reception);
-        };
+            this.receivedSlot.Raise(callback => callback(connection.Identity, data), discardedDisposable: data);
+        connection.AcknowledgedHandler = tag => this.acknowledgedHandler?.Invoke(connection.Identity, tag);
         connection.DisconnectedHandler = _ =>
         {
             onDisconnectedTrackingCleanup(connection);

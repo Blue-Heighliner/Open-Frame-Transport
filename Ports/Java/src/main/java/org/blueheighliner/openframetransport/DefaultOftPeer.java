@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -37,7 +38,16 @@ final class DefaultOftPeer implements OftPeer {
 
     private final Map<HostPort, OftConnection> outboundConnections = new ConcurrentHashMap<>();
     private final Set<OftConnection> inboundConnections = ConcurrentHashMap.newKeySet();
-    private final BufferedHandlerSlot<Consumer<OftPeerReception>> receivedSlot = new BufferedHandlerSlot<>();
+    private final BufferedHandlerSlot<BiConsumer<OftIdentity, byte[]>> receivedSlot = new BufferedHandlerSlot<>();
+
+    /**
+     * Deliberately a plain field, not a {@link BufferedHandlerSlot} like {@link #receivedSlot}: this
+     * can only ever be raised in response to a {@link #send} call the caller itself makes - there is
+     * nothing for it to race against, since the caller fully controls when that first happens and can
+     * simply assign this beforehand if it cares (see
+     * {@link OftConnection#setAcknowledgedHandler}'s own doc comment for the full reasoning).
+     */
+    private volatile BiConsumer<OftIdentity, Object> acknowledgedHandler;
 
     /**
      * How long a connection must have had no pending data (see
@@ -120,13 +130,23 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     @Override
-    public void setReceivedHandler(Consumer<OftPeerReception> handler) {
+    public void setReceivedHandler(BiConsumer<OftIdentity, byte[]> handler) {
         this.receivedSlot.setHandler(handler);
     }
 
     @Override
-    public Consumer<OftPeerReception> getReceivedHandler() {
+    public BiConsumer<OftIdentity, byte[]> getReceivedHandler() {
         return this.receivedSlot.getHandler();
+    }
+
+    @Override
+    public void setAcknowledgedHandler(BiConsumer<OftIdentity, Object> handler) {
+        this.acknowledgedHandler = handler;
+    }
+
+    @Override
+    public BiConsumer<OftIdentity, Object> getAcknowledgedHandler() {
+        return this.acknowledgedHandler;
     }
 
     @Override
@@ -163,13 +183,13 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     @Override
-    public OftSendHandle send(String host, int port, byte[] data, int priority) throws IOException {
+    public OftSendHandle send(String host, int port, byte[] data, int priority, Object tag) throws IOException {
         if (this.disposed) {
             throw new OftDisconnectedException("This peer is no longer connected.");
         }
 
         OftConnection connection = getOrConnect(host, port);
-        return connection.send(data, priority);
+        return connection.send(data, priority, tag);
     }
 
     @Override
@@ -242,15 +262,22 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     /**
-     * Forwards a tracked connection's received messages to this peer's own
-     * {@link #receivedSlot}, and runs {@code onDisconnectedTrackingCleanup} when it disconnects to
-     * untrack it (from {@link #outboundConnections} or {@link #inboundConnections} as appropriate)
-     * - this peer has no external disconnected notification of its own to forward to (see
+     * Forwards a tracked connection's received messages and acknowledgements to this peer's own
+     * {@link #receivedSlot}/{@link #acknowledgedHandler}, and runs
+     * {@code onDisconnectedTrackingCleanup} when it disconnects to untrack it (from
+     * {@link #outboundConnections} or {@link #inboundConnections} as appropriate) - this peer has no
+     * external disconnected notification of its own to forward to (see
      * {@link OftPeer#setReceivedHandler}'s own doc comment for why).
      */
     private void trackConnection(OftConnection connection, Consumer<OftConnection> onDisconnectedTrackingCleanup) {
         connection.setReceivedHandler(data -> this.receivedSlot.raise(
-                handler -> handler.accept(new DefaultOftPeerReception(data, connection.getIdentity()))));
+                handler -> handler.accept(connection.getIdentity(), data)));
+        connection.setAcknowledgedHandler(tag -> {
+            BiConsumer<OftIdentity, Object> handler = this.acknowledgedHandler;
+            if (handler != null) {
+                handler.accept(connection.getIdentity(), tag);
+            }
+        });
         connection.setDisconnectedHandler(exception -> {
             onDisconnectedTrackingCleanup.accept(connection);
             this.pendingDataClearedAt.remove(connection);
