@@ -10,6 +10,21 @@
     <NoWarn>$(NoWarn);CS1591</NoWarn>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <PackageId>BlueHeighliner.OpenFrameTransport</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Chris Markwardt</Authors>
+    <Description>C# reference implementation of the Open Frame Transport (OFT) protocol: a framed, prioritized, TLS 1.3 messaging protocol over TCP.</Description>
+    <PackageTags>oft;networking;tls;protocol</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/Blue-Heighliner/Open-Frame-Transport</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/Blue-Heighliner/Open-Frame-Transport</PackageProjectUrl>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <GeneratePackageOnBuild Condition="'$(Configuration)' == 'Release'">true</GeneratePackageOnBuild>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="BouncyCastle.Cryptography" Version="2.6.2" />
     <PackageReference Include="Google.Protobuf" Version="3.35.1" />
@@ -23,6 +38,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="OpenFrameTransport.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="\" />
   </ItemGroup>
 
 </Project>

@@ -2,6 +2,7 @@
 name = "oft"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem"] }

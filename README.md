@@ -1,5 +1,12 @@
 # Open Frame Transport (OFT)
 
+[![NuGet](https://img.shields.io/nuget/v/BlueHeighliner.OpenFrameTransport.svg?label=NuGet)](https://www.nuget.org/packages/BlueHeighliner.OpenFrameTransport)
+[![License: MIT](https://img.shields.io/github/license/Blue-Heighliner/Open-Frame-Transport.svg)](LICENSE)
+[![C#](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/csharp.yml/badge.svg)](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/csharp.yml)
+[![Java](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/java.yml/badge.svg)](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/java.yml)
+[![C](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/c.yml/badge.svg)](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/c.yml)
+[![Rust](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/rust.yml/badge.svg)](https://github.com/Blue-Heighliner/Open-Frame-Transport/actions/workflows/rust.yml)
+
 Open Frame Transport (OFT) is an application-layer protocol that runs on top of TCP and TLS. It
 provides:
 
@@ -223,3 +230,7 @@ configuration, cancellation, rekeying, memory ownership, and more.
 
 See [`AGENTS.md`](AGENTS.md) for the coding conventions used throughout the implementation,
 including the policy that all ports' APIs stay aligned as much as practical.
+
+## License
+
+[MIT](LICENSE)

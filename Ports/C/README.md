@@ -59,3 +59,7 @@ The library-error and live-socket-I/O-failure paths in `oft_frame.c` (mid-stream
 `SSL_write` failures) are the main remaining gap: they'd need fault injection into an established
 TLS session to reach deterministically, which isn't worth the complexity relative to the coverage
 gained.
+
+## License
+
+[MIT](LICENSE)

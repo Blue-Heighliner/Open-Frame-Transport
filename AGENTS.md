@@ -86,3 +86,18 @@ describes.
   ```
 
   `coverlet.runsettings` excludes generated protobuf code from coverage, since it isn't hand-written.
+
+## Packaging
+
+- `Core/OpenFrameTransport.csproj` carries the NuGet package metadata (`PackageId`, `Version`,
+  description, etc.) for the C# reference implementation. A Release build produces the package
+  automatically:
+
+  ```
+  dotnet build Core/OpenFrameTransport.csproj -c Release
+  ```
+
+  The resulting `.nupkg`/`.snupkg` land in `Core/bin/Release/`. `dotnet pack -c Release` works
+  the same way if you only want the package without a full build. `Version` is not currently tied
+  to any automated versioning scheme (e.g. git tags) — bump it by hand in the csproj before
+  publishing a new release.

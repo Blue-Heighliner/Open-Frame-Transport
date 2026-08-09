@@ -11,6 +11,14 @@
   <name>Open Frame Transport - Java</name>
   <description>Java implementation of the Open Frame Transport (OFT) protocol. See README.md.</description>
 
+  <licenses>
+    <license>
+      <name>MIT License</name>
+      <url>https://github.com/Blue-Heighliner/Open-Frame-Transport/blob/main/LICENSE</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
   <properties>
     <maven.compiler.source>17</maven.compiler.source>
     <maven.compiler.target>17</maven.compiler.target>
