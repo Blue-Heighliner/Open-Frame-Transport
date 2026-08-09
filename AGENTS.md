@@ -61,13 +61,17 @@ describes.
 
 ## Other-language ports
 
-- [`Ports/Java`](Ports/Java/) and [`Ports/C`](Ports/C/) are independent implementations of the same
-  protocol. Their `OftServer`/`OftClient`/`OftPeer` APIs should align with the C# reference
-  implementation (and each other) as much as is practical: same method names and semantics, same
-  option/property shapes, adapted only where the target language's idioms genuinely require it
-  (e.g. events vs. listener interfaces vs. callbacks, `Task`/`CompletableFuture`/blocking calls,
-  `record`/Java `record`/plain `struct`). When one language's API changes, check whether the same
-  change should be mirrored in the other two before considering the change complete.
+- [`Ports/Java`](Ports/Java/), [`Ports/C`](Ports/C/), and [`Ports/Rust`](Ports/Rust/) are
+  independent implementations of the same protocol. Their `OftServer`/`OftClient`/`OftPeer` APIs
+  should align with the C# reference implementation (and each other) as much as is practical: same
+  method names and semantics, same option/property shapes, adapted only where the target
+  language's idioms genuinely require it (e.g. events vs. listener interfaces vs. callbacks,
+  `Task`/`CompletableFuture`/blocking calls, `record`/Java `record`/plain `struct`). When one
+  language's API changes, check whether the same change should be mirrored in the other ports
+  before considering the change complete. One deliberate exception: Rust's `Connection` uses a
+  single background I/O thread instead of the 2-4 separate threads the other ports use, since
+  `rustls::Connection` isn't safely readable/writable from multiple threads at once - see
+  [Docs/Rust.md](Docs/Rust.md#concurrency-model).
 
 ## Testing
 

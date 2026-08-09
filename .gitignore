@@ -1,6 +1,18 @@
+# C#
 bin/
 obj/
 *.user
 .vs/
 .vscode/
 TestResults/
+
+# Rust (also covers Java's Maven output, which defaults to the same directory name)
+target/
+
+# C
+Ports/C/build/
+Ports/C/build_cov/
+*.o
+*.gcov
+*.gcda
+*.gcno

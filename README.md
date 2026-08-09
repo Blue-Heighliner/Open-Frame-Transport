@@ -26,8 +26,9 @@ components: **[Docs/Architecture.md](Docs/Architecture.md)**.
 | C# (.NET) — reference implementation | [`Core/`](Core) | [Docs/CSharp.md](Docs/CSharp.md) |
 | Java | [`Ports/Java/`](Ports/Java) | [Docs/Java.md](Docs/Java.md) |
 | C | [`Ports/C/`](Ports/C) | [Docs/C.md](Docs/C.md) |
+| Rust | [`Ports/Rust/`](Ports/Rust) | [Docs/Rust.md](Docs/Rust.md) |
 
-All three implement the same wire protocol and the same three-component API shape (a connector, a
+All four implement the same wire protocol and the same three-component API shape (a connector, a
 hoster/listener, and a peer-to-peer convenience layer), verified against each other via real
 loopback TCP/TLS tests. Each is idiomatic to its language — see
 [Docs/Architecture.md](Docs/Architecture.md) for a full breakdown of what's shared and what's
@@ -48,17 +49,17 @@ An Avalonia sample app demonstrating peer-to-peer messaging with simulated netwo
    reuses it afterward. Messages from every connection the peer holds, inbound or outbound, arrive
    through one callback assigned on the peer itself.
 
-All three ports use the same shape: a connection has an independent, single-slot callback for
+All four ports use the same shape: a connection has an independent, single-slot callback for
 received messages and one for disconnection; a listener has one for newly accepted connections; a
 peer has one for messages received on any connection it holds (identifying which one) — a plain
 `Action<T>` property in C#, a `set*Handler(Consumer<T>)` method in Java, a `oft_*_set_*_callback()`
-function taking a function pointer in C. Assigning a new callback always replaces any previous one,
-so exactly one recipient is ever notified of a given message, and each notification kind is assigned
-independently of the others. A peer deliberately has no disconnected or connected callback of its
-own — connection lifecycle is its own implementation detail, transparently managed behind its send
-method.
+function taking a function pointer in C, a `set_*_handler(Option<Arc<dyn Fn(...)>>)` method in Rust.
+Assigning a new callback always replaces any previous one, so exactly one recipient is ever notified
+of a given message, and each notification kind is assigned independently of the others. A peer
+deliberately has no disconnected or connected callback of its own — connection lifecycle is its own
+implementation detail, transparently managed behind its send method.
 
-**Note:** all three ports buffer anything raised before a connection/listener/peer's first callback
+**Note:** all four ports buffer anything raised before a connection/listener/peer's first callback
 is assigned, so assigning one (received, disconnected, or connected) any time after getting a
 connection or listener is always safe, even if a peer replies the instant a connection is up. See
 [Docs/Architecture.md](Docs/Architecture.md#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
@@ -172,18 +173,53 @@ uint64_t message_id;
 oft_peer_send(peer, "127.0.0.1", 5001, (const uint8_t *)"hello", 5, 0, NULL, NULL, &message_id, error_buffer, sizeof(error_buffer));
 ```
 
-See [Docs/CSharp.md](Docs/CSharp.md), [Docs/Java.md](Docs/Java.md), and [Docs/C.md](Docs/C.md) for
-more detail on each of these examples, plus security-mode configuration, cancellation, rekeying,
-memory ownership, and more.
+### Rust
+
+#### Client/server
+
+```rust
+use oft::{connect, host};
+use std::sync::Arc;
+
+// Server
+let listener = host("0.0.0.0", 5000, None)?;
+listener.set_connected_handler(Some(Arc::new(|connection: oft::Connection| {
+    connection.set_received_handler(Some(Arc::new(|data: Vec<u8>| println!("{}", String::from_utf8_lossy(&data)))));
+})));
+
+// Client
+let connection = connect("127.0.0.1", 5000, None)?;
+connection.send(b"hello".to_vec(), 0, None).wait()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+#### Peer-to-peer
+
+```rust
+use oft::Peer;
+use std::sync::Arc;
+
+let peer = Peer::new(None)?;
+peer.set_received_handler(Some(Arc::new(|identity: oft::Identity, data: Vec<u8>| println!("{}", String::from_utf8_lossy(&data)))));
+
+peer.listen("0.0.0.0", 5001)?; // optional: also accept inbound connections
+peer.send("127.0.0.1", 5001, b"hello".to_vec(), 0, None)?.wait()?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+See [Docs/CSharp.md](Docs/CSharp.md), [Docs/Java.md](Docs/Java.md), [Docs/C.md](Docs/C.md), and
+[Docs/Rust.md](Docs/Rust.md) for more detail on each of these examples, plus security-mode
+configuration, cancellation, rekeying, memory ownership, and more.
 
 ## Repository layout
 
 - [`Core/`](Core) — C# reference implementation.
-- [`Ports/Java/`](Ports/Java), [`Ports/C/`](Ports/C) — Java and C ports.
+- [`Ports/Java/`](Ports/Java), [`Ports/C/`](Ports/C), [`Ports/Rust/`](Ports/Rust) — Java, C, and
+  Rust ports.
 - [`Sample/`](Sample) — Avalonia peer-to-peer sample app (C#).
 - [`Tests/`](Tests) — C# test suite; each port also has its own tests (`Ports/Java/src/test`,
-  `Ports/C/tests`).
+  `Ports/C/tests`, `Ports/Rust/tests`).
 - [`Docs/`](Docs) — protocol specification, architecture, and per-language API reference.
 
 See [`AGENTS.md`](AGENTS.md) for the coding conventions used throughout the implementation,
-including the policy that all three ports' APIs stay aligned as much as practical.
+including the policy that all ports' APIs stay aligned as much as practical.
