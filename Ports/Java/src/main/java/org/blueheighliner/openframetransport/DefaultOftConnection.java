@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
 /**
@@ -126,7 +127,7 @@ final class DefaultOftConnection implements OftConnection {
      * nothing for it to race against, since the caller fully controls when that first happens and can
      * simply assign this beforehand if it cares.
      */
-    private volatile Consumer<Object> acknowledgedHandler;
+    private volatile BiConsumer<Object, OftDeliveryStatus> deliveryStatusHandler;
 
     private DefaultOftConnection(
             Socket rawSocket,
@@ -459,13 +460,13 @@ final class DefaultOftConnection implements OftConnection {
     }
 
     @Override
-    public void setAcknowledgedHandler(Consumer<Object> handler) {
-        this.acknowledgedHandler = handler;
+    public void setDeliveryStatusHandler(BiConsumer<Object, OftDeliveryStatus> handler) {
+        this.deliveryStatusHandler = handler;
     }
 
     @Override
-    public Consumer<Object> getAcknowledgedHandler() {
-        return this.acknowledgedHandler;
+    public BiConsumer<Object, OftDeliveryStatus> getDeliveryStatusHandler() {
+        return this.deliveryStatusHandler;
     }
 
     @Override
@@ -601,6 +602,13 @@ final class DefaultOftConnection implements OftConnection {
         try {
             while (!this.closed.get()) {
                 this.sendSignal.acquire();
+                raiseQueuedForNewMessages();
+
+                // Tracks the message the previous iteration of this inner loop sent a packet for, so
+                // a change in which message gets picked (other than that message finishing) can be
+                // recognized as a priority interruption (see README.md &sect;6) rather than ordinary
+                // packet-by-packet progress on the same message.
+                PendingMessage previousMessage = null;
 
                 while (true) {
                     PendingMessage message;
@@ -612,9 +620,23 @@ final class DefaultOftConnection implements OftConnection {
                         break;
                     }
 
+                    if (previousMessage != null && previousMessage != message) {
+                        previousMessage.wasInterrupted = true;
+                        raiseDeliveryStatus(previousMessage, OftDeliveryStatus.INTERRUPTED);
+                    }
+
+                    if (!message.started) {
+                        raiseDeliveryStatus(message, OftDeliveryStatus.SENDING);
+                    } else if (message.wasInterrupted) {
+                        message.wasInterrupted = false;
+                        raiseDeliveryStatus(message, OftDeliveryStatus.RESUMED);
+                    }
+
                     this.writePermit.acquire();
-                    sendNextPacket(message);
+                    boolean finished = sendNextPacket(message);
                     this.writePermit.release();
+
+                    previousMessage = finished ? null : message;
                 }
             }
         } catch (InterruptedException e) {
@@ -636,11 +658,53 @@ final class DefaultOftConnection implements OftConnection {
         return null;
     }
 
-    private void sendNextPacket(PendingMessage message) throws IOException, InterruptedException {
+    /**
+     * Raises {@link OftDeliveryStatus#QUEUED} for every tagged message enqueued since the last time
+     * this ran, regardless of priority - so a low-priority message stuck behind higher-priority
+     * traffic still gets its {@link OftDeliveryStatus#QUEUED} promptly, rather than only once it's
+     * actually its turn to send (see {@link OftDeliveryStatus}'s own doc comment on why
+     * {@link OftDeliveryStatus#QUEUED} is distinct from {@link OftDeliveryStatus#SENDING}).
+     */
+    private void raiseQueuedForNewMessages() {
+        List<PendingMessage> newlyQueued = null;
+        synchronized (this.outboundLock) {
+            for (Deque<PendingMessage> queue : this.outboundQueues.values()) {
+                for (PendingMessage message : queue) {
+                    if (!message.queuedRaised) {
+                        message.queuedRaised = true;
+                        if (newlyQueued == null) {
+                            newlyQueued = new ArrayList<>();
+                        }
+
+                        newlyQueued.add(message);
+                    }
+                }
+            }
+        }
+
+        if (newlyQueued != null) {
+            for (PendingMessage message : newlyQueued) {
+                raiseDeliveryStatus(message, OftDeliveryStatus.QUEUED);
+            }
+        }
+    }
+
+    private void raiseDeliveryStatus(PendingMessage message, OftDeliveryStatus status) {
+        if (message.tag != null) {
+            BiConsumer<Object, OftDeliveryStatus> handler = this.deliveryStatusHandler;
+            if (handler != null) {
+                handler.accept(message.tag, status);
+            }
+        }
+    }
+
+    /** @return {@code true} if this was the message's last packet (sent or cancelled) */
+    private boolean sendNextPacket(PendingMessage message) throws IOException, InterruptedException {
         Packet packet;
         boolean finishesMessage;
+        boolean isCancellationPacket = message.cancelRequested && message.started;
 
-        if (message.cancelRequested && message.started) {
+        if (isCancellationPacket) {
             packet = Packet.newBuilder().setControl(1).setData(ByteString.EMPTY).build();
             finishesMessage = true;
         } else if (!message.started && message.data.length <= this.maxPacketDataSize) {
@@ -667,6 +731,10 @@ final class DefaultOftConnection implements OftConnection {
         this.frameStream.write(packet);
         this.lastSentAtMillis.set(System.currentTimeMillis());
 
+        if (finishesMessage && !isCancellationPacket) {
+            raiseDeliveryStatus(message, OftDeliveryStatus.SENT);
+        }
+
         try {
             receiptFuture.get();
         } catch (ExecutionException e) {
@@ -680,17 +748,14 @@ final class DefaultOftConnection implements OftConnection {
 
             if (message.cancelRequested) {
                 message.future.completeExceptionally(new CancellationException("Message was cancelled."));
+                raiseDeliveryStatus(message, OftDeliveryStatus.CANCELLED);
             } else {
                 message.future.complete(null);
-
-                if (message.tag != null) {
-                    Consumer<Object> handler = this.acknowledgedHandler;
-                    if (handler != null) {
-                        handler.accept(message.tag);
-                    }
-                }
+                raiseDeliveryStatus(message, OftDeliveryStatus.ACKNOWLEDGED);
             }
         }
+
+        return finishesMessage;
     }
 
     private void requestCancellation(PendingMessage message) {
@@ -699,6 +764,7 @@ final class DefaultOftConnection implements OftConnection {
                 Deque<PendingMessage> queue = this.outboundQueues.get(message.priority);
                 if (queue != null && queue.remove(message)) {
                     message.future.completeExceptionally(new CancellationException("Message was cancelled."));
+                    raiseDeliveryStatus(message, OftDeliveryStatus.CANCELLED);
                     return;
                 }
             }
@@ -848,13 +914,23 @@ final class DefaultOftConnection implements OftConnection {
         final byte[] data;
         final int priority;
 
-        /** The opaque tag this send was queued with, or {@code null} if it wasn't (see {@link #acknowledgedHandler}). */
+        /** The opaque tag this send was queued with, or {@code null} if it wasn't (see {@link #deliveryStatusHandler}). */
         final Object tag;
 
         final CompletableFuture<Void> future;
         volatile boolean cancelRequested;
         volatile boolean started;
         int bytesSent;
+
+        /** Whether {@link OftDeliveryStatus#QUEUED} has already been raised for this message. */
+        boolean queuedRaised;
+
+        /**
+         * Whether this message was preempted by a higher-priority send since it last sent a packet -
+         * set when {@link OftDeliveryStatus#INTERRUPTED} is raised, cleared (after raising
+         * {@link OftDeliveryStatus#RESUMED}) once it's picked to send again.
+         */
+        boolean wasInterrupted;
 
         PendingMessage(byte[] data, int priority, Object tag, CompletableFuture<Void> future) {
             this.data = data;

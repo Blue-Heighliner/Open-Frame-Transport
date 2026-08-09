@@ -105,97 +105,89 @@ static int message_capture_wait(message_capture *capture, int timeout_seconds) {
     return received && !timed_out ? 0 : -1;
 }
 
+/*
+ * Records every status a tagged send passes through (see enum oft_delivery_status). Shared between
+ * connection-level and peer-level tests: oft_delivery_status_callback and
+ * oft_peer_delivery_status_callback are the exact same underlying function pointer type now that
+ * the peer-level callback no longer carries an identity (see oft_peer.h), so one capture type and
+ * one callback function serve both.
+ */
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t cond;
     void *tag;
-    int raised;
-} tag_capture;
+    enum oft_delivery_status statuses[16];
+    size_t status_count;
+} delivery_status_capture;
 
-static void tag_capture_init(tag_capture *capture) {
+static void delivery_status_capture_init(delivery_status_capture *capture) {
     pthread_mutex_init(&capture->mutex, NULL);
     pthread_cond_init(&capture->cond, NULL);
     capture->tag = NULL;
-    capture->raised = 0;
+    capture->status_count = 0;
 }
 
-static void tag_capture_destroy(tag_capture *capture) {
+static void delivery_status_capture_destroy(delivery_status_capture *capture) {
     pthread_mutex_destroy(&capture->mutex);
     pthread_cond_destroy(&capture->cond);
 }
 
-static void on_acknowledged_capture(void *tag, void *user_data) {
-    tag_capture *capture = user_data;
+static void on_delivery_status_capture(void *tag, enum oft_delivery_status status, void *user_data) {
+    delivery_status_capture *capture = user_data;
     pthread_mutex_lock(&capture->mutex);
     capture->tag = tag;
-    capture->raised = 1;
+    if (capture->status_count < sizeof(capture->statuses) / sizeof(capture->statuses[0])) {
+        capture->statuses[capture->status_count++] = status;
+    }
     pthread_cond_broadcast(&capture->cond);
     pthread_mutex_unlock(&capture->mutex);
 }
 
-static int tag_capture_wait(tag_capture *capture, int timeout_seconds) {
+/* Blocks until `target` has been raised at least once, or times out. */
+static int delivery_status_capture_wait_for(delivery_status_capture *capture, enum oft_delivery_status target, int timeout_seconds) {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += timeout_seconds;
 
     pthread_mutex_lock(&capture->mutex);
     int timed_out = 0;
-    while (!capture->raised && !timed_out) {
+    int found = 0;
+    while (!found && !timed_out) {
+        for (size_t i = 0; i < capture->status_count; i++) {
+            if (capture->statuses[i] == target) {
+                found = 1;
+                break;
+            }
+        }
+
+        if (found) {
+            break;
+        }
+
         if (pthread_cond_timedwait(&capture->cond, &capture->mutex, &deadline) != 0) {
             timed_out = 1;
         }
     }
-    int raised = capture->raised;
     pthread_mutex_unlock(&capture->mutex);
-    return raised && !timed_out ? 0 : -1;
+    return found && !timed_out ? 0 : -1;
 }
 
-typedef struct {
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    void *tag;
-    char info_copy[64];
-    int raised;
-} peer_tag_capture;
-
-static void peer_tag_capture_init(peer_tag_capture *capture) {
-    pthread_mutex_init(&capture->mutex, NULL);
-    pthread_cond_init(&capture->cond, NULL);
-    capture->tag = NULL;
-    capture->info_copy[0] = '\0';
-    capture->raised = 0;
-}
-
-static void peer_tag_capture_destroy(peer_tag_capture *capture) {
-    pthread_mutex_destroy(&capture->mutex);
-    pthread_cond_destroy(&capture->cond);
-}
-
-static void on_peer_acknowledged_capture(const oft_identity *identity, void *tag, void *user_data) {
-    peer_tag_capture *capture = user_data;
-    pthread_mutex_lock(&capture->mutex);
-    capture->tag = tag;
-    strncpy(capture->info_copy, identity->info ? identity->info : "", sizeof(capture->info_copy) - 1);
-    capture->raised = 1;
-    pthread_cond_broadcast(&capture->cond);
-    pthread_mutex_unlock(&capture->mutex);
-}
-
-static int peer_tag_capture_wait(peer_tag_capture *capture, int timeout_seconds) {
+/* Blocks for up to timeout_seconds, then reports whether anything was ever raised - used by the
+ * "never raises" tests, which want to wait out a window rather than stop at the first event. */
+static int delivery_status_capture_wait_none_raised(delivery_status_capture *capture, int timeout_seconds) {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += timeout_seconds;
 
     pthread_mutex_lock(&capture->mutex);
-    int timed_out = 0;
-    while (!capture->raised && !timed_out) {
+    while (capture->status_count == 0) {
         if (pthread_cond_timedwait(&capture->cond, &capture->mutex, &deadline) != 0) {
-            timed_out = 1;
+            break;
         }
     }
-    int raised = capture->raised;
+    size_t status_count = capture->status_count;
     pthread_mutex_unlock(&capture->mutex);
-    return raised && !timed_out ? 0 : -1;
+    return status_count == 0 ? 0 : -1;
 }
 
 #define MAX_ORDERED_MESSAGES 16
@@ -840,13 +832,13 @@ static void test_cancel_after_start_connection_stays_healthy(void) {
     destroy_pair(&pair);
 }
 
-static void test_send_with_tag_raises_acknowledged_callback_with_tag(void) {
+static void test_send_with_tag_raises_delivery_status_callback_ending_in_acknowledged(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    tag_capture capture;
-    tag_capture_init(&capture);
-    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+    delivery_status_capture capture;
+    delivery_status_capture_init(&capture);
+    oft_connection_set_delivery_status_callback(pair.client_connection, on_delivery_status_capture, &capture);
 
     int tag_value;
     const char *payload = "hello";
@@ -854,20 +846,25 @@ static void test_send_with_tag_raises_acknowledged_callback_with_tag(void) {
     TEST_ASSERT(oft_connection_send(pair.client_connection, (const uint8_t *)payload, strlen(payload), 0, &tag_value, &message_id) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
-    TEST_ASSERT(tag_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(delivery_status_capture_wait_for(&capture, OFT_DELIVERY_STATUS_ACKNOWLEDGED, 10) == 0);
     TEST_ASSERT(capture.tag == &tag_value);
+    TEST_ASSERT(capture.status_count == 4);
+    TEST_ASSERT(capture.statuses[0] == OFT_DELIVERY_STATUS_QUEUED);
+    TEST_ASSERT(capture.statuses[1] == OFT_DELIVERY_STATUS_SENDING);
+    TEST_ASSERT(capture.statuses[2] == OFT_DELIVERY_STATUS_SENT);
+    TEST_ASSERT(capture.statuses[3] == OFT_DELIVERY_STATUS_ACKNOWLEDGED);
 
-    tag_capture_destroy(&capture);
+    delivery_status_capture_destroy(&capture);
     destroy_pair(&pair);
 }
 
-static void test_send_with_tag_larger_than_packet_size_raises_acknowledged_callback_only_after_final_completion(void) {
+static void test_send_with_tag_larger_than_packet_size_raises_acknowledged_only_after_final_completion(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16, 0) == 0);
 
-    tag_capture capture;
-    tag_capture_init(&capture);
-    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+    delivery_status_capture capture;
+    delivery_status_capture_init(&capture);
+    oft_connection_set_delivery_status_callback(pair.client_connection, on_delivery_status_capture, &capture);
 
     int tag_value;
     uint8_t payload[1000];
@@ -878,21 +875,21 @@ static void test_send_with_tag_larger_than_packet_size_raises_acknowledged_callb
     uint64_t message_id;
     TEST_ASSERT(oft_connection_send(pair.client_connection, payload, sizeof(payload), 0, &tag_value, &message_id) == OFT_OK);
 
-    TEST_ASSERT(tag_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(delivery_status_capture_wait_for(&capture, OFT_DELIVERY_STATUS_ACKNOWLEDGED, 10) == 0);
     TEST_ASSERT(capture.tag == &tag_value);
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
 
-    tag_capture_destroy(&capture);
+    delivery_status_capture_destroy(&capture);
     destroy_pair(&pair);
 }
 
-static void test_send_with_null_tag_never_raises_acknowledged_callback(void) {
+static void test_send_with_null_tag_never_raises_delivery_status_callback(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    tag_capture capture;
-    tag_capture_init(&capture);
-    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+    delivery_status_capture capture;
+    delivery_status_capture_init(&capture);
+    oft_connection_set_delivery_status_callback(pair.client_connection, on_delivery_status_capture, &capture);
 
     message_capture received;
     message_capture_init(&received);
@@ -904,20 +901,20 @@ static void test_send_with_null_tag_never_raises_acknowledged_callback(void) {
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_OK);
     TEST_ASSERT(message_capture_wait(&received, 10) == 0);
 
-    TEST_ASSERT(tag_capture_wait(&capture, 1) != 0);
+    TEST_ASSERT(delivery_status_capture_wait_none_raised(&capture, 1) == 0);
 
     message_capture_destroy(&received);
-    tag_capture_destroy(&capture);
+    delivery_status_capture_destroy(&capture);
     destroy_pair(&pair);
 }
 
-static void test_cancel_before_start_with_tag_never_raises_acknowledged_callback(void) {
+static void test_cancel_before_start_with_tag_raises_only_cancelled(void) {
     test_pair pair;
     TEST_ASSERT(establish_pair(&pair, 16384, 0) == 0);
 
-    tag_capture capture;
-    tag_capture_init(&capture);
-    oft_connection_set_acknowledged_callback(pair.client_connection, on_acknowledged_capture, &capture);
+    delivery_status_capture capture;
+    delivery_status_capture_init(&capture);
+    oft_connection_set_delivery_status_callback(pair.client_connection, on_delivery_status_capture, &capture);
 
     int tag_value;
     const char *payload = "should not arrive";
@@ -926,9 +923,11 @@ static void test_cancel_before_start_with_tag_never_raises_acknowledged_callback
     oft_connection_cancel(pair.client_connection, message_id);
 
     TEST_ASSERT(oft_connection_wait(pair.client_connection, message_id) == OFT_ERROR_CANCELLED);
-    TEST_ASSERT(tag_capture_wait(&capture, 1) != 0);
+    TEST_ASSERT(delivery_status_capture_wait_for(&capture, OFT_DELIVERY_STATUS_CANCELLED, 10) == 0);
+    TEST_ASSERT(capture.status_count == 1);
+    TEST_ASSERT(capture.statuses[0] == OFT_DELIVERY_STATUS_CANCELLED);
 
-    tag_capture_destroy(&capture);
+    delivery_status_capture_destroy(&capture);
     destroy_pair(&pair);
 }
 
@@ -1996,13 +1995,13 @@ static void test_peer_message_delivered_on_inbound_connection(void) {
     destroy_listening_peer(&listening_peer);
 }
 
-static void test_peer_send_with_tag_raises_acknowledged_callback_with_identity_and_tag(void) {
+static void test_peer_send_with_tag_raises_delivery_status_callback_with_tag(void) {
     test_listening_peer listening_peer = make_listening_peer("listener");
     test_outbound_peer caller = make_outbound_peer("caller", 0);
 
-    peer_tag_capture capture;
-    peer_tag_capture_init(&capture);
-    oft_peer_set_acknowledged_callback(caller.peer, on_peer_acknowledged_capture, &capture);
+    delivery_status_capture capture;
+    delivery_status_capture_init(&capture);
+    oft_peer_set_delivery_status_callback(caller.peer, on_delivery_status_capture, &capture);
 
     uint16_t port = (uint16_t)oft_peer_local_port(listening_peer.peer);
     char error_buffer[256];
@@ -2012,22 +2011,21 @@ static void test_peer_send_with_tag_raises_acknowledged_callback_with_identity_a
     TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, &tag_value, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
-    TEST_ASSERT(peer_tag_capture_wait(&capture, 10) == 0);
+    TEST_ASSERT(delivery_status_capture_wait_for(&capture, OFT_DELIVERY_STATUS_ACKNOWLEDGED, 10) == 0);
     TEST_ASSERT(capture.tag == &tag_value);
-    TEST_ASSERT(strcmp(capture.info_copy, "listener") == 0);
 
-    peer_tag_capture_destroy(&capture);
+    delivery_status_capture_destroy(&capture);
     destroy_outbound_peer(&caller);
     destroy_listening_peer(&listening_peer);
 }
 
-static void test_peer_send_without_tag_never_raises_acknowledged_callback(void) {
+static void test_peer_send_without_tag_never_raises_delivery_status_callback(void) {
     test_listening_peer listening_peer = make_listening_peer("listener");
     test_outbound_peer caller = make_outbound_peer("caller", 0);
 
-    peer_tag_capture capture;
-    peer_tag_capture_init(&capture);
-    oft_peer_set_acknowledged_callback(caller.peer, on_peer_acknowledged_capture, &capture);
+    delivery_status_capture capture;
+    delivery_status_capture_init(&capture);
+    oft_peer_set_delivery_status_callback(caller.peer, on_delivery_status_capture, &capture);
 
     uint16_t port = (uint16_t)oft_peer_local_port(listening_peer.peer);
     char error_buffer[256];
@@ -2036,9 +2034,9 @@ static void test_peer_send_without_tag_never_raises_acknowledged_callback(void) 
     TEST_ASSERT(oft_peer_send(caller.peer, "127.0.0.1", port, (const uint8_t *)"hello listener", 14, 0, NULL, &connection, &message_id, error_buffer, sizeof(error_buffer)) == OFT_OK);
     TEST_ASSERT(oft_connection_wait(connection, message_id) == OFT_OK);
 
-    TEST_ASSERT(peer_tag_capture_wait(&capture, 1) != 0);
+    TEST_ASSERT(delivery_status_capture_wait_none_raised(&capture, 1) == 0);
 
-    peer_tag_capture_destroy(&capture);
+    delivery_status_capture_destroy(&capture);
     destroy_outbound_peer(&caller);
     destroy_listening_peer(&listening_peer);
 }
@@ -2869,10 +2867,10 @@ int main(void) {
     RUN_TEST(test_higher_priority_interrupts_lower_priority);
     RUN_TEST(test_cancel_before_start_never_delivered);
     RUN_TEST(test_cancel_after_start_connection_stays_healthy);
-    RUN_TEST(test_send_with_tag_raises_acknowledged_callback_with_tag);
-    RUN_TEST(test_send_with_tag_larger_than_packet_size_raises_acknowledged_callback_only_after_final_completion);
-    RUN_TEST(test_send_with_null_tag_never_raises_acknowledged_callback);
-    RUN_TEST(test_cancel_before_start_with_tag_never_raises_acknowledged_callback);
+    RUN_TEST(test_send_with_tag_raises_delivery_status_callback_ending_in_acknowledged);
+    RUN_TEST(test_send_with_tag_larger_than_packet_size_raises_acknowledged_only_after_final_completion);
+    RUN_TEST(test_send_with_null_tag_never_raises_delivery_status_callback);
+    RUN_TEST(test_cancel_before_start_with_tag_raises_only_cancelled);
     RUN_TEST(test_send_after_close_fails);
     RUN_TEST(test_send_negative_priority_fails);
     RUN_TEST(test_wait_unknown_message_id_fails);
@@ -2923,8 +2921,8 @@ int main(void) {
     RUN_TEST(test_peer_eviction_disconnects_excess_connections_beyond_max_count);
     RUN_TEST(test_peer_outbound_only_has_no_local_port);
     RUN_TEST(test_peer_message_delivered_on_inbound_connection);
-    RUN_TEST(test_peer_send_with_tag_raises_acknowledged_callback_with_identity_and_tag);
-    RUN_TEST(test_peer_send_without_tag_never_raises_acknowledged_callback);
+    RUN_TEST(test_peer_send_with_tag_raises_delivery_status_callback_with_tag);
+    RUN_TEST(test_peer_send_without_tag_never_raises_delivery_status_callback);
     RUN_TEST(test_peer_rekey_rekeys_outbound_and_inbound_connections);
     RUN_TEST(test_peer_rekey_no_connections_succeeds);
     RUN_TEST(test_peer_drop_disconnects_outbound_and_inbound_connections);

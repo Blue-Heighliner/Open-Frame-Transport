@@ -1,5 +1,5 @@
 use crate::buffered_slot::BufferedSlot;
-use crate::connection::{Connection, Tag};
+use crate::connection::{Connection, DeliveryStatus, Tag};
 use crate::connector::connect;
 use crate::error::OftError;
 use crate::identity::Identity;
@@ -44,7 +44,7 @@ struct Shared {
     inbound: Mutex<Vec<Arc<TrackedConnection>>>,
     listener: Mutex<Option<Listener>>,
     received_slot: BufferedSlot<(Identity, Vec<u8>)>,
-    acknowledged_handler: Mutex<Option<Arc<dyn Fn(Identity, Tag) + Send + Sync>>>,
+    delivery_status_handler: Mutex<Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>>,
     closed: AtomicBool,
     eviction_stop: Arc<(Mutex<bool>, Condvar)>,
     eviction_thread: Mutex<Option<JoinHandle<()>>>,
@@ -85,7 +85,7 @@ impl Peer {
             inbound: Mutex::new(Vec::new()),
             listener: Mutex::new(None),
             received_slot: BufferedSlot::new(),
-            acknowledged_handler: Mutex::new(None),
+            delivery_status_handler: Mutex::new(None),
             closed: AtomicBool::new(false),
             eviction_stop: Arc::new((Mutex::new(false), Condvar::new())),
             eviction_thread: Mutex::new(None),
@@ -124,10 +124,14 @@ impl Peer {
     }
 
     /// Assigns the (single) callback invoked whenever data sent via `send()` with a `Some(tag)`
-    /// has been fully delivered and acknowledged on the connection it was sent on. Not buffered -
-    /// see `Connection::set_acknowledged_handler`'s own documentation for why that's safe.
-    pub fn set_acknowledged_handler(&self, handler: Option<Arc<dyn Fn(Identity, Tag) + Send + Sync>>) {
-        *self.shared.acknowledged_handler.lock().unwrap() = handler;
+    /// changes delivery status on the connection it was sent on (see `DeliveryStatus` for the full
+    /// lifecycle), with a reference to that same tag and its new status - deliberately without
+    /// identifying which connection it was sent over, unlike `set_received_handler`: the caller
+    /// already knows, since it's the same caller that made the `send()` call this is reporting on.
+    /// Not buffered - see `Connection::set_delivery_status_handler`'s own documentation for why
+    /// that's safe.
+    pub fn set_delivery_status_handler(&self, handler: Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>) {
+        *self.shared.delivery_status_handler.lock().unwrap() = handler;
     }
 
     /// Starts listening for inbound connections on `bind_host:bind_port`. A peer that never calls
@@ -167,8 +171,7 @@ impl Peer {
 
     /// Sends a message to `host:port`, reusing a cached connection if one already exists, or
     /// creating and caching a new one otherwise. `tag`, if present, is referenced later via
-    /// `acknowledged_handler` once this specific message has been fully delivered and
-    /// acknowledged.
+    /// `delivery_status_handler` as this send passes through each `DeliveryStatus`.
     pub fn send(&self, host_: &str, port: u16, data: Vec<u8>, priority: u32, tag: Option<Tag>) -> Result<SendHandle, OftError> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(OftError::Disconnected);
@@ -277,11 +280,10 @@ fn wire_tracking(shared: &Arc<Shared>, tracked: Arc<TrackedConnection>) {
         received_shared.received_slot.raise((received_identity.clone(), data));
     })));
 
-    let ack_shared = shared.clone();
-    let ack_identity = identity.clone();
-    tracked.connection.set_acknowledged_handler(Some(Arc::new(move |tag| {
-        if let Some(handler) = ack_shared.acknowledged_handler.lock().unwrap().as_ref() {
-            handler(ack_identity.clone(), tag);
+    let delivery_status_shared = shared.clone();
+    tracked.connection.set_delivery_status_handler(Some(Arc::new(move |tag, status| {
+        if let Some(handler) = delivery_status_shared.delivery_status_handler.lock().unwrap().as_ref() {
+            handler(tag, status);
         }
     })));
 

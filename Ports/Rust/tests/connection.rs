@@ -141,29 +141,97 @@ fn cancel_before_start_never_delivered() {
 }
 
 #[test]
-fn send_with_tag_raises_acknowledged_handler() {
+fn send_with_tag_raises_delivery_status_handler_ending_in_acknowledged() {
     let pair = establish(trusted_options());
     let (tx, rx) = mpsc::channel();
-    pair.client.set_acknowledged_handler(Some(Arc::new(move |tag: oft::Tag| {
-        let tag = tag.downcast::<u32>().unwrap();
-        tx.send(*tag).unwrap();
+    let statuses: Arc<std::sync::Mutex<Vec<oft::DeliveryStatus>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let statuses_for_handler = statuses.clone();
+    pair.client.set_delivery_status_handler(Some(Arc::new(move |tag: &oft::Tag, status| {
+        statuses_for_handler.lock().unwrap().push(status);
+        if status == oft::DeliveryStatus::Acknowledged {
+            let tag = tag.downcast_ref::<u32>().unwrap();
+            tx.send(*tag).unwrap();
+        }
     })));
 
     pair.client.send(b"hi".to_vec(), 0, Some(Box::new(42u32))).wait().unwrap();
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 42u32);
+    assert_eq!(
+        statuses.lock().unwrap().clone(),
+        vec![oft::DeliveryStatus::Queued, oft::DeliveryStatus::Sending, oft::DeliveryStatus::Sent, oft::DeliveryStatus::Acknowledged]
+    );
     pair.close();
 }
 
 #[test]
-fn send_without_tag_never_raises_acknowledged_handler() {
+fn send_without_tag_never_raises_delivery_status_handler() {
     let pair = establish(trusted_options());
     let raised = Arc::new(AtomicBool::new(false));
     let raised_for_handler = raised.clone();
-    pair.client.set_acknowledged_handler(Some(Arc::new(move |_tag| raised_for_handler.store(true, Ordering::SeqCst))));
+    pair.client.set_delivery_status_handler(Some(Arc::new(move |_tag, _status| raised_for_handler.store(true, Ordering::SeqCst))));
 
     pair.client.send(b"hi".to_vec(), 0, None).wait().unwrap();
     std::thread::sleep(Duration::from_millis(200));
     assert!(!raised.load(Ordering::SeqCst));
+    pair.close();
+}
+
+#[test]
+fn cancel_before_start_with_tag_raises_only_cancelled() {
+    let pair = establish(trusted_options());
+    let statuses: Arc<std::sync::Mutex<Vec<oft::DeliveryStatus>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let statuses_for_handler = statuses.clone();
+    pair.client.set_delivery_status_handler(Some(Arc::new(move |_tag, status| statuses_for_handler.lock().unwrap().push(status))));
+
+    // A blocker occupies the connection's one in-flight turn (Docs/OFT.md §4.1) so the cancelled
+    // send is guaranteed to still be sitting unstarted in the queue when `cancel()` runs.
+    let blocker = pair.client.send(vec![0u8; 100_000], 5, None);
+    let handle = pair.client.send(b"should not arrive".to_vec(), 0, Some(Box::new(1u32)));
+    handle.cancel();
+
+    assert_eq!(handle.wait(), Err(oft::SendFailure::Cancelled));
+    blocker.wait().unwrap();
+
+    // Unlike C#/Java/C, Rust's `send()`/`cancel()` both just enqueue work onto the connection's
+    // single I/O thread rather than mutating a shared queue synchronously on the calling thread -
+    // so `Queued` has always already been raised (from that I/O thread, per its own doc comment)
+    // by the time the cancel request is processed, even though the two calls happen back-to-back
+    // here with no delay in between.
+    assert_eq!(statuses.lock().unwrap().clone(), vec![oft::DeliveryStatus::Queued, oft::DeliveryStatus::Cancelled]);
+    pair.close();
+}
+
+#[test]
+fn higher_priority_interrupts_lower_priority_raises_interrupted_and_resumed() {
+    let pair = establish(ConnectionOptions {
+        max_packet_data_size: 8,
+        ..trusted_options()
+    });
+
+    let statuses: Arc<std::sync::Mutex<Vec<oft::DeliveryStatus>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let statuses_for_handler = statuses.clone();
+    pair.client.set_delivery_status_handler(Some(Arc::new(move |_tag, status| statuses_for_handler.lock().unwrap().push(status))));
+
+    // Large enough that it's still only partway sent (not yet finished) once the higher-priority
+    // message is queued below - otherwise there'd be nothing left to interrupt.
+    let low_handle = pair.client.send(vec![b'a'; 200_000], 0, Some(Box::new(1u32)));
+
+    // Longer than the connection's own I/O thread's read-timeout cap (100ms - see
+    // `connection.rs`'s `READ_TIMEOUT_CAP`): that thread's very first loop iteration blocks in a
+    // read with no data yet to return, for up to that long, before it ever drains its work queue
+    // for the first time - a shorter sleep here risks both sends landing in that very first drain
+    // batch together, in which case the higher-priority one would simply go first with nothing to
+    // interrupt, rather than genuinely preempting an already-started low-priority send.
+    std::thread::sleep(Duration::from_millis(150));
+    let high_handle = pair.client.send(vec![b'b'; 8], 5, None);
+
+    low_handle.wait().unwrap();
+    high_handle.wait().unwrap();
+
+    let recorded = statuses.lock().unwrap().clone();
+    assert!(recorded.contains(&oft::DeliveryStatus::Interrupted));
+    assert!(recorded.contains(&oft::DeliveryStatus::Resumed));
+    assert_eq!(*recorded.last().unwrap(), oft::DeliveryStatus::Acknowledged);
     pair.close();
 }
 
@@ -235,3 +303,4 @@ fn secure_pair_helper_smoke() {
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), b"over-tls");
     pair.close();
 }
+

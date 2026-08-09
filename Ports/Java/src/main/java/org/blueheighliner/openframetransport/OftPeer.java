@@ -84,19 +84,21 @@ public interface OftPeer extends AutoCloseable {
     BiConsumer<OftIdentity, byte[]> getReceivedHandler();
 
     /**
-     * Called whenever a message sent with a non-null {@code tag} (see {@link #send}) has been fully
-     * delivered and acknowledged (see {@link OftConnection#setAcknowledgedHandler}), with the identity
-     * of the connection it was sent over and that same tag. Never called for a message sent with a
-     * {@code null} tag, or for one that was cancelled rather than delivered. {@code null} if no
+     * Called whenever a message sent with a non-null {@code tag} (see {@link #send}) changes
+     * delivery status (see {@link OftDeliveryStatus} for the full lifecycle), with that same tag and
+     * its new status - deliberately without identifying which connection it was sent over, unlike
+     * {@link #setReceivedHandler}: the caller already knows, since it's the same caller that made
+     * the {@link #send} call this is reporting on. Called multiple times per send, once per status
+     * it passes through. Never called for a message sent with a {@code null} tag. {@code null} if no
      * callback is currently assigned. There is only ever one callback at a time - assigning a new
      * value here always replaces any previous one. Unlike {@link #setReceivedHandler}, this does
      * <em>not</em> buffer a raise that happens before a callback is ever assigned - see
-     * {@link OftConnection#setAcknowledgedHandler}'s own doc comment for why that's safe.
+     * {@link OftConnection#setDeliveryStatusHandler}'s own doc comment for why that's safe.
      */
-    void setAcknowledgedHandler(BiConsumer<OftIdentity, Object> handler);
+    void setDeliveryStatusHandler(BiConsumer<Object, OftDeliveryStatus> handler);
 
-    /** The callback currently assigned via {@link #setAcknowledgedHandler}, or {@code null} if none is. */
-    BiConsumer<OftIdentity, Object> getAcknowledgedHandler();
+    /** The callback currently assigned via {@link #setDeliveryStatusHandler}, or {@code null} if none is. */
+    BiConsumer<Object, OftDeliveryStatus> getDeliveryStatusHandler();
 
     /**
      * Starts listening for inbound connections. A peer that never calls this only ever makes
@@ -133,10 +135,9 @@ public interface OftPeer extends AutoCloseable {
      * @param data     the message payload
      * @param priority the priority to send the message at (see README.md &sect;5-&sect;6)
      * @param tag      an opaque, application-controlled value attached to this send, so it can be
-     *                 referenced later - passed back to {@link #setAcknowledgedHandler}'s callback,
-     *                 along with the identity of the connection it was sent over, once this message is
-     *                 fully delivered and acknowledged, if non-null; {@code null} means this send
-     *                 never raises it
+     *                 referenced later - passed back to {@link #setDeliveryStatusHandler}'s callback,
+     *                 along with each status this send passes through (see {@link OftDeliveryStatus}),
+     *                 if non-null; {@code null} means this send never raises it
      * @return a handle that can be used to wait for delivery or cancel the message
      * @throws OftDisconnectedException {@link #isConnected()} is {@code false}
      */

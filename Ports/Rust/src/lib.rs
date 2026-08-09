@@ -18,7 +18,7 @@ mod send_handle;
 mod stream;
 mod wire;
 
-pub use connection::{Connection, Tag};
+pub use connection::{Connection, DeliveryStatus, Tag};
 pub use connector::connect;
 pub use error::OftError;
 pub use identity::Identity;

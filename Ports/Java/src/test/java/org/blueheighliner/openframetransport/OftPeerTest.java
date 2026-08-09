@@ -184,39 +184,38 @@ final class OftPeerTest {
     }
 
     @Test
-    void send_withTag_raisesAcknowledgedHandlerWithIdentityAndTag() throws Exception {
+    void send_withTag_raisesDeliveryStatusHandlerWithTagEndingInAcknowledged() throws Exception {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
             OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
             Object tag = new Object();
-            CompletableFuture<OftIdentity> acknowledgedIdentity = new CompletableFuture<>();
             CompletableFuture<Object> acknowledgedTag = new CompletableFuture<>();
-            caller.setAcknowledgedHandler((identity, receivedTag) -> {
-                acknowledgedIdentity.complete(identity);
-                acknowledgedTag.complete(receivedTag);
+            caller.setDeliveryStatusHandler((receivedTag, status) -> {
+                if (status == OftDeliveryStatus.ACKNOWLEDGED) {
+                    acknowledgedTag.complete(receivedTag);
+                }
             });
 
             int port = listeningPeer.getLocalEndpoint().getPort();
             caller.send("127.0.0.1", port, "hello listener".getBytes(), 0, tag).completion().get(10, TimeUnit.SECONDS);
 
             assertTrue(tag == acknowledgedTag.get(10, TimeUnit.SECONDS));
-            assertEquals("listener", acknowledgedIdentity.get(10, TimeUnit.SECONDS).info());
         }
     }
 
     @Test
-    void send_withoutTag_neverRaisesAcknowledgedHandler() throws Exception {
+    void send_withoutTag_neverRaisesDeliveryStatusHandler() throws Exception {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
             OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
-            java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
-            caller.setAcknowledgedHandler((identity, tag) -> acknowledgedHandlerRaised.set(true));
+            java.util.concurrent.atomic.AtomicBoolean deliveryStatusHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
+            caller.setDeliveryStatusHandler((tag, status) -> deliveryStatusHandlerRaised.set(true));
 
             int port = listeningPeer.getLocalEndpoint().getPort();
             caller.send("127.0.0.1", port, "hello listener".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             Thread.sleep(200);
-            assertFalse(acknowledgedHandlerRaised.get());
+            assertFalse(deliveryStatusHandlerRaised.get());
         }
     }
 

@@ -25,8 +25,50 @@ const CONTROL_RECEIPT: u32 = 2;
 const CONTROL_UNIT: u32 = 3;
 
 /// An opaque, application-controlled value attached to a `send()`, referenced later via
-/// `acknowledged_handler` once that message is fully delivered and acknowledged.
+/// `delivery_status_handler` each time that message's delivery status changes.
 pub type Tag = Box<dyn std::any::Any + Send>;
+
+/// A lifecycle stage of a tagged send, reported via `Connection::set_delivery_status_handler`/
+/// `Peer::set_delivery_status_handler`. Every tagged send passes through `Queued`, `Sending`, then
+/// either `Cancelled` or `Sent` followed by `Acknowledged`; `Interrupted`/`Resumed` pairs may occur
+/// any number of times in between `Sending` and `Sent`, for a multi-packet send that a
+/// higher-priority send preempts (see `Docs/OFT.md` §6) - a single-packet send can never be
+/// interrupted, since there is nothing between its first and only packet for another send to
+/// interleave with. `Cancelled` can only occur before `Sent`: once a send's final packet has
+/// actually been written, cancelling it can no longer prevent delivery, so it always proceeds to
+/// `Sent`/`Acknowledged` instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    /// The send has been queued and is waiting its turn - reported once `send()` returns, not
+    /// necessarily synchronously before it does.
+    Queued,
+    /// The send's first packet has started transmitting.
+    Sending,
+    /// A higher-priority send has preempted this one before it finished (see `Docs/OFT.md` §6); it
+    /// remains queued and eventually resumes.
+    Interrupted,
+    /// Transmission has resumed after an `Interrupted` preemption.
+    Resumed,
+    /// The send's final packet has been written, but not yet acknowledged.
+    Sent,
+    /// The send's final packet has been acknowledged (a `Receipt` - see `Docs/OFT.md` §4.1): the
+    /// send is now fully delivered. This is the terminal status for a send that isn't cancelled.
+    Acknowledged,
+    /// The send was cancelled (see `Docs/OFT.md` §7) before its final packet was written. This is
+    /// the terminal status for a cancelled send.
+    Cancelled,
+}
+
+/// Raises `status` on `shared`'s delivery-status handler with `tag`, if `tag` is `Some`. A free
+/// function rather than an `Engine` method so it can be called with a `&PendingMessage` borrowed
+/// from `Engine::in_progress` without conflicting with a concurrent `&Engine` borrow.
+fn raise_delivery_status(shared: &Shared, tag: &Option<Tag>, status: DeliveryStatus) {
+    if let Some(tag) = tag {
+        if let Some(handler) = shared.delivery_status_handler.lock().unwrap().as_ref() {
+            handler(tag, status);
+        }
+    }
+}
 
 enum Work {
     Send {
@@ -49,6 +91,10 @@ struct PendingMessage {
     started: bool,
     bytes_sent: usize,
     cancel_requested: bool,
+    /// Whether this message was preempted by a higher-priority send since it last sent a packet -
+    /// set when `DeliveryStatus::Interrupted` is raised, cleared (after raising
+    /// `DeliveryStatus::Resumed`) once it's picked to send again.
+    was_interrupted: bool,
 }
 
 pub(crate) struct Shared {
@@ -58,7 +104,7 @@ pub(crate) struct Shared {
     last_received_at: Mutex<SystemTime>,
     received_slot: BufferedSlot<Vec<u8>>,
     disconnected_slot: BufferedSlot<Option<String>>,
-    acknowledged_handler: Mutex<Option<Arc<dyn Fn(Tag) + Send + Sync>>>,
+    delivery_status_handler: Mutex<Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>>,
     closed: AtomicBool,
     has_pending_data: AtomicBool,
     work_tx: Mutex<Option<Sender<Work>>>,
@@ -111,15 +157,18 @@ impl Connection {
     }
 
     /// Assigns the (single) callback invoked whenever data sent via `send()` with a `Some(tag)`
-    /// has been fully delivered and acknowledged. Deliberately *not* buffered, unlike
-    /// `received_handler`/`disconnected_handler` - see `Docs/Architecture.md`'s own note on why
-    /// that's safe (it can only ever be triggered by the caller's own `send()` call).
-    pub fn set_acknowledged_handler(&self, handler: Option<Arc<dyn Fn(Tag) + Send + Sync>>) {
-        *self.shared.acknowledged_handler.lock().unwrap() = handler;
+    /// changes delivery status (see `DeliveryStatus` for the full lifecycle), with a reference to
+    /// that same tag and its new status. Called multiple times per send, once per status it passes
+    /// through. Deliberately *not* buffered, unlike `received_handler`/`disconnected_handler` - see
+    /// `Docs/Architecture.md`'s own note on why that's safe (it can only ever be triggered by the
+    /// caller's own `send()` call).
+    pub fn set_delivery_status_handler(&self, handler: Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>) {
+        *self.shared.delivery_status_handler.lock().unwrap() = handler;
     }
 
     /// Sends `data` at the given `priority` (see `Docs/OFT.md` §5-§7). `tag`, if present, is
-    /// handed back via `acknowledged_handler` once fully delivered and acknowledged.
+    /// handed back via `delivery_status_handler` as this send passes through each
+    /// `DeliveryStatus`.
     pub fn send(&self, data: Vec<u8>, priority: u32, tag: Option<Tag>) -> SendHandle {
         let completion = Completion::new();
         if self.shared.closed.load(Ordering::SeqCst) {
@@ -209,7 +258,7 @@ pub(crate) fn spawn(stream: Stream, identity: Identity, max_packet_data_size: us
         last_received_at: Mutex::new(now),
         received_slot: BufferedSlot::new(),
         disconnected_slot: BufferedSlot::new(),
-        acknowledged_handler: Mutex::new(None),
+        delivery_status_handler: Mutex::new(None),
         closed: AtomicBool::new(false),
         has_pending_data: AtomicBool::new(false),
         work_tx: Mutex::new(Some(work_tx)),
@@ -234,6 +283,7 @@ pub(crate) fn spawn(stream: Stream, identity: Identity, max_packet_data_size: us
             outstanding_turn: false,
             queue: VecDeque::new(),
             in_progress: HashMap::new(),
+            previous_send: None,
             inbound_channels: HashMap::new(),
             awaiting_completion: None,
             next_poll_send: Instant::now() + poll_interval,
@@ -260,6 +310,10 @@ struct Engine {
     /// FIFO order messages were submitted in, used to break priority ties.
     queue: VecDeque<u64>,
     in_progress: HashMap<u64, PendingMessage>,
+    /// The message a packet was most recently sent for, so a change in which message gets picked
+    /// (other than that message finishing) can be recognized as a priority interruption (see
+    /// `Docs/OFT.md` §6) rather than ordinary packet-by-packet progress on the same message.
+    previous_send: Option<u64>,
     /// Per-priority-channel reassembly buffer for an in-progress multi-packet inbound message.
     inbound_channels: HashMap<u32, Vec<u8>>,
     /// The outcome to apply to a message's `SendHandle` once its most recently sent packet (a
@@ -337,9 +391,15 @@ impl Engine {
                                 started: false,
                                 bytes_sent: 0,
                                 cancel_requested: false,
+                                was_interrupted: false,
                             },
                         );
                         self.shared.has_pending_data.store(true, Ordering::SeqCst);
+
+                        // Raised here, from this connection's own I/O thread, rather than
+                        // synchronously inside `Connection::send()` on the caller's thread.
+                        let message = self.in_progress.get(&message_id).unwrap();
+                        raise_delivery_status(&self.shared, &message.tag, DeliveryStatus::Queued);
                     }
                     Work::Cancel(id) => self.cancel(id),
                     Work::Rekey => {
@@ -386,6 +446,7 @@ impl Engine {
             let message = self.in_progress.remove(&message_id).unwrap();
             self.queue.retain(|id| *id != message_id);
             message.completion.complete(Err(SendFailure::Cancelled));
+            raise_delivery_status(&self.shared, &message.tag, DeliveryStatus::Cancelled);
         } else if is_unit {
             // Already dispatched and atomic - nothing left to cancel (Docs/OFT.md §7).
         } else {
@@ -408,10 +469,10 @@ impl Engine {
                 self.outstanding_turn = false;
                 if let Some((outcome, completion, tag)) = self.awaiting_completion.take() {
                     completion.complete(outcome);
-                    if outcome.is_ok() {
-                        if let Some(tag) = tag {
-                            self.raise_acknowledged(tag);
-                        }
+                    match outcome {
+                        Ok(()) => raise_delivery_status(&self.shared, &tag, DeliveryStatus::Acknowledged),
+                        Err(SendFailure::Cancelled) => raise_delivery_status(&self.shared, &tag, DeliveryStatus::Cancelled),
+                        Err(SendFailure::Disconnected) => {}
                     }
                 }
             }
@@ -507,6 +568,11 @@ impl Engine {
             _ => false,
         };
 
+        let chosen_id = if send_unit { best_unit } else { best_multipacket };
+        if let Some(id) = chosen_id {
+            self.raise_sending_interrupted_resumed(id);
+        }
+
         if send_unit {
             if let Some(id) = best_unit {
                 self.send_unit(id)?;
@@ -516,6 +582,30 @@ impl Engine {
         }
 
         Ok(())
+    }
+
+    /// Raises `DeliveryStatus::Interrupted` for `self.previous_send` if `chosen_id` picked a
+    /// different message than last time (see `previous_send`'s own doc comment), and
+    /// `DeliveryStatus::Sending`/`DeliveryStatus::Resumed` for `chosen_id` itself, as appropriate.
+    /// Does not update `previous_send` itself - the caller does that once it knows whether the send
+    /// that follows finishes the message.
+    fn raise_sending_interrupted_resumed(&mut self, chosen_id: u64) {
+        if let Some(previous_id) = self.previous_send {
+            if previous_id != chosen_id {
+                if let Some(previous) = self.in_progress.get_mut(&previous_id) {
+                    previous.was_interrupted = true;
+                    raise_delivery_status(&self.shared, &previous.tag, DeliveryStatus::Interrupted);
+                }
+            }
+        }
+
+        let message = self.in_progress.get_mut(&chosen_id).unwrap();
+        if !message.started {
+            raise_delivery_status(&self.shared, &message.tag, DeliveryStatus::Sending);
+        } else if message.was_interrupted {
+            message.was_interrupted = false;
+            raise_delivery_status(&self.shared, &message.tag, DeliveryStatus::Resumed);
+        }
     }
 
     fn send_unit(&mut self, message_id: u64) -> Result<(), OftError> {
@@ -530,6 +620,11 @@ impl Engine {
         *self.shared.last_sent_at.lock().unwrap() = SystemTime::now();
         self.outstanding_turn = true;
         self.update_has_pending_data();
+        // A Unit is always fully sent in one packet, so it's always removed from in_progress above
+        // - nothing left for a later send to interrupt.
+        self.previous_send = None;
+
+        raise_delivery_status(&self.shared, &message.tag, DeliveryStatus::Sent);
 
         // Not completed yet - only once its Receipt actually arrives (Docs/OFT.md §4.1); see
         // CONTROL_RECEIPT's own handling in handle_packet.
@@ -551,6 +646,7 @@ impl Engine {
             *self.shared.last_sent_at.lock().unwrap() = SystemTime::now();
             self.outstanding_turn = true;
             self.update_has_pending_data();
+            self.previous_send = None;
             self.awaiting_completion = Some((Err(SendFailure::Cancelled), message.completion, message.tag));
             return Ok(());
         }
@@ -570,10 +666,15 @@ impl Engine {
         self.update_has_pending_data();
 
         if is_last {
+            raise_delivery_status(&self.shared, &self.in_progress[&message_id].tag, DeliveryStatus::Sent);
+
             let message = self.in_progress.remove(&message_id).unwrap();
             self.queue.retain(|id| *id != message_id);
             self.update_has_pending_data();
+            self.previous_send = None;
             self.awaiting_completion = Some((Ok(()), message.completion, message.tag));
+        } else {
+            self.previous_send = Some(message_id);
         }
 
         Ok(())
@@ -581,12 +682,6 @@ impl Engine {
 
     fn update_has_pending_data(&self) {
         self.shared.has_pending_data.store(!self.in_progress.is_empty(), Ordering::SeqCst);
-    }
-
-    fn raise_acknowledged(&self, tag: Tag) {
-        if let Some(handler) = self.shared.acknowledged_handler.lock().unwrap().as_ref() {
-            handler(tag);
-        }
     }
 
     fn teardown(&mut self, reason: Option<String>) {

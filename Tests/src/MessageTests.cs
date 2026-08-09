@@ -178,28 +178,47 @@ public sealed class MessageTests
     }
 
     [Fact]
-    public async Task Send_WithTag_RaisesAcknowledgedHandlerWithTag()
+    public async Task Send_WithTag_RaisesDeliveryStatusHandlerEndingInAcknowledged()
     {
         using OftPair pair = await OftTestHarness.Establish();
 
         object tag = new();
+        List<OftDeliveryStatus> statuses = [];
         TaskCompletionSource<object> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ClientConnection.AcknowledgedHandler = acknowledgedTag => acknowledged.TrySetResult(acknowledgedTag);
+        pair.ClientConnection.DeliveryStatusHandler = (raisedTag, status) =>
+        {
+            lock (statuses)
+            {
+                statuses.Add(status);
+            }
+
+            if (status == OftDeliveryStatus.Acknowledged)
+            {
+                acknowledged.TrySetResult(raisedTag);
+            }
+        };
 
         await pair.ClientConnection.Send("hello"u8.ToArray(), tag: tag);
 
         object acknowledgedTag = await acknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
         Assert.Same(tag, acknowledgedTag);
+        Assert.Equal([OftDeliveryStatus.Queued, OftDeliveryStatus.Sending, OftDeliveryStatus.Sent, OftDeliveryStatus.Acknowledged], statuses);
     }
 
     [Fact]
-    public async Task Send_WithTagLargerThanPacketSize_RaisesAcknowledgedHandlerOnlyAfterFinalCompletion()
+    public async Task Send_WithTagLargerThanPacketSize_RaisesAcknowledgedOnlyAfterFinalCompletion()
     {
         using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 16);
 
         object tag = new();
         TaskCompletionSource<object> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pair.ClientConnection.AcknowledgedHandler = acknowledgedTag => acknowledged.TrySetResult(acknowledgedTag);
+        pair.ClientConnection.DeliveryStatusHandler = (raisedTag, status) =>
+        {
+            if (status == OftDeliveryStatus.Acknowledged)
+            {
+                acknowledged.TrySetResult(raisedTag);
+            }
+        };
 
         byte[] payload = [.. Enumerable.Range(0, 1000).Select(i => (byte)i)];
         Task sendTask = pair.ClientConnection.Send(payload, tag: tag);
@@ -210,12 +229,12 @@ public sealed class MessageTests
     }
 
     [Fact]
-    public async Task Send_WithNullTag_NeverRaisesAcknowledgedHandler()
+    public async Task Send_WithNullTag_NeverRaisesDeliveryStatusHandler()
     {
         using OftPair pair = await OftTestHarness.Establish();
 
-        bool acknowledgedHandlerRaised = false;
-        pair.ClientConnection.AcknowledgedHandler = _ => acknowledgedHandlerRaised = true;
+        bool deliveryStatusHandlerRaised = false;
+        pair.ClientConnection.DeliveryStatusHandler = (_, _) => deliveryStatusHandlerRaised = true;
 
         TaskCompletionSource<IMemoryOwner<byte>> received = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ServerConnection.ReceivedHandler = data => received.TrySetResult(data);
@@ -224,16 +243,28 @@ public sealed class MessageTests
 
         using IMemoryOwner<byte> data = await received.Task.WaitAsync(OftTestHarness.DefaultTimeout);
         Assert.Equal("hello"u8.ToArray(), data.Memory.ToArray());
-        Assert.False(acknowledgedHandlerRaised);
+        Assert.False(deliveryStatusHandlerRaised);
     }
 
     [Fact]
-    public async Task Send_CancelledBeforeStartWithTag_NeverRaisesAcknowledgedHandler()
+    public async Task Send_CancelledBeforeStartWithTag_RaisesOnlyCancelled()
     {
         using OftPair pair = await OftTestHarness.Establish();
 
-        bool acknowledgedHandlerRaised = false;
-        pair.ClientConnection.AcknowledgedHandler = _ => acknowledgedHandlerRaised = true;
+        List<OftDeliveryStatus> statuses = [];
+        TaskCompletionSource<bool> cancelled = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.DeliveryStatusHandler = (_, status) =>
+        {
+            lock (statuses)
+            {
+                statuses.Add(status);
+            }
+
+            if (status == OftDeliveryStatus.Cancelled)
+            {
+                cancelled.TrySetResult(true);
+            }
+        };
 
         using CancellationTokenSource cts = new();
         cts.Cancel();
@@ -241,7 +272,60 @@ public sealed class MessageTests
 
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => sendTask);
 
-        await Task.Delay(200);
-        Assert.False(acknowledgedHandlerRaised);
+        // Cancelled before the send loop ever picked it up, so no Queued/Sending is expected either -
+        // it's removed from the queue synchronously by the cancellation callback itself.
+        await cancelled.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        Assert.Equal([OftDeliveryStatus.Cancelled], statuses);
+    }
+
+    [Fact]
+    public async Task Send_HigherPriorityInterruptsLowerPriority_RaisesInterruptedAndResumedForLowPriorityMessage()
+    {
+        using OftPair pair = await OftTestHarness.Establish(maxPacketDataSize: 8);
+
+        object lowPriorityTag = new();
+        List<OftDeliveryStatus> lowPriorityStatuses = [];
+        TaskCompletionSource<bool> lowPriorityAcknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pair.ClientConnection.DeliveryStatusHandler = (tag, status) =>
+        {
+            if (ReferenceEquals(tag, lowPriorityTag))
+            {
+                lock (lowPriorityStatuses)
+                {
+                    lowPriorityStatuses.Add(status);
+                }
+
+                if (status == OftDeliveryStatus.Acknowledged)
+                {
+                    lowPriorityAcknowledged.TrySetResult(true);
+                }
+            }
+        };
+
+        TaskCompletionSource<bool> bothReceived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int receivedCount = 0;
+        pair.ServerConnection.ReceivedHandler = data =>
+        {
+            data.Dispose();
+            if (Interlocked.Increment(ref receivedCount) == 2)
+            {
+                bothReceived.TrySetResult(true);
+            }
+        };
+
+        byte[] lowPriorityPayload = [.. Enumerable.Repeat((byte)1, 500)];
+        byte[] highPriorityPayload = [.. Enumerable.Repeat((byte)2, 24)];
+
+        Task lowSend = pair.ClientConnection.Send(lowPriorityPayload, priority: 0, tag: lowPriorityTag);
+        await Task.Delay(20);
+        Task highSend = pair.ClientConnection.Send(highPriorityPayload, priority: 5);
+
+        await bothReceived.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        await lowPriorityAcknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        await Task.WhenAll(lowSend, highSend).WaitAsync(OftTestHarness.DefaultTimeout);
+
+        Assert.Contains(OftDeliveryStatus.Interrupted, lowPriorityStatuses);
+        Assert.Contains(OftDeliveryStatus.Resumed, lowPriorityStatuses);
+        Assert.Equal(OftDeliveryStatus.Acknowledged, lowPriorityStatuses[^1]);
     }
 }

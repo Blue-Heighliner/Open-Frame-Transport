@@ -30,8 +30,8 @@ covers the C#-specific API in detail, with examples.
 - `IOftConnection.Identity` — an `OftIdentity` record describing the connection's remote side:
   `EndPoint`, `Certificate` (an `X509Certificate2?`, present only if the remote side presented a TLS
   certificate), and `Info` (the opaque hail data).
-- `IOftConnection.ReceivedHandler`/`.DisconnectedHandler`/`.AcknowledgedHandler`,
-  `IOftListener.ConnectedHandler`, `IOftPeer.ReceivedHandler`/`.AcknowledgedHandler` — single-slot
+- `IOftConnection.ReceivedHandler`/`.DisconnectedHandler`/`.DeliveryStatusHandler`,
+  `IOftListener.ConnectedHandler`, `IOftPeer.ReceivedHandler`/`.DeliveryStatusHandler` — single-slot
   `Action<T>` properties assigned directly (no handler-object interface to implement), one per
   notification kind. Assigning a new value (including `null`) always replaces any previous one, and
   each notification kind is assigned independently of the others. `IOftPeer` has no
@@ -39,12 +39,16 @@ covers the C#-specific API in detail, with examples.
   `IOftPeer.ReceivedHandler` is `Action<OftIdentity, IMemoryOwner<byte>>` — the sending connection's
   identity plus the same pooled payload `IOftConnection.ReceivedHandler` delivers, which the callback
   must dispose.
-- `Send`'s `tag` parameter — an optional, application-controlled `object?` (default `null`) attached to
-  a send, referenced later via `AcknowledgedHandler`: once that message is fully delivered and
-  acknowledged (a `Receipt` for its `Unit` packet, or for its final `Completion` packet if split — see
-  [OFT.md §4](OFT.md#4-packets)), `AcknowledgedHandler` is raised with the tag (`IOftConnection`) or the
-  identity and tag (`IOftPeer`). A `null` tag never raises `AcknowledgedHandler`, and neither does a
-  cancelled send.
+- `Send`'s `tag` parameter — an optional, application-controlled `object?` (default `null`) attached
+  to a send, referenced later via `DeliveryStatusHandler` each time that send's `OftDeliveryStatus`
+  changes: `Queued` → `Sending` → optionally any number of `Interrupted`/`Resumed` pairs (a
+  higher-priority send preempting it, see [OFT.md §6](OFT.md#6-interruption)) → either `Cancelled` or
+  `Sent` followed by `Acknowledged` (a `Receipt` for its `Unit` packet, or for its final `Completion`
+  packet if split — see [OFT.md §4](OFT.md#4-packets)). `DeliveryStatusHandler` is raised with the tag
+  and new status each time, on both `IOftConnection` and `IOftPeer` — unlike `ReceivedHandler`,
+  `IOftPeer.DeliveryStatusHandler` does not identify which connection a send went out on, since the
+  caller already knows (it's the same caller that made the `Send` call). A `null` tag never raises
+  `DeliveryStatusHandler` at all.
 - `IOftConnection`/`IOftPeer` implement both `IDisposable` and `IAsyncDisposable`: `Dispose()`
   immediately terminates whatever it's called on and releases its resources, without waiting for any
   background work to finish; `DisposeAsync()` instead waits for that work to fully stop before

@@ -46,9 +46,9 @@ final class DefaultOftPeer implements OftPeer {
      * can only ever be raised in response to a {@link #send} call the caller itself makes - there is
      * nothing for it to race against, since the caller fully controls when that first happens and can
      * simply assign this beforehand if it cares (see
-     * {@link OftConnection#setAcknowledgedHandler}'s own doc comment for the full reasoning).
+     * {@link OftConnection#setDeliveryStatusHandler}'s own doc comment for the full reasoning).
      */
-    private volatile BiConsumer<OftIdentity, Object> acknowledgedHandler;
+    private volatile BiConsumer<Object, OftDeliveryStatus> deliveryStatusHandler;
 
     /**
      * How long a connection must have had no pending data (see
@@ -141,13 +141,13 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     @Override
-    public void setAcknowledgedHandler(BiConsumer<OftIdentity, Object> handler) {
-        this.acknowledgedHandler = handler;
+    public void setDeliveryStatusHandler(BiConsumer<Object, OftDeliveryStatus> handler) {
+        this.deliveryStatusHandler = handler;
     }
 
     @Override
-    public BiConsumer<OftIdentity, Object> getAcknowledgedHandler() {
-        return this.acknowledgedHandler;
+    public BiConsumer<Object, OftDeliveryStatus> getDeliveryStatusHandler() {
+        return this.deliveryStatusHandler;
     }
 
     @Override
@@ -281,8 +281,8 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     /**
-     * Forwards a tracked connection's received messages and acknowledgements to this peer's own
-     * {@link #receivedSlot}/{@link #acknowledgedHandler}, and runs
+     * Forwards a tracked connection's received messages and delivery status changes to this peer's
+     * own {@link #receivedSlot}/{@link #deliveryStatusHandler}, and runs
      * {@code onDisconnectedTrackingCleanup} when it disconnects to untrack it (from
      * {@link #outboundConnections} or {@link #inboundConnections} as appropriate) - this peer has no
      * external disconnected notification of its own to forward to (see
@@ -291,10 +291,10 @@ final class DefaultOftPeer implements OftPeer {
     private void trackConnection(OftConnection connection, Consumer<OftConnection> onDisconnectedTrackingCleanup) {
         connection.setReceivedHandler(data -> this.receivedSlot.raise(
                 handler -> handler.accept(connection.getIdentity(), data)));
-        connection.setAcknowledgedHandler(tag -> {
-            BiConsumer<OftIdentity, Object> handler = this.acknowledgedHandler;
+        connection.setDeliveryStatusHandler((tag, status) -> {
+            BiConsumer<Object, OftDeliveryStatus> handler = this.deliveryStatusHandler;
             if (handler != null) {
-                handler.accept(connection.getIdentity(), tag);
+                handler.accept(tag, status);
             }
         });
         connection.setDisconnectedHandler(exception -> {

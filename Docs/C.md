@@ -37,20 +37,24 @@ This port targets Linux/POSIX and depends only on OpenSSL and pthreads.
 - `oft_peer_received_callback` — takes the sending connection's `const oft_identity *` (borrowed,
   valid only for the duration of the call) and payload (`uint8_t *`/`length`, heap-allocated, owned
   by the callee) as two separate arguments, the same shape `oft_received_callback` already uses.
-- `oft_acknowledged_callback`/`oft_peer_acknowledged_callback`, set via
-  `oft_connection_set_acknowledged_callback()`/`oft_peer_set_acknowledged_callback()` — invoked once
-  data sent with a non-`NULL` tag has been fully delivered and acknowledged (see `oft_connection_send()`'s
-  `tag` parameter below). Unlike every other callback setter above, this one is **not** buffered (see
+- `enum oft_delivery_status` — `OFT_DELIVERY_STATUS_QUEUED` / `_SENDING` / `_INTERRUPTED` /
+  `_RESUMED` / `_SENT` / `_ACKNOWLEDGED` / `_CANCELLED`, the full lifecycle a tagged send is reported
+  through (see [Delivery status](#delivery-status) below).
+- `oft_delivery_status_callback`/`oft_peer_delivery_status_callback`, set via
+  `oft_connection_set_delivery_status_callback()`/`oft_peer_set_delivery_status_callback()` — invoked
+  each time data sent with a non-`NULL` tag changes delivery status (see `oft_connection_send()`'s
+  `tag` parameter below). `oft_peer_delivery_status_callback` does not identify which connection a
+  send went out on, unlike `oft_peer_received_callback` - the caller already knows, since it's the
+  same caller that made the `oft_peer_send()` call. Unlike every other callback setter above, this
+  one is **not** buffered (see
   [Buffered notifications](Architecture.md#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
   in Architecture.md): it can only ever be raised in response to the caller's own
   `oft_connection_send()`/`oft_peer_send()` call, so there's no message-loss race to guard against by
   assigning it beforehand.
 - `oft_connection_send()`'s/`oft_peer_send()`'s `tag` parameter — an application-controlled `void *`
-  (pass `NULL` if unused) attached to a send, referenced later via the acknowledged callback: once
-  that message is fully delivered and acknowledged (a `Receipt` for its `Unit` packet, or for its
-  final `Completion` packet if split — see [OFT.md §4](OFT.md#4-packets)), the acknowledged callback
-  is raised with the tag (`oft_connection_send()`) or the identity and tag (`oft_peer_send()`). A
-  `NULL` tag never raises it, and neither does a cancelled send.
+  (pass `NULL` if unused) attached to a send, referenced later via the delivery-status callback each
+  time that send's `enum oft_delivery_status` changes (see [Delivery status](#delivery-status)
+  below). A `NULL` tag never raises it at all.
 
 ## Client/server example
 
@@ -131,9 +135,10 @@ if (identity->certificate) {
 TLS at all), and also `NULL` on the accepting side of a connection established under a mode that
 never requests a certificate from the connecting side (see `OFT_SECURITY_MODE_DUAL_AUTHENTICATION`).
 `oft_connection_identity()`'s return value — including its `certificate` field — is owned by the
-connection and only valid until it's closed; a peer's received/acknowledged callbacks hand out the
-same kind of borrowed identity (see [Peer-to-peer example](#peer-to-peer-example) below), valid only
-for the duration of that one call.
+connection and only valid until it's closed; a peer's received callback hands out the same kind of
+borrowed identity (see [Peer-to-peer example](#peer-to-peer-example) below), valid only for the
+duration of that one call. `oft_peer_delivery_status_callback` carries no identity at all - see
+[Delivery status](#delivery-status) below.
 
 ## Peer-to-peer example
 
@@ -189,6 +194,32 @@ if (result == OFT_ERROR_CANCELLED) {
  * if it has already begun. */
 oft_connection_cancel(connection, message_id);
 ```
+
+## Delivery status
+
+A tagged send is also reported through `enum oft_delivery_status`, via a callback set with
+`oft_connection_set_delivery_status_callback()`, independent of `oft_connection_wait()` above -
+useful for observing a send's progress without a message id in hand, or for tracking many in-flight
+sends from one place:
+
+```c
+static void on_delivery_status(void *tag, enum oft_delivery_status status, void *user_data) {
+    printf("%p -> %d\n", tag, status);
+}
+
+oft_connection_set_delivery_status_callback(connection, on_delivery_status, NULL);
+oft_connection_send(connection, payload, payload_length, /* priority */ 0, /* tag */ my_tag, &message_id);
+```
+
+Every tagged send passes through `OFT_DELIVERY_STATUS_QUEUED` → `OFT_DELIVERY_STATUS_SENDING`, then
+either `OFT_DELIVERY_STATUS_CANCELLED` or `OFT_DELIVERY_STATUS_SENT` followed by
+`OFT_DELIVERY_STATUS_ACKNOWLEDGED`; `OFT_DELIVERY_STATUS_INTERRUPTED`/`OFT_DELIVERY_STATUS_RESUMED`
+pairs may occur any number of times in between `OFT_DELIVERY_STATUS_SENDING` and
+`OFT_DELIVERY_STATUS_SENT`, for a multi-packet send a higher-priority send preempts (see
+[OFT.md §6](OFT.md#6-interruption)) - a single-packet send can never be interrupted.
+`OFT_DELIVERY_STATUS_CANCELLED` can only occur before `OFT_DELIVERY_STATUS_SENT`: once a send's
+final packet has actually been written, cancelling it can no longer prevent delivery. A `NULL` tag
+never raises the callback at all.
 
 ## Rekeying
 
@@ -277,9 +308,9 @@ equivalent actually available at this point.
 ownership of its own buffer and may free or reuse it as soon as the call returns. Data delivered to
 an `oft_received_callback`/`oft_peer_received_callback` is heap-allocated (`malloc()`) by the
 library, and ownership passes to the callback — it **must** `free()` it once done (see the examples
-above). The `oft_identity *` an `oft_peer_received_callback`/`oft_peer_acknowledged_callback` is
-handed alongside that payload is, unlike the payload, borrowed (owned by the underlying connection)
-and valid only for the duration of that one call — do not retain the pointer or free it.
+above). The `oft_identity *` an `oft_peer_received_callback` is handed alongside that payload is,
+unlike the payload, borrowed (owned by the underlying connection) and valid only for the duration of
+that one call — do not retain the pointer or free it.
 
 ## Concurrency model
 

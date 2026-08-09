@@ -392,25 +392,38 @@ final class OftConnectionTest {
     }
 
     @Test
-    void send_withTag_raisesAcknowledgedHandlerWithTag() throws Exception {
+    void send_withTag_raisesDeliveryStatusHandlerEndingInAcknowledged() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
             Object tag = new Object();
+            List<OftDeliveryStatus> statuses = new CopyOnWriteArrayList<>();
             CompletableFuture<Object> acknowledged = new CompletableFuture<>();
-            pair.clientConnection().setAcknowledgedHandler(acknowledged::complete);
+            pair.clientConnection().setDeliveryStatusHandler((raisedTag, status) -> {
+                statuses.add(status);
+                if (status == OftDeliveryStatus.ACKNOWLEDGED) {
+                    acknowledged.complete(raisedTag);
+                }
+            });
 
             pair.clientConnection().send("hello".getBytes(), 0, tag).completion().get(10, TimeUnit.SECONDS);
 
             Object acknowledgedTag = acknowledged.get(10, TimeUnit.SECONDS);
             assertTrue(tag == acknowledgedTag);
+            assertEquals(
+                    List.of(OftDeliveryStatus.QUEUED, OftDeliveryStatus.SENDING, OftDeliveryStatus.SENT, OftDeliveryStatus.ACKNOWLEDGED),
+                    statuses);
         }
     }
 
     @Test
-    void send_withTagLargerThanPacketSize_raisesAcknowledgedHandlerOnlyAfterFinalCompletion() throws Exception {
+    void send_withTagLargerThanPacketSize_raisesAcknowledgedOnlyAfterFinalCompletion() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish(16, null)) {
             Object tag = new Object();
             CompletableFuture<Object> acknowledged = new CompletableFuture<>();
-            pair.clientConnection().setAcknowledgedHandler(acknowledged::complete);
+            pair.clientConnection().setDeliveryStatusHandler((raisedTag, status) -> {
+                if (status == OftDeliveryStatus.ACKNOWLEDGED) {
+                    acknowledged.complete(raisedTag);
+                }
+            });
 
             byte[] payload = new byte[1000];
             for (int i = 0; i < payload.length; i++) {
@@ -425,10 +438,10 @@ final class OftConnectionTest {
     }
 
     @Test
-    void send_withNullTag_neverRaisesAcknowledgedHandler() throws Exception {
+    void send_withNullTag_neverRaisesDeliveryStatusHandler() throws Exception {
         try (OftTestHarness.Pair pair = OftTestHarness.establish()) {
-            java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
-            pair.clientConnection().setAcknowledgedHandler(tag -> acknowledgedHandlerRaised.set(true));
+            java.util.concurrent.atomic.AtomicBoolean deliveryStatusHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
+            pair.clientConnection().setDeliveryStatusHandler((tag, status) -> deliveryStatusHandlerRaised.set(true));
 
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
             pair.serverConnection().setReceivedHandler(received::add);
@@ -436,19 +449,26 @@ final class OftConnectionTest {
             pair.clientConnection().send("hello".getBytes(), 0, null).completion().get(10, TimeUnit.SECONDS);
 
             assertArrayEquals("hello".getBytes(), received.poll(10, TimeUnit.SECONDS));
-            assertFalse(acknowledgedHandlerRaised.get());
+            assertFalse(deliveryStatusHandlerRaised.get());
         }
     }
 
     @Test
-    void send_cancelledWithTag_neverRaisesAcknowledgedHandler() throws Exception {
+    void send_cancelledWithTag_raisesCancelledStatus() throws Exception {
         // Unlike C#'s equivalent test, this cancels mid-transfer (via a multi-packet payload plus a
         // short delay) rather than immediately after send() returns: Java's OftSendHandle#cancel(),
         // unlike a pre-cancelled CancellationToken, races against the send loop for a single-packet
         // message and can't deterministically preempt it.
         try (OftTestHarness.Pair pair = OftTestHarness.establish(8, null)) {
-            java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
-            pair.clientConnection().setAcknowledgedHandler(tag -> acknowledgedHandlerRaised.set(true));
+            java.util.concurrent.atomic.AtomicBoolean acknowledgedRaised = new java.util.concurrent.atomic.AtomicBoolean();
+            CompletableFuture<Void> cancelled = new CompletableFuture<>();
+            pair.clientConnection().setDeliveryStatusHandler((tag, status) -> {
+                if (status == OftDeliveryStatus.ACKNOWLEDGED) {
+                    acknowledgedRaised.set(true);
+                } else if (status == OftDeliveryStatus.CANCELLED) {
+                    cancelled.complete(null);
+                }
+            });
 
             byte[] payload = new byte[400];
             OftSendHandle handle = pair.clientConnection().send(payload, 0, new Object());
@@ -458,8 +478,8 @@ final class OftConnectionTest {
             CompletableFuture<Void> completion = handle.completion();
             assertThrows(Exception.class, () -> completion.get(10, TimeUnit.SECONDS));
 
-            Thread.sleep(200);
-            assertFalse(acknowledgedHandlerRaised.get());
+            cancelled.get(10, TimeUnit.SECONDS);
+            assertFalse(acknowledgedRaised.get());
         }
     }
 

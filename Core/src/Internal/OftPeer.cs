@@ -26,7 +26,7 @@ internal sealed class OftPeer : IOftPeer
     /// the caller itself makes - there is nothing for it to race against, since the caller fully
     /// controls when that first happens and can simply assign this beforehand if it cares.
     /// </summary>
-    private Action<OftIdentity, object>? acknowledgedHandler;
+    private Action<object, OftDeliveryStatus>? deliveryStatusHandler;
 
     /// <summary>
     /// How long a connection must have had no pending data (see
@@ -110,10 +110,10 @@ internal sealed class OftPeer : IOftPeer
     }
 
     /// <inheritdoc />
-    public Action<OftIdentity, object>? AcknowledgedHandler
+    public Action<object, OftDeliveryStatus>? DeliveryStatusHandler
     {
-        get => this.acknowledgedHandler;
-        set => this.acknowledgedHandler = value;
+        get => this.deliveryStatusHandler;
+        set => this.deliveryStatusHandler = value;
     }
 
     /// <inheritdoc />
@@ -339,8 +339,8 @@ internal sealed class OftPeer : IOftPeer
     }
 
     /// <summary>
-    /// Forwards a tracked connection's received messages and acknowledgements to this peer's own
-    /// <see cref="ReceivedHandler"/>/<see cref="AcknowledgedHandler"/>, and runs
+    /// Forwards a tracked connection's received messages and delivery status changes to this peer's
+    /// own <see cref="ReceivedHandler"/>/<see cref="DeliveryStatusHandler"/>, and runs
     /// <paramref name="onDisconnectedTrackingCleanup"/> when it disconnects to untrack it (from
     /// <see cref="outboundConnections"/> or <see cref="inboundConnections"/> as appropriate) — this
     /// peer has no external disconnected notification of its own to forward to (see
@@ -350,7 +350,7 @@ internal sealed class OftPeer : IOftPeer
     {
         connection.ReceivedHandler = data =>
             this.receivedSlot.Raise(callback => callback(connection.Identity, data), discardedDisposable: data);
-        connection.AcknowledgedHandler = tag => this.acknowledgedHandler?.Invoke(connection.Identity, tag);
+        connection.DeliveryStatusHandler = (tag, status) => this.deliveryStatusHandler?.Invoke(tag, status);
         connection.DisconnectedHandler = _ =>
         {
             onDisconnectedTrackingCleanup(connection);

@@ -41,22 +41,25 @@ what the TLS layer genuinely needs.
 - `Connection::identity()` — an `Identity` struct describing the connection's remote side:
   `address`, `certificate` (a `rustls_pki_types::CertificateDer<'static>`, present only if the
   remote side presented a TLS certificate), and `info` (the opaque hail data).
-- `Connection::set_received_handler`/`set_disconnected_handler`/`set_acknowledged_handler`,
-  `Listener::set_connected_handler`, `Peer::set_received_handler`/`set_acknowledged_handler` —
+- `Connection::set_received_handler`/`set_disconnected_handler`/`set_delivery_status_handler`,
+  `Listener::set_connected_handler`, `Peer::set_received_handler`/`set_delivery_status_handler` —
   single-slot callback setters taking `Option<Arc<dyn Fn(...) + Send + Sync>>`, one per
   notification kind. Assigning a new value (including `None`) always replaces any previous one, and
   each notification kind is assigned independently of the others. `Peer` has no
   `disconnected_handler`/`connected_handler` of its own — see its own docstring for why.
   `Peer::received_handler` takes `(Identity, Vec<u8>)` — the sending connection's identity plus the
   same payload `Connection::received_handler` delivers, as two separate arguments rather than one
-  bundled type.
+  bundled type. `Peer::delivery_status_handler`, unlike `received_handler`, carries no identity at
+  all — the caller already knows which connection a send went out on, since it's the same caller
+  that made the `send()` call.
+- `DeliveryStatus` — an enum: `Queued` / `Sending` / `Interrupted` / `Resumed` / `Sent` /
+  `Acknowledged` / `Cancelled`, the full lifecycle a tagged send is reported through (see
+  [Delivery status](#delivery-status) below).
 - `send()`'s `tag` parameter — `Option<Tag>` (`Tag = Box<dyn std::any::Any + Send>`), an optional,
-  application-controlled value attached to a send, referenced later via `acknowledged_handler`: once
-  that message is fully delivered and acknowledged (a `Receipt` for its `Unit` packet, or for its
-  final `Completion` packet if split — see [OFT.md §4](OFT.md#4-packets)), `acknowledged_handler` is
-  raised with the tag (`Connection`) or the identity and tag (`Peer`). A `None` tag never raises
-  `acknowledged_handler`, and neither does a cancelled send. Unlike `received_handler`/
-  `disconnected_handler`, `acknowledged_handler` is **not** buffered — see
+  application-controlled value attached to a send, referenced later via `delivery_status_handler`
+  each time that send's `DeliveryStatus` changes (see [Delivery status](#delivery-status) below). A
+  `None` tag never raises `delivery_status_handler` at all. Unlike `received_handler`/
+  `disconnected_handler`, `delivery_status_handler` is **not** buffered — see
   [Architecture.md](Architecture.md#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
   for why that's safe.
 - `SendHandle` — returned by `send()`: `.wait()` blocks until delivered/cancelled/disconnected,
@@ -198,6 +201,26 @@ machine already, so adding a `Waker` slot to the same state and waking it from `
 (called from the connection's own I/O thread, see "Concurrency model" below) was enough to support
 both a blocking and an async caller off the exact same completion state, with no executor of its own
 required either way.
+
+## Delivery status
+
+A tagged send is also reported through `DeliveryStatus`, via `set_delivery_status_handler`,
+independent of `SendHandle` above - useful for observing a send's progress without holding onto its
+handle, or for tracking many in-flight sends from one place:
+
+```rust
+connection.set_delivery_status_handler(Some(Arc::new(|tag: &oft::Tag, status| {
+    println!("{tag:?} -> {status:?}");
+})));
+connection.send(payload, 0, Some(Box::new("my-message-id")));
+```
+
+Every tagged send passes through `Queued` → `Sending`, then either `Cancelled` or `Sent` followed by
+`Acknowledged`; `Interrupted`/`Resumed` pairs may occur any number of times in between `Sending` and
+`Sent`, for a multi-packet send a higher-priority send preempts (see
+[OFT.md §6](OFT.md#6-interruption)) - a single-packet send can never be interrupted. `Cancelled` can
+only occur before `Sent`: once a send's final packet has actually been written, cancelling it can no
+longer prevent delivery. A `None` tag never raises the handler at all.
 
 ## Rekeying
 

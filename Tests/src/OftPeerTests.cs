@@ -148,37 +148,49 @@ public sealed class OftPeerTests
     }
 
     [Fact]
-    public async Task Send_WithTag_RaisesAcknowledgedHandlerWithIdentityAndTag()
+    public async Task Send_WithTag_RaisesDeliveryStatusHandlerWithTagEndingInAcknowledged()
     {
         using IOftPeer listeningPeer = CreateListeningPeer();
         await listeningPeer.Listen(new IPEndPoint(IPAddress.Loopback, 0));
 
         object tag = new();
-        TaskCompletionSource<(OftIdentity Identity, object Tag)> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        List<OftDeliveryStatus> statuses = [];
+        TaskCompletionSource<object> acknowledged = new(TaskCreationOptions.RunContinuationsAsynchronously);
         using IOftPeer caller = CreatePeer();
-        caller.AcknowledgedHandler = (identity, acknowledgedTag) => acknowledged.TrySetResult((identity, acknowledgedTag));
+        caller.DeliveryStatusHandler = (raisedTag, status) =>
+        {
+            lock (statuses)
+            {
+                statuses.Add(status);
+            }
+
+            if (status == OftDeliveryStatus.Acknowledged)
+            {
+                acknowledged.TrySetResult(raisedTag);
+            }
+        };
 
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, "hello listener"u8.ToArray(), tag: tag).WaitAsync(OftTestHarness.DefaultTimeout);
 
-        (OftIdentity identity, object acknowledgedTag) = await acknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
+        object acknowledgedTag = await acknowledged.Task.WaitAsync(OftTestHarness.DefaultTimeout);
         Assert.Same(tag, acknowledgedTag);
-        Assert.Equal("listener", identity.Info);
+        Assert.Equal([OftDeliveryStatus.Queued, OftDeliveryStatus.Sending, OftDeliveryStatus.Sent, OftDeliveryStatus.Acknowledged], statuses);
     }
 
     [Fact]
-    public async Task Send_WithoutTag_NeverRaisesAcknowledgedHandler()
+    public async Task Send_WithoutTag_NeverRaisesDeliveryStatusHandler()
     {
         using IOftPeer listeningPeer = CreateListeningPeer();
         await listeningPeer.Listen(new IPEndPoint(IPAddress.Loopback, 0));
 
-        bool acknowledgedHandlerRaised = false;
+        bool deliveryStatusHandlerRaised = false;
         using IOftPeer caller = CreatePeer();
-        caller.AcknowledgedHandler = (_, _) => acknowledgedHandlerRaised = true;
+        caller.DeliveryStatusHandler = (_, _) => deliveryStatusHandlerRaised = true;
 
         await caller.Send("127.0.0.1", listeningPeer.LocalEndPoint!.Port, "hello listener"u8.ToArray()).WaitAsync(OftTestHarness.DefaultTimeout);
 
         await Task.Delay(200);
-        Assert.False(acknowledgedHandlerRaised);
+        Assert.False(deliveryStatusHandlerRaised);
     }
 
     [Fact]

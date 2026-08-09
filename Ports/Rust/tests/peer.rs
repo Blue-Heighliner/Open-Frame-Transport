@@ -81,7 +81,7 @@ fn received_delivers_with_identity() {
 }
 
 #[test]
-fn send_with_tag_raises_acknowledged_handler_with_identity_and_tag() {
+fn send_with_tag_raises_delivery_status_handler_with_tag_ending_in_acknowledged() {
     let (identity, cert) = shared_test_identity();
     let listener_peer = Peer::new(Some(make_peer_options(&identity, &cert))).unwrap();
     listener_peer.listen("127.0.0.1", 0).unwrap();
@@ -89,12 +89,36 @@ fn send_with_tag_raises_acknowledged_handler_with_identity_and_tag() {
 
     let caller = Peer::new(Some(make_peer_options(&identity, &cert))).unwrap();
     let (tx, rx) = mpsc::channel();
-    caller.set_acknowledged_handler(Some(Arc::new(move |_identity, tag: oft::Tag| {
-        tx.send(*tag.downcast::<u32>().unwrap()).unwrap();
+    caller.set_delivery_status_handler(Some(Arc::new(move |tag: &oft::Tag, status| {
+        if status == oft::DeliveryStatus::Acknowledged {
+            tx.send(*tag.downcast_ref::<u32>().unwrap()).unwrap();
+        }
     })));
 
     caller.send("127.0.0.1", port, b"hi".to_vec(), 0, Some(Box::new(7u32))).unwrap().wait().unwrap();
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), 7u32);
+
+    caller.close();
+    listener_peer.close();
+}
+
+#[test]
+fn send_without_tag_never_raises_delivery_status_handler() {
+    let (identity, cert) = shared_test_identity();
+    let listener_peer = Peer::new(Some(make_peer_options(&identity, &cert))).unwrap();
+    listener_peer.listen("127.0.0.1", 0).unwrap();
+    let port = listener_peer.local_endpoint().unwrap().port();
+
+    let caller = Peer::new(Some(make_peer_options(&identity, &cert))).unwrap();
+    let raised = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let raised_for_handler = raised.clone();
+    caller.set_delivery_status_handler(Some(Arc::new(move |_tag, _status| {
+        raised_for_handler.store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+
+    caller.send("127.0.0.1", port, b"hi".to_vec(), 0, None).unwrap().wait().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(!raised.load(std::sync::atomic::Ordering::SeqCst));
 
     caller.close();
     listener_peer.close();

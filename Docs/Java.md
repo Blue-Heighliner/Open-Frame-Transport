@@ -33,18 +33,18 @@ blocking call style); this document covers the Java-specific API in detail, with
 - `OftPeer.setReceivedHandler` — a `BiConsumer<OftIdentity, byte[]>`: the sending connection's
   identity plus the same payload `OftConnection.setReceivedHandler` delivers, as two separate
   arguments rather than one bundled type.
-- `OftConnection.setAcknowledgedHandler`/`OftPeer.setAcknowledgedHandler` — a
-  `Consumer<Object>`/`BiConsumer<OftIdentity, Object>` invoked once data sent with a non-`null` tag
-  has been fully delivered and acknowledged (see `send`'s `tag` parameter below). Unlike every other
-  handler setter above, this one is **not** buffered (see
+- `OftConnection.setDeliveryStatusHandler`/`OftPeer.setDeliveryStatusHandler` — a
+  `BiConsumer<Object, OftDeliveryStatus>` invoked each time data sent with a non-`null` tag changes
+  delivery status (see `send`'s `tag` parameter below and [`OftDeliveryStatus`](#delivery-status)).
+  Unlike `OftPeer.setReceivedHandler`, `OftPeer.setDeliveryStatusHandler` does not identify which
+  connection a send went out on - the caller already knows, since it's the same caller that made the
+  `send` call. Unlike every other handler setter above, this one is **not** buffered (see
   [Buffered notifications](Architecture.md#buffered-notifications-prevent-a-connectdisconnectreceive-message-loss-race)
   in Architecture.md): it can only ever be raised in response to the caller's own `send` call, so
   there's no message-loss race to guard against by assigning it beforehand.
 - `send`'s `tag` parameter — an application-controlled `Object` (pass `null` if unused) attached to a
-  send, referenced later via `setAcknowledgedHandler`: once that message is fully delivered and
-  acknowledged (a `Receipt` for its `Unit` packet, or for its final `Completion` packet if split — see
-  [OFT.md §4](OFT.md#4-packets)), the acknowledged handler is raised with the tag (`OftConnection`) or
-  the identity and tag (`OftPeer`). A `null` tag never raises it, and neither does a cancelled send.
+  send, referenced later via `setDeliveryStatusHandler` each time that send's `OftDeliveryStatus`
+  changes (see [Delivery status](#delivery-status) below). A `null` tag never raises it at all.
 - `OftSendHandle` — returned by `send`, exposes `completion()` (a `CompletableFuture<Void>`) and
   `cancel()`.
 - `OftConnector.connect`/`OftHoster.host` return `CompletableFuture<OftConnection>`/
@@ -182,6 +182,24 @@ handle.completion().get(10, TimeUnit.SECONDS);
 // packet if it has already begun.
 handle.cancel();
 ```
+
+## Delivery status
+
+A tagged send is also reported through `OftDeliveryStatus`, via `setDeliveryStatusHandler`,
+independent of `OftSendHandle` above - useful for observing a send's progress without holding onto
+its handle, or for tracking many in-flight sends from one place:
+
+```java
+connection.setDeliveryStatusHandler((tag, status) -> System.out.println(tag + " -> " + status));
+connection.send(payload, /* priority */ 0, /* tag */ "my-message-id");
+```
+
+Every tagged send passes through `QUEUED` → `SENDING`, then either `CANCELLED` or `SENT` followed by
+`ACKNOWLEDGED`; `INTERRUPTED`/`RESUMED` pairs may occur any number of times in between `SENDING` and
+`SENT`, for a multi-packet send a higher-priority send preempts (see
+[OFT.md §6](OFT.md#6-interruption)) - a single-packet send can never be interrupted. `CANCELLED` can
+only occur before `SENT`: once a send's final packet has actually been written, cancelling it can no
+longer prevent delivery. A `null` tag never raises `setDeliveryStatusHandler` at all.
 
 ## Rekeying
 

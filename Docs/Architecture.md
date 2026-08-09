@@ -69,10 +69,10 @@ no multicast event/listener-list:
 |---|---|---|---|---|
 | Connection received | `IOftConnection.ReceivedHandler` (`Action<T>`) | `OftConnection.setReceivedHandler` (`Consumer<T>`) | `oft_connection_set_received_callback` | `Connection::set_received_handler` |
 | Connection disconnected | `.DisconnectedHandler` | `.setDisconnectedHandler` | `oft_connection_set_disconnected_callback` | `.set_disconnected_handler` |
-| Connection send acknowledged (tagged) | `.AcknowledgedHandler` | `.setAcknowledgedHandler` | `oft_connection_set_acknowledged_callback` | `.set_acknowledged_handler` |
+| Connection send delivery status (tagged) | `.DeliveryStatusHandler` | `.setDeliveryStatusHandler` | `oft_connection_set_delivery_status_callback` | `.set_delivery_status_handler` |
 | Listener accepted a connection | `IOftListener.ConnectedHandler` | `OftListener.setConnectedHandler` | `oft_listener_set_connected_callback` | `Listener::set_connected_handler` |
 | Peer received (any held connection) | `IOftPeer.ReceivedHandler` | `OftPeer.setReceivedHandler` | `oft_peer_set_received_callback` | `Peer::set_received_handler` |
-| Peer send acknowledged (tagged) | `IOftPeer.AcknowledgedHandler` | `OftPeer.setAcknowledgedHandler` | `oft_peer_set_acknowledged_callback` | `Peer::set_acknowledged_handler` |
+| Peer send delivery status (tagged) | `IOftPeer.DeliveryStatusHandler` | `OftPeer.setDeliveryStatusHandler` | `oft_peer_set_delivery_status_callback` | `Peer::set_delivery_status_handler` |
 
 A peer has no connected/disconnected slot of its own (see [Components](#components)). Each slot is
 assigned independently of the others, and assigning a new value (including `null`/`NULL`/`None`)
@@ -87,9 +87,14 @@ payload. C#/Java/Rust's identity value is self-contained and safe to keep after 
 returns; C's `const oft_identity *` is borrowed from the connection and valid only for that one
 call — copy out what you need if it must outlive it.
 
-Tagged-send acknowledgement (`send`'s `tag` parameter and the acknowledged-handler it's later
+Tagged-send delivery status (`send`'s `tag` parameter and the delivery-status handler it's later
 reported through) is mirrored identically across all four, at both the connection and peer level,
-with one exception — see below.
+with one exception — see below. Every tagged send is reported through the same lifecycle: `Queued` →
+`Sending` → optionally any number of `Interrupted`/`Resumed` pairs (a higher-priority send preempting
+it, see [OFT.md §6](OFT.md#6-interruption)) → either `Cancelled` or `Sent` followed by `Acknowledged`.
+At the peer level, the handler deliberately carries no identity, unlike the received notification:
+the caller already knows which connection a send went out on, since it's the same caller that made
+that `send` call.
 
 ### Buffered notifications prevent a connect/disconnect/receive message-loss race
 
@@ -98,7 +103,7 @@ caller has had a chance to assign a received-message callback. Without precautio
 replies (or disconnects) immediately on connecting could have that first message or disconnection
 silently lost.
 
-All four ports solve this the same way, for every notification kind except `AcknowledgedHandler`
+All four ports solve this the same way, for every notification kind except `DeliveryStatusHandler`
 (see below): each slot buffers everything raised before a callback is first assigned, then flushes
 that backlog to it, in order, before going live for anything raised afterward. C#'s
 `OftBufferedHandlerSlot<TDelegate>`, Java's `BufferedHandlerSlot`, C's `oft_event_buffer`, and Rust's
@@ -111,10 +116,11 @@ This means a caller can get a connection back and assign a received/disconnected
 in any order, with nothing ever silently lost — and the same guarantee applies to a listener's
 connected notification.
 
-`AcknowledgedHandler` is deliberately **not** buffered: unlike the other notifications, its only
+`DeliveryStatusHandler` is deliberately **not** buffered: unlike the other notifications, its only
 trigger is the caller's own tagged `send()` call, so there's no autonomous-timing race to guard
-against. All four ports implement it as a plain unbuffered field — assign it before the send you
-want notified about, not after.
+against — even though it can fire many times for that one call (once per status), every one of those
+firings still traces back to that same caller-controlled starting point. All four ports implement it
+as a plain unbuffered field — assign it before the send you want notified about, not after.
 
 ### Where a port's flow differs from this
 

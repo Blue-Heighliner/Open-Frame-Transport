@@ -40,9 +40,17 @@ typedef struct oft_pending_message {
     int cancel_requested;
     size_t bytes_sent;
 
-    /* The opaque tag this send was queued with, or NULL if it wasn't - see acknowledged_callback
-     * below. Not owned by this struct. */
+    /* The opaque tag this send was queued with, or NULL if it wasn't - see
+     * delivery_status_callback below. Not owned by this struct. */
     void *tag;
+
+    /* Whether OFT_DELIVERY_STATUS_QUEUED has already been raised for this message. */
+    int queued_raised;
+
+    /* Whether this message was preempted by a higher-priority send since it last sent a packet -
+     * set when OFT_DELIVERY_STATUS_INTERRUPTED is raised, cleared (after raising
+     * OFT_DELIVERY_STATUS_RESUMED) once it's picked to send again. */
+    int was_interrupted;
 
     oft_event completed; /* result: OFT_OK, OFT_ERROR_CANCELLED, or OFT_ERROR_CLOSED */
     struct oft_pending_message *next_in_queue;
@@ -168,15 +176,15 @@ struct oft_connection {
     oft_event_buffer disconnected_buffer;
     oft_disconnected_target disconnected_target;
 
-    /* The (single) callback invoked when data sent with a non-NULL tag has been fully delivered and
-     * acknowledged (see oft_connection_send() and oft_connection_set_acknowledged_callback()).
-     * Deliberately not buffered like received_buffer/disconnected_buffer above: it can only ever be
-     * raised in response to a caller's own oft_connection_send() call, so there's no message-loss
-     * race to guard against by assigning it beforehand - this lock only protects the callback/
-     * user_data pointer pair itself from a torn read/write across threads. */
-    pthread_mutex_t acknowledged_callback_lock;
-    oft_acknowledged_callback acknowledged_callback;
-    void *acknowledged_callback_user_data;
+    /* The (single) callback invoked when data sent with a non-NULL tag changes delivery status (see
+     * oft_connection_send() and oft_connection_set_delivery_status_callback()). Deliberately not
+     * buffered like received_buffer/disconnected_buffer above: it can only ever be raised in
+     * response to a caller's own oft_connection_send() call, so there's no message-loss race to
+     * guard against by assigning it beforehand - this lock only protects the callback/user_data
+     * pointer pair itself from a torn read/write across threads. */
+    pthread_mutex_t delivery_status_callback_lock;
+    oft_delivery_status_callback delivery_status_callback;
+    void *delivery_status_callback_user_data;
 };
 
 /* ---- Small helpers ---- */
@@ -264,7 +272,7 @@ static oft_connection *connection_alloc(int fd, SSL_CTX *ssl_ctx, int owns_ssl_c
     pthread_mutex_init(&connection->receipt_lock, NULL);
     pthread_mutex_init(&connection->rekey_queue_lock, NULL);
     pthread_mutex_init(&connection->timestamp_lock, NULL);
-    pthread_mutex_init(&connection->acknowledged_callback_lock, NULL);
+    pthread_mutex_init(&connection->delivery_status_callback_lock, NULL);
     atomic_init(&connection->closed, 0);
     atomic_init(&connection->has_pending_inbound_message, 0);
     oft_event_buffer_init(&connection->received_buffer, free_received_buffer_item);
@@ -497,6 +505,68 @@ static oft_pending_message *registry_find(oft_connection *connection, uint64_t i
     return NULL;
 }
 
+static void raise_delivery_status(oft_connection *connection, oft_pending_message *message, enum oft_delivery_status status) {
+    if (!message->tag) {
+        return;
+    }
+
+    pthread_mutex_lock(&connection->delivery_status_callback_lock);
+    oft_delivery_status_callback callback = connection->delivery_status_callback;
+    void *user_data = connection->delivery_status_callback_user_data;
+    pthread_mutex_unlock(&connection->delivery_status_callback_lock);
+
+    if (callback) {
+        callback(message->tag, status, user_data);
+    }
+}
+
+/*
+ * Raises OFT_DELIVERY_STATUS_QUEUED for every tagged message enqueued since the last time this ran,
+ * regardless of priority - so a low-priority message stuck behind higher-priority traffic still
+ * gets its OFT_DELIVERY_STATUS_QUEUED promptly, rather than only once it's actually its turn to
+ * send (see enum oft_delivery_status's own documentation, in oft.h, on why
+ * OFT_DELIVERY_STATUS_QUEUED is distinct from OFT_DELIVERY_STATUS_SENDING).
+ */
+static void raise_queued_for_new_messages(oft_connection *connection) {
+    pthread_mutex_lock(&connection->outbound_lock);
+
+    size_t unraised_count = 0;
+    for (oft_priority_queue *queue = connection->queues; queue; queue = queue->next) {
+        for (oft_pending_message *message = queue->head; message; message = message->next_in_queue) {
+            if (!message->queued_raised) {
+                unraised_count++;
+            }
+        }
+    }
+
+    if (unraised_count == 0) {
+        pthread_mutex_unlock(&connection->outbound_lock);
+        return;
+    }
+
+    /* Collected while holding outbound_lock, but the callbacks below run after it's released - a
+     * callback that calls back into this connection (e.g. oft_connection_send()) would otherwise
+     * deadlock trying to reacquire outbound_lock itself. */
+    oft_pending_message **newly_queued = malloc(unraised_count * sizeof(oft_pending_message *));
+    size_t newly_queued_count = 0;
+    for (oft_priority_queue *queue = connection->queues; queue; queue = queue->next) {
+        for (oft_pending_message *message = queue->head; message; message = message->next_in_queue) {
+            if (!message->queued_raised) {
+                message->queued_raised = 1;
+                newly_queued[newly_queued_count++] = message;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&connection->outbound_lock);
+
+    for (size_t i = 0; i < newly_queued_count; i++) {
+        raise_delivery_status(connection, newly_queued[i], OFT_DELIVERY_STATUS_QUEUED);
+    }
+
+    free(newly_queued);
+}
+
 static oft_pending_message *registry_remove(oft_connection *connection, uint64_t id) {
     oft_pending_message *prev = NULL;
     for (oft_pending_message *cur = connection->registry; cur; prev = cur, cur = cur->next_in_registry) {
@@ -671,11 +741,14 @@ static void raise_disconnected(oft_connection *connection, const char *error_mes
     oft_event_buffer_raise(&connection->disconnected_buffer, disconnected);
 }
 
-static int send_next_packet(oft_connection *connection, oft_pending_message *message) {
+/* *out_finished is set even when this returns nonzero (connection closed/errored) is not
+ * guaranteed - callers must not rely on *out_finished unless this returns 0. */
+static int send_next_packet(oft_connection *connection, oft_pending_message *message, int *out_finished) {
     oft_packet packet;
     int finishes_message;
+    int is_cancellation_packet = message->cancel_requested && message->started;
 
-    if (message->cancel_requested && message->started) {
+    if (is_cancellation_packet) {
         oft_packet_init(&packet, 1, NULL, 0);
         finishes_message = 1;
     } else if (!message->started && message->length <= connection->max_packet_data_size) {
@@ -721,6 +794,10 @@ static int send_next_packet(oft_connection *connection, oft_pending_message *mes
     now(&connection->last_sent_at);
     pthread_mutex_unlock(&connection->timestamp_lock);
 
+    if (finishes_message && !is_cancellation_packet) {
+        raise_delivery_status(connection, message, OFT_DELIVERY_STATUS_SENT);
+    }
+
     int receipt_result = oft_event_wait(&receipt);
     oft_event_destroy(&receipt);
 
@@ -744,22 +821,14 @@ static int send_next_packet(oft_connection *connection, oft_pending_message *mes
 
         if (message->cancel_requested) {
             oft_event_signal(&message->completed, OFT_ERROR_CANCELLED);
+            raise_delivery_status(connection, message, OFT_DELIVERY_STATUS_CANCELLED);
         } else {
             oft_event_signal(&message->completed, OFT_OK);
-
-            if (message->tag) {
-                pthread_mutex_lock(&connection->acknowledged_callback_lock);
-                oft_acknowledged_callback callback = connection->acknowledged_callback;
-                void *user_data = connection->acknowledged_callback_user_data;
-                pthread_mutex_unlock(&connection->acknowledged_callback_lock);
-
-                if (callback) {
-                    callback(message->tag, user_data);
-                }
-            }
+            raise_delivery_status(connection, message, OFT_DELIVERY_STATUS_ACKNOWLEDGED);
         }
     }
 
+    *out_finished = finishes_message;
     return 0;
 }
 
@@ -772,6 +841,14 @@ static void *send_loop(void *arg) {
             break;
         }
 
+        raise_queued_for_new_messages(connection);
+
+        /* Tracks the message the previous iteration of this inner loop sent a packet for, so a
+         * change in which message gets picked (other than that message finishing) can be
+         * recognized as a priority interruption (see Docs/OFT.md §6) rather than ordinary
+         * packet-by-packet progress on the same message. */
+        oft_pending_message *previous_message = NULL;
+
         while (1) {
             pthread_mutex_lock(&connection->outbound_lock);
             oft_pending_message *message = pick_next_message(connection);
@@ -781,18 +858,33 @@ static void *send_loop(void *arg) {
                 break;
             }
 
+            if (previous_message && previous_message != message) {
+                previous_message->was_interrupted = 1;
+                raise_delivery_status(connection, previous_message, OFT_DELIVERY_STATUS_INTERRUPTED);
+            }
+
+            if (!message->started) {
+                raise_delivery_status(connection, message, OFT_DELIVERY_STATUS_SENDING);
+            } else if (message->was_interrupted) {
+                message->was_interrupted = 0;
+                raise_delivery_status(connection, message, OFT_DELIVERY_STATUS_RESUMED);
+            }
+
             sem_wait(&connection->write_permit);
             if (atomic_load(&connection->closed)) {
                 sem_post(&connection->write_permit);
                 break;
             }
 
-            int result = send_next_packet(connection, message);
+            int finished = 0;
+            int result = send_next_packet(connection, message, &finished);
             sem_post(&connection->write_permit);
 
             if (result != 0) {
                 return NULL;
             }
+
+            previous_message = finished ? NULL : message;
         }
     }
 
@@ -1350,6 +1442,7 @@ void oft_connection_cancel(oft_connection *connection, uint64_t message_id) {
         if (queue && queue_remove(queue, message)) {
             pthread_mutex_unlock(&connection->outbound_lock);
             oft_event_signal(&message->completed, OFT_ERROR_CANCELLED);
+            raise_delivery_status(connection, message, OFT_DELIVERY_STATUS_CANCELLED);
             return;
         }
     }
@@ -1371,11 +1464,11 @@ void oft_connection_set_disconnected_callback(oft_connection *connection, oft_di
     oft_event_buffer_attach(&connection->disconnected_buffer, callback ? dispatch_disconnected_buffer_item : NULL, &connection->disconnected_target);
 }
 
-void oft_connection_set_acknowledged_callback(oft_connection *connection, oft_acknowledged_callback callback, void *user_data) {
-    pthread_mutex_lock(&connection->acknowledged_callback_lock);
-    connection->acknowledged_callback = callback;
-    connection->acknowledged_callback_user_data = user_data;
-    pthread_mutex_unlock(&connection->acknowledged_callback_lock);
+void oft_connection_set_delivery_status_callback(oft_connection *connection, oft_delivery_status_callback callback, void *user_data) {
+    pthread_mutex_lock(&connection->delivery_status_callback_lock);
+    connection->delivery_status_callback = callback;
+    connection->delivery_status_callback_user_data = user_data;
+    pthread_mutex_unlock(&connection->delivery_status_callback_lock);
 }
 
 const oft_identity *oft_connection_identity(oft_connection *connection) {
@@ -1543,7 +1636,7 @@ void oft_connection_close(oft_connection *connection) {
     pthread_mutex_destroy(&connection->receipt_lock);
     pthread_mutex_destroy(&connection->rekey_queue_lock);
     pthread_mutex_destroy(&connection->timestamp_lock);
-    pthread_mutex_destroy(&connection->acknowledged_callback_lock);
+    pthread_mutex_destroy(&connection->delivery_status_callback_lock);
 
     free(connection);
 }

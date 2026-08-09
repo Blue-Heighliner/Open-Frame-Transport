@@ -86,6 +86,47 @@ enum oft_security_mode {
     OFT_SECURITY_MODE_DUAL_AUTHENTICATION = 3,
 };
 
+/*
+ * A lifecycle stage of a tagged send, reported via oft_connection_set_delivery_status_callback()/
+ * oft_peer_set_delivery_status_callback(). Every tagged send passes through
+ * OFT_DELIVERY_STATUS_QUEUED, OFT_DELIVERY_STATUS_SENDING, then either
+ * OFT_DELIVERY_STATUS_CANCELLED or OFT_DELIVERY_STATUS_SENT followed by
+ * OFT_DELIVERY_STATUS_ACKNOWLEDGED; OFT_DELIVERY_STATUS_INTERRUPTED/OFT_DELIVERY_STATUS_RESUMED
+ * pairs may occur any number of times in between OFT_DELIVERY_STATUS_SENDING and
+ * OFT_DELIVERY_STATUS_SENT, for a multi-packet send that a higher-priority send preempts (see
+ * Docs/OFT.md §6) - a single-packet send can never be interrupted, since there is nothing between
+ * its first and only packet for another send to interleave with. OFT_DELIVERY_STATUS_CANCELLED can
+ * only occur before OFT_DELIVERY_STATUS_SENT: once a send's final packet has actually been written,
+ * cancelling it can no longer prevent delivery, so it always proceeds to
+ * OFT_DELIVERY_STATUS_SENT/OFT_DELIVERY_STATUS_ACKNOWLEDGED instead.
+ */
+enum oft_delivery_status {
+    /* The send has been queued and is waiting its turn - reported once oft_connection_send()
+     * returns, not necessarily synchronously before it does. */
+    OFT_DELIVERY_STATUS_QUEUED = 0,
+
+    /* The send's first packet has started transmitting. */
+    OFT_DELIVERY_STATUS_SENDING = 1,
+
+    /* A higher-priority send has preempted this one before it finished (see Docs/OFT.md §6); it
+     * remains queued and eventually resumes. */
+    OFT_DELIVERY_STATUS_INTERRUPTED = 2,
+
+    /* Transmission has resumed after an OFT_DELIVERY_STATUS_INTERRUPTED preemption. */
+    OFT_DELIVERY_STATUS_RESUMED = 3,
+
+    /* The send's final packet has been written, but not yet acknowledged. */
+    OFT_DELIVERY_STATUS_SENT = 4,
+
+    /* The send's final packet has been acknowledged (a Receipt - see Docs/OFT.md §4.1): the send
+     * is now fully delivered. This is the terminal status for a send that isn't cancelled. */
+    OFT_DELIVERY_STATUS_ACKNOWLEDGED = 5,
+
+    /* The send was cancelled (see Docs/OFT.md §7) before its final packet was written. This is the
+     * terminal status for a cancelled send. */
+    OFT_DELIVERY_STATUS_CANCELLED = 6,
+};
+
 typedef struct oft_connection oft_connection;
 typedef struct oft_listener oft_listener;
 
@@ -100,19 +141,19 @@ typedef void (*oft_received_callback)(oft_connection *connection, uint8_t *data,
 typedef void (*oft_disconnected_callback)(oft_connection *connection, const char *error_message, void *user_data);
 
 /*
- * Called when data sent via oft_connection_send() with a non-NULL `tag` has been fully delivered
- * and acknowledged (a Receipt received for the data's Unit packet, or its final Completion packet -
- * see Docs/OFT.md §5-§7). `tag` is the same pointer passed to oft_connection_send(). Never raised
- * for a send with a NULL tag, or for a cancelled send (see oft_connection_cancel()).
+ * Called whenever data sent via oft_connection_send() with a non-NULL `tag` changes delivery status
+ * (see enum oft_delivery_status for the full lifecycle). `tag` is the same pointer passed to
+ * oft_connection_send(). Called multiple times per send, once per status it passes through. Never
+ * raised for a send with a NULL tag.
  *
  * Unlike oft_received_callback/oft_disconnected_callback (see
  * oft_connection_set_received_callback()/oft_connection_set_disconnected_callback()), this callback
  * is never buffered: it can only ever be raised in response to the caller's own
  * oft_connection_send() call, so there is no message-loss race to guard against by assigning it
  * beforehand - assigning it after the triggering send call (but before that send completes) simply
- * misses the notification for that specific send, by design.
+ * misses earlier statuses for that specific send, by design.
  */
-typedef void (*oft_acknowledged_callback)(void *tag, void *user_data);
+typedef void (*oft_delivery_status_callback)(void *tag, enum oft_delivery_status status, void *user_data);
 
 /* Called whenever an oft_listener accepts and establishes a new inbound connection. */
 typedef void (*oft_connected_callback)(oft_listener *listener, oft_connection *connection, void *user_data);
@@ -197,8 +238,8 @@ typedef struct {
  * resumed later (Docs/OFT.md §6). Returns immediately once the message is queued.
  *
  * `tag` is an opaque, application-controlled value attached to this send, NULL by default,
- * referenced later via the callback assigned with oft_connection_set_acknowledged_callback() once
- * this specific message has been fully delivered and acknowledged.
+ * referenced later via the callback assigned with oft_connection_set_delivery_status_callback(),
+ * along with each status this send passes through (see enum oft_delivery_status).
  *
  * On success, writes an identifier for the message to *out_message_id, usable with
  * oft_connection_wait() and oft_connection_cancel(). Returns OFT_OK, or OFT_ERROR_CLOSED if the
@@ -254,14 +295,15 @@ void oft_connection_set_disconnected_callback(oft_connection *connection, oft_di
 
 /*
  * Assigns the (single) callback invoked whenever data sent via oft_connection_send() with a
- * non-NULL tag has been fully delivered and acknowledged (see oft_acknowledged_callback's own
- * documentation for exactly when), replacing any previously assigned one. Pass NULL to clear it.
- * Not safe to call concurrently with itself.
+ * non-NULL tag changes delivery status (see oft_delivery_status_callback's own documentation for
+ * exactly when), replacing any previously assigned one. Pass NULL to clear it. Not safe to call
+ * concurrently with itself.
  *
  * Unlike oft_connection_set_received_callback()/oft_connection_set_disconnected_callback(), this
- * callback is not buffered - see oft_acknowledged_callback's own documentation for why that's safe.
+ * callback is not buffered - see oft_delivery_status_callback's own documentation for why that's
+ * safe.
  */
-void oft_connection_set_acknowledged_callback(oft_connection *connection, oft_acknowledged_callback callback, void *user_data);
+void oft_connection_set_delivery_status_callback(oft_connection *connection, oft_delivery_status_callback callback, void *user_data);
 
 /*
  * This connection's remote identity: its TCP endpoint, its TLS certificate (if any was presented),

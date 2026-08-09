@@ -105,7 +105,7 @@ internal sealed class OftConnection : IOftConnection
     /// itself makes - there is nothing for it to race against, since the caller fully controls when
     /// that first happens and can simply assign this beforehand if it cares.
     /// </summary>
-    private Action<object>? acknowledgedHandler;
+    private Action<object, OftDeliveryStatus>? deliveryStatusHandler;
 
     private OftConnection(
             TcpClient tcpClient, NetworkStream networkStream, Stream plaintextStream, IOftTlsRekeyableProtocol? tlsProtocol,
@@ -178,10 +178,10 @@ internal sealed class OftConnection : IOftConnection
     }
 
     /// <inheritdoc />
-    public Action<object>? AcknowledgedHandler
+    public Action<object, OftDeliveryStatus>? DeliveryStatusHandler
     {
-        get => this.acknowledgedHandler;
-        set => this.acknowledgedHandler = value;
+        get => this.deliveryStatusHandler;
+        set => this.deliveryStatusHandler = value;
     }
 
     /// <summary>
@@ -471,6 +471,13 @@ internal sealed class OftConnection : IOftConnection
             while (!this.lifetimeCts.IsCancellationRequested)
             {
                 await this.sendSignal.WaitAsync(this.lifetimeCts.Token).ConfigureAwait(false);
+                this.RaiseQueuedForNewMessages();
+
+                // Tracks the message the previous iteration of this inner loop sent a packet for, so
+                // a change in which message gets picked (other than that message finishing) can be
+                // recognized as a priority interruption (see Docs/OFT.md §6) rather than ordinary
+                // packet-by-packet progress on the same message.
+                PendingOutboundMessage? previousMessage = null;
 
                 while (true)
                 {
@@ -485,9 +492,27 @@ internal sealed class OftConnection : IOftConnection
                         break;
                     }
 
+                    if (previousMessage is not null && !ReferenceEquals(previousMessage, message))
+                    {
+                        previousMessage.WasInterrupted = true;
+                        this.RaiseDeliveryStatus(previousMessage, OftDeliveryStatus.Interrupted);
+                    }
+
+                    if (!message.Started)
+                    {
+                        this.RaiseDeliveryStatus(message, OftDeliveryStatus.Sending);
+                    }
+                    else if (message.WasInterrupted)
+                    {
+                        message.WasInterrupted = false;
+                        this.RaiseDeliveryStatus(message, OftDeliveryStatus.Resumed);
+                    }
+
                     await this.writePermit.WaitAsync(this.lifetimeCts.Token).ConfigureAwait(false);
-                    await this.SendNextPacket(message).ConfigureAwait(false);
+                    bool finished = await this.SendNextPacket(message).ConfigureAwait(false);
                     this.writePermit.Release();
+
+                    previousMessage = finished ? null : message;
                 }
             }
         }
@@ -515,12 +540,57 @@ internal sealed class OftConnection : IOftConnection
         return bestPriority is null ? null : this.outboundQueues[bestPriority.Value].Peek();
     }
 
-    private async Task SendNextPacket(PendingOutboundMessage message)
+    /// <summary>
+    /// Raises <see cref="OftDeliveryStatus.Queued"/> for every tagged message enqueued since the
+    /// last time this ran, regardless of priority - so a low-priority message stuck behind
+    /// higher-priority traffic still gets its <see cref="OftDeliveryStatus.Queued"/> promptly,
+    /// rather than only once it's actually its turn to send (see <see cref="OftDeliveryStatus"/>'s
+    /// own doc comment on why <see cref="OftDeliveryStatus.Queued"/> is distinct from
+    /// <see cref="OftDeliveryStatus.Sending"/>).
+    /// </summary>
+    private void RaiseQueuedForNewMessages()
+    {
+        List<PendingOutboundMessage>? newlyQueued = null;
+        lock (this.outboundLock)
+        {
+            foreach (Queue<PendingOutboundMessage> queue in this.outboundQueues.Values)
+            {
+                foreach (PendingOutboundMessage message in queue)
+                {
+                    if (!message.QueuedRaised)
+                    {
+                        message.QueuedRaised = true;
+                        (newlyQueued ??= []).Add(message);
+                    }
+                }
+            }
+        }
+
+        if (newlyQueued is not null)
+        {
+            foreach (PendingOutboundMessage message in newlyQueued)
+            {
+                this.RaiseDeliveryStatus(message, OftDeliveryStatus.Queued);
+            }
+        }
+    }
+
+    private void RaiseDeliveryStatus(PendingOutboundMessage message, OftDeliveryStatus status)
+    {
+        if (message.Tag is { } tag)
+        {
+            this.deliveryStatusHandler?.Invoke(tag, status);
+        }
+    }
+
+    /// <returns><see langword="true"/> if this was the message's last packet (sent or cancelled).</returns>
+    private async Task<bool> SendNextPacket(PendingOutboundMessage message)
     {
         Packet packet;
         bool finishesMessage;
+        bool isCancellationPacket = message.CancelRequested && message.Started;
 
-        if (message.CancelRequested && message.Started)
+        if (isCancellationPacket)
         {
             packet = new Packet { Control = 1, Data = ByteString.Empty };
             finishesMessage = true;
@@ -554,6 +624,11 @@ internal sealed class OftConnection : IOftConnection
         await this.frameStream.Write(packet, this.lifetimeCts.Token).ConfigureAwait(false);
         this.UpdateLastSentAt();
 
+        if (finishesMessage && !isCancellationPacket)
+        {
+            this.RaiseDeliveryStatus(message, OftDeliveryStatus.Sent);
+        }
+
         await receiptSource.Task.WaitAsync(this.lifetimeCts.Token).ConfigureAwait(false);
 
         if (finishesMessage)
@@ -568,17 +643,16 @@ internal sealed class OftConnection : IOftConnection
             if (message.CancelRequested)
             {
                 message.CompletionSource.TrySetCanceled(message.CancellationToken);
+                this.RaiseDeliveryStatus(message, OftDeliveryStatus.Cancelled);
             }
             else
             {
                 message.CompletionSource.TrySetResult();
-
-                if (message.Tag is { } tag)
-                {
-                    this.acknowledgedHandler?.Invoke(tag);
-                }
+                this.RaiseDeliveryStatus(message, OftDeliveryStatus.Acknowledged);
             }
         }
+
+        return finishesMessage;
     }
 
     /// <summary>
@@ -601,6 +675,7 @@ internal sealed class OftConnection : IOftConnection
                 this.outboundQueues[message.Priority] = rebuilt;
                 message.Owner?.Dispose();
                 message.CompletionSource.TrySetCanceled(message.CancellationToken);
+                this.RaiseDeliveryStatus(message, OftDeliveryStatus.Cancelled);
                 return;
             }
 
@@ -874,8 +949,9 @@ internal sealed class OftConnection : IOftConnection
 
         /// <summary>
         /// The opaque tag this send was queued with, or <see langword="null"/> if it wasn't. When
-        /// non-null, raises <see cref="AcknowledgedHandler"/> with this value once this message is
-        /// fully delivered and acknowledged (see <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>).
+        /// non-null, raises <see cref="DeliveryStatusHandler"/> with this value and each
+        /// <see cref="OftDeliveryStatus"/> this send passes through (see
+        /// <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>).
         /// </summary>
         public object? Tag { get; init; }
 
@@ -888,5 +964,15 @@ internal sealed class OftConnection : IOftConnection
         public bool Started { get; set; }
 
         public bool CancelRequested { get; set; }
+
+        /// <summary>Whether <see cref="OftDeliveryStatus.Queued"/> has already been raised for this message.</summary>
+        public bool QueuedRaised { get; set; }
+
+        /// <summary>
+        /// Whether this message was preempted by a higher-priority send since it last sent a packet -
+        /// set when <see cref="OftDeliveryStatus.Interrupted"/> is raised, cleared (after raising
+        /// <see cref="OftDeliveryStatus.Resumed"/>) once it's picked to send again.
+        /// </summary>
+        public bool WasInterrupted { get; set; }
     }
 }

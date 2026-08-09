@@ -23,24 +23,11 @@
  * take effect any sooner than this floor. */
 #define OFT_PEER_EVICTION_CHECK_INTERVAL_MS (30L * 1000L)
 
-/*
- * Bundles the (peer, connection) pair a connection's acknowledged callback needs as its user_data -
- * see oft_acknowledged_callback's signature in oft.h, which (unlike oft_received_callback /
- * oft_disconnected_callback) carries no connection parameter of its own to recover this from.
- * Embedded directly in each tracking node below rather than separately heap-allocated, since it
- * lives exactly as long as the node does.
- */
-typedef struct {
-    oft_peer *peer;
-    oft_connection *connection;
-} oft_peer_connection_context;
-
 /* Tracks a single outbound connection this peer has cached, keyed by host:port for reuse lookups. */
 typedef struct oft_peer_outbound_node {
     char host[256];
     uint16_t port;
     oft_connection *connection;
-    oft_peer_connection_context ack_context;
 
     /* When this connection was first observed, by run_eviction(), to have no pending data (see
      * oft_connection_has_pending_data()) - reset (pending_data_cleared_at_valid = 0) the moment it's
@@ -55,7 +42,6 @@ typedef struct oft_peer_outbound_node {
 /* Tracks a single inbound connection this peer has accepted. */
 typedef struct oft_peer_inbound_node {
     oft_connection *connection;
-    oft_peer_connection_context ack_context;
 
     /* See oft_peer_outbound_node's own field of the same name. */
     struct timespec pending_data_cleared_at;
@@ -88,12 +74,11 @@ struct oft_peer {
     oft_peer_received_callback received_callback;
     void *received_callback_user_data;
 
-    /* See oft_peer_connection_context's own doc comment for why this is a lock-protected pointer
-     * pair rather than buffered like received_callback above - same non-buffering rationale as
-     * oft_connection's own acknowledged_callback_lock. */
-    pthread_mutex_t acknowledged_callback_lock;
-    oft_peer_acknowledged_callback acknowledged_callback;
-    void *acknowledged_callback_user_data;
+    /* A lock-protected pointer pair rather than buffered like received_callback above - same
+     * non-buffering rationale as oft_connection's own delivery_status_callback_lock. */
+    pthread_mutex_t delivery_status_callback_lock;
+    oft_peer_delivery_status_callback delivery_status_callback;
+    void *delivery_status_callback_user_data;
 
     pthread_t eviction_thread;
     atomic_int eviction_stop;
@@ -129,14 +114,14 @@ static void raise_received(oft_peer *peer, oft_connection *connection, uint8_t *
     callback(oft_connection_identity(connection), data, length, user_data);
 }
 
-static void raise_acknowledged(oft_peer *peer, oft_connection *connection, void *tag) {
-    pthread_mutex_lock(&peer->acknowledged_callback_lock);
-    oft_peer_acknowledged_callback callback = peer->acknowledged_callback;
-    void *user_data = peer->acknowledged_callback_user_data;
-    pthread_mutex_unlock(&peer->acknowledged_callback_lock);
+static void raise_delivery_status(oft_peer *peer, void *tag, enum oft_delivery_status status) {
+    pthread_mutex_lock(&peer->delivery_status_callback_lock);
+    oft_peer_delivery_status_callback callback = peer->delivery_status_callback;
+    void *user_data = peer->delivery_status_callback_user_data;
+    pthread_mutex_unlock(&peer->delivery_status_callback_lock);
 
     if (callback) {
-        callback(oft_connection_identity(connection), tag, user_data);
+        callback(tag, status, user_data);
     }
 }
 
@@ -144,9 +129,8 @@ static void on_outbound_received(oft_connection *connection, uint8_t *data, size
     raise_received(user_data, connection, data, length);
 }
 
-static void on_outbound_acknowledged(void *tag, void *user_data) {
-    oft_peer_connection_context *context = user_data;
-    raise_acknowledged(context->peer, context->connection, tag);
+static void on_outbound_delivery_status(void *tag, enum oft_delivery_status status, void *user_data) {
+    raise_delivery_status(user_data, tag, status);
 }
 
 /* No disconnected callback to forward to: this peer deliberately exposes no way to be notified
@@ -174,28 +158,26 @@ static void on_outbound_disconnected(oft_connection *connection, const char *err
 }
 
 /*
- * Registers this peer's own received/disconnected/acknowledged tracking on a newly established
- * outbound connection, using ack_context (embedded in the connection's own tracking node, see
- * oft_peer_connection_context) as the acknowledged callback's user_data. Called after oft_connect()
- * returns rather than passed to it: received/disconnected notifications are buffered (see
+ * Registers this peer's own received/disconnected/delivery-status tracking on a newly established
+ * outbound connection. Called after oft_connect() returns rather than passed to it:
+ * received/disconnected notifications are buffered (see
  * oft_connection_set_received_callback/oft_connection_set_disconnected_callback), so there's no
- * ordering requirement to satisfy by registering those any earlier - and the acknowledged callback,
- * though not buffered, is likewise always registered here before oft_peer_send() can possibly
- * trigger it, since get_or_connect() (which calls this) always completes before oft_peer_send()
- * ever calls oft_connection_send() on this same connection. */
-static void track_outbound(oft_peer *peer, oft_connection *connection, oft_peer_connection_context *ack_context) {
+ * ordering requirement to satisfy by registering those any earlier - and the delivery-status
+ * callback, though not buffered, is likewise always registered here before oft_peer_send() can
+ * possibly trigger it, since get_or_connect() (which calls this) always completes before
+ * oft_peer_send() ever calls oft_connection_send() on this same connection. */
+static void track_outbound(oft_peer *peer, oft_connection *connection) {
     oft_connection_set_received_callback(connection, on_outbound_received, peer);
     oft_connection_set_disconnected_callback(connection, on_outbound_disconnected, peer);
-    oft_connection_set_acknowledged_callback(connection, on_outbound_acknowledged, ack_context);
+    oft_connection_set_delivery_status_callback(connection, on_outbound_delivery_status, peer);
 }
 
 static void on_inbound_received(oft_connection *connection, uint8_t *data, size_t length, void *user_data) {
     raise_received(user_data, connection, data, length);
 }
 
-static void on_inbound_acknowledged(void *tag, void *user_data) {
-    oft_peer_connection_context *context = user_data;
-    raise_acknowledged(context->peer, context->connection, tag);
+static void on_inbound_delivery_status(void *tag, enum oft_delivery_status status, void *user_data) {
+    raise_delivery_status(user_data, tag, status);
 }
 
 /* No disconnected callback to forward to - see on_outbound_disconnected()'s own comment. */
@@ -231,8 +213,6 @@ static void on_inbound_established(oft_listener *listener, oft_connection *conne
     }
 
     node->connection = connection;
-    node->ack_context.peer = peer;
-    node->ack_context.connection = connection;
 
     pthread_mutex_lock(&peer->inbound_lock);
     node->next = peer->inbound_connections;
@@ -241,7 +221,7 @@ static void on_inbound_established(oft_listener *listener, oft_connection *conne
 
     oft_connection_set_received_callback(connection, on_inbound_received, peer);
     oft_connection_set_disconnected_callback(connection, on_inbound_disconnected, peer);
-    oft_connection_set_acknowledged_callback(connection, on_inbound_acknowledged, &node->ack_context);
+    oft_connection_set_delivery_status_callback(connection, on_inbound_delivery_status, peer);
 }
 
 static void *eviction_loop(void *arg);
@@ -270,7 +250,7 @@ oft_peer *oft_peer_create(const oft_peer_options *options) {
     pthread_mutex_init(&peer->outbound_lock, NULL);
     pthread_mutex_init(&peer->inbound_lock, NULL);
     pthread_mutex_init(&peer->received_callback_lock, NULL);
-    pthread_mutex_init(&peer->acknowledged_callback_lock, NULL);
+    pthread_mutex_init(&peer->delivery_status_callback_lock, NULL);
     atomic_init(&peer->eviction_stop, 0);
     atomic_init(&peer->disposed, 0);
 
@@ -330,11 +310,11 @@ void oft_peer_set_received_callback(oft_peer *peer, oft_peer_received_callback c
     pthread_mutex_unlock(&peer->received_callback_lock);
 }
 
-void oft_peer_set_acknowledged_callback(oft_peer *peer, oft_peer_acknowledged_callback callback, void *user_data) {
-    pthread_mutex_lock(&peer->acknowledged_callback_lock);
-    peer->acknowledged_callback = callback;
-    peer->acknowledged_callback_user_data = user_data;
-    pthread_mutex_unlock(&peer->acknowledged_callback_lock);
+void oft_peer_set_delivery_status_callback(oft_peer *peer, oft_peer_delivery_status_callback callback, void *user_data) {
+    pthread_mutex_lock(&peer->delivery_status_callback_lock);
+    peer->delivery_status_callback = callback;
+    peer->delivery_status_callback_user_data = user_data;
+    pthread_mutex_unlock(&peer->delivery_status_callback_lock);
 }
 
 static oft_peer_outbound_node *get_or_connect(oft_peer *peer, const char *host, uint16_t port, char *error_buffer, size_t error_buffer_size) {
@@ -368,12 +348,10 @@ static oft_peer_outbound_node *get_or_connect(oft_peer *peer, const char *host, 
     snprintf(node->host, sizeof(node->host), "%s", host);
     node->port = port;
     node->connection = connection;
-    node->ack_context.peer = peer;
-    node->ack_context.connection = connection;
     node->next = peer->outbound_connections;
     peer->outbound_connections = node;
 
-    track_outbound(peer, connection, &node->ack_context);
+    track_outbound(peer, connection);
 
     pthread_mutex_unlock(&peer->outbound_lock);
 
@@ -678,7 +656,7 @@ void oft_peer_close(oft_peer *peer) {
     pthread_mutex_destroy(&peer->outbound_lock);
     pthread_mutex_destroy(&peer->inbound_lock);
     pthread_mutex_destroy(&peer->received_callback_lock);
-    pthread_mutex_destroy(&peer->acknowledged_callback_lock);
+    pthread_mutex_destroy(&peer->delivery_status_callback_lock);
 
     free(peer->info_copy);
     free(peer);

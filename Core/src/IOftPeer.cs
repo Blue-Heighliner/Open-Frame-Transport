@@ -67,17 +67,19 @@ public interface IOftPeer : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Called whenever a message sent with a non-null <c>tag</c> (see
-    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>) has
-    /// been fully delivered and acknowledged (see
-    /// <see cref="IOftConnection.AcknowledgedHandler"/>), with the identity of the connection it was
-    /// sent over and that same tag. Never called for a message sent with a <see langword="null"/> tag,
-    /// or for one that was cancelled rather than delivered. <see langword="null"/> if no callback is
-    /// currently assigned. There is only ever one callback at a time — assigning a new value here
-    /// always replaces any previous one. Unlike <see cref="ReceivedHandler"/>, this does <em>not</em>
-    /// buffer a raise that happens before a callback is ever assigned — see
-    /// <see cref="IOftConnection.AcknowledgedHandler"/>'s own doc comment for why that's safe.
+    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>)
+    /// changes delivery status (see <see cref="OftDeliveryStatus"/> for the full lifecycle), with
+    /// that same tag and its new status — deliberately without identifying which connection it was
+    /// sent over, unlike <see cref="ReceivedHandler"/>: the caller already knows, since it's the same
+    /// caller that made the <c>Send</c> call this is reporting on. Called multiple times per send,
+    /// once per status it passes through. Never called for a message sent with a
+    /// <see langword="null"/> tag. <see langword="null"/> if no callback is currently assigned. There
+    /// is only ever one callback at a time — assigning a new value here always replaces any previous
+    /// one. Unlike <see cref="ReceivedHandler"/>, this does <em>not</em> buffer a raise that happens
+    /// before a callback is ever assigned — see
+    /// <see cref="IOftConnection.DeliveryStatusHandler"/>'s own doc comment for why that's safe.
     /// </summary>
-    Action<OftIdentity, object>? AcknowledgedHandler { get; set; }
+    Action<object, OftDeliveryStatus>? DeliveryStatusHandler { get; set; }
 
     /// <summary>
     /// Starts listening for inbound connections. A peer that never calls this only ever makes
@@ -110,10 +112,9 @@ public interface IOftPeer : IDisposable, IAsyncDisposable
     /// <param name="priority">The priority to send the message at (see Docs/OFT.md §5-§6).</param>
     /// <param name="tag">
     /// An opaque, application-controlled value attached to this send, so it can be referenced later —
-    /// passed back to <see cref="AcknowledgedHandler"/>, along with the identity of the connection it
-    /// was sent over, once this message is fully delivered and acknowledged, if non-null.
-    /// <see langword="null"/> (the default) means this send never raises
-    /// <see cref="AcknowledgedHandler"/>.
+    /// passed back to <see cref="DeliveryStatusHandler"/>, along with each status this send passes
+    /// through (see <see cref="OftDeliveryStatus"/>), if non-null. <see langword="null"/> (the
+    /// default) means this send never raises <see cref="DeliveryStatusHandler"/>.
     /// </param>
     /// <param name="cancellationToken">A token used to cancel connecting or sending.</param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>
@@ -136,10 +137,9 @@ public interface IOftPeer : IDisposable, IAsyncDisposable
     /// <param name="priority">The priority to send the message at (see Docs/OFT.md §5-§6).</param>
     /// <param name="tag">
     /// An opaque, application-controlled value attached to this send, so it can be referenced later —
-    /// passed back to <see cref="AcknowledgedHandler"/>, along with the identity of the connection it
-    /// was sent over, once this message is fully delivered and acknowledged, if non-null.
-    /// <see langword="null"/> (the default) means this send never raises
-    /// <see cref="AcknowledgedHandler"/>.
+    /// passed back to <see cref="DeliveryStatusHandler"/>, along with each status this send passes
+    /// through (see <see cref="OftDeliveryStatus"/>), if non-null. <see langword="null"/> (the
+    /// default) means this send never raises <see cref="DeliveryStatusHandler"/>.
     /// </param>
     /// <param name="cancellationToken">A token used to cancel connecting or sending.</param>
     /// <returns>A task that completes once the message has been fully delivered.</returns>

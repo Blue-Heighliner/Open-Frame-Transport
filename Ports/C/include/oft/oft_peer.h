@@ -42,17 +42,19 @@ typedef struct oft_peer oft_peer;
 typedef void (*oft_peer_received_callback)(const oft_identity *identity, uint8_t *data, size_t length, void *user_data);
 
 /*
- * Called when data sent via oft_peer_send() with a non-NULL `tag` has been fully delivered and
- * acknowledged on the connection it was sent on (see oft_acknowledged_callback's own documentation,
- * in oft.h, for exactly when). `identity` is that connection's identity - borrowed, valid only for
- * the duration of this call; do not retain the pointer. `tag` is the same pointer passed to
- * oft_peer_send(). Never raised for a send with a NULL tag.
+ * Called whenever data sent via oft_peer_send() with a non-NULL `tag` changes delivery status on
+ * the connection it was sent on (see enum oft_delivery_status, in oft.h, for the full lifecycle) -
+ * deliberately without identifying which connection it was sent over, unlike
+ * oft_peer_received_callback: the caller already knows, since it's the same caller that made the
+ * oft_peer_send() call this is reporting on. `tag` is the same pointer passed to oft_peer_send().
+ * Called multiple times per send, once per status it passes through. Never raised for a send with a
+ * NULL tag.
  *
- * Same non-buffering caveat as oft_acknowledged_callback: this can only ever be raised in response
- * to the caller's own oft_peer_send() call, so there is no message-loss race to guard against by
- * assigning it beforehand.
+ * Same non-buffering caveat as oft_delivery_status_callback (in oft.h): this can only ever be
+ * raised in response to the caller's own oft_peer_send() call, so there is no message-loss race to
+ * guard against by assigning it beforehand.
  */
-typedef void (*oft_peer_acknowledged_callback)(const oft_identity *identity, void *tag, void *user_data);
+typedef void (*oft_peer_delivery_status_callback)(void *tag, enum oft_delivery_status status, void *user_data);
 
 typedef struct {
     /* Opaque, application-controlled data sent to every peer in this side's hail. Copied. */
@@ -157,11 +159,11 @@ void oft_peer_set_received_callback(oft_peer *peer, oft_peer_received_callback c
 
 /*
  * Assigns the (single) callback invoked whenever data sent via oft_peer_send() with a non-NULL tag
- * has been fully delivered and acknowledged, replacing any previously assigned one. Pass NULL to
- * clear it. Not safe to call concurrently with itself. Not buffered - see
- * oft_peer_acknowledged_callback's own documentation for why that's safe.
+ * changes delivery status, replacing any previously assigned one. Pass NULL to clear it. Not safe
+ * to call concurrently with itself. Not buffered - see
+ * oft_peer_delivery_status_callback's own documentation for why that's safe.
  */
-void oft_peer_set_acknowledged_callback(oft_peer *peer, oft_peer_acknowledged_callback callback, void *user_data);
+void oft_peer_set_delivery_status_callback(oft_peer *peer, oft_peer_delivery_status_callback callback, void *user_data);
 
 /*
  * Sends a message to host:port, reusing a cached connection if one already exists, or creating and
@@ -171,8 +173,9 @@ void oft_peer_set_acknowledged_callback(oft_peer *peer, oft_peer_acknowledged_ca
  * may be NULL if the caller doesn't need it.
  *
  * `tag` is an opaque, application-controlled value attached to this send, referenced later via the
- * callback assigned with oft_peer_set_acknowledged_callback() once this specific message has been
- * fully delivered and acknowledged - see oft_connection_send()'s own documentation for `tag`.
+ * callback assigned with oft_peer_set_delivery_status_callback(), along with each status this send
+ * passes through (see enum oft_delivery_status, in oft.h) - see oft_connection_send()'s own
+ * documentation for `tag`.
  */
 int oft_peer_send(oft_peer *peer, const char *host, uint16_t port, const uint8_t *data, size_t length, int priority, void *tag,
                    oft_connection **out_connection, uint64_t *out_message_id, char *error_buffer, size_t error_buffer_size);
