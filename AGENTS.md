@@ -98,6 +98,18 @@ describes.
   ```
 
   The resulting `.nupkg`/`.snupkg` land in `Core/bin/Release/`. `dotnet pack -c Release` works
-  the same way if you only want the package without a full build. `Version` is not currently tied
-  to any automated versioning scheme (e.g. git tags) — bump it by hand in the csproj before
-  publishing a new release.
+  the same way if you only want the package without a full build.
+
+## Versioning
+
+- All four ports share one version number across the whole repository — currently `0.1.0`. It is
+  not tied to any automated versioning scheme (e.g. git tags, a CI-computed version) — bump it by
+  hand, everywhere it's declared, before cutting a release:
+  - `Core/OpenFrameTransport.csproj` — `<Version>`
+  - `Ports/Java/pom.xml` — `<version>`
+  - `Ports/Rust/Cargo.toml` — `version`
+  - `Ports/C` has no package manifest of its own and carries no version string to bump; its
+    release tarball is simply named after the git tag it's built from.
+- The version bump and the git tag used for the GitHub Release (which triggers each port's CI
+  `publish` job, defined under `.github/workflows/`) must match, or the published
+  packages/tarball will disagree with the release they're attached to.

@@ -5,10 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  release:
+    types: [published]
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: Ports/C
@@ -20,3 +24,38 @@ jobs:
 
       - name: Test
         run: make test
+
+  publish:
+    needs: build-and-test
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: Ports/C
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL development headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Build library
+        run: make lib
+
+      # C has no package registry equivalent to NuGet/Maven/crates.io, so the standard packaging
+      # step here is a source+binary release tarball (headers, static lib, license, readme)
+      # attached directly to the GitHub Release.
+      - name: Package release archive
+        run: |
+          STAGE="oft-c-${{ github.event.release.tag_name }}"
+          mkdir -p "$STAGE"
+          cp -r include "$STAGE/"
+          cp build/liboft.a "$STAGE/"
+          cp LICENSE README.md "$STAGE/"
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" "oft-c-${{ github.event.release.tag_name }}.tar.gz"

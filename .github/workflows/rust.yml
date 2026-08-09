@@ -5,10 +5,14 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  release:
+    types: [published]
 
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: Ports/Rust
@@ -26,3 +30,29 @@ jobs:
 
       - name: Test
         run: cargo test
+
+  publish:
+    needs: build-and-test
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: Ports/Rust
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # GitHub Packages has no Cargo registry type, and publishing to crates.io needs its own
+      # account/token to manage - so, like the C port's tarball, this builds the standard local
+      # `.crate` archive (via `cargo package`, which also compiles it in isolation to verify it's
+      # actually complete) and attaches that directly to the GitHub Release instead.
+      - name: Package
+        run: cargo package
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ github.event.release.tag_name }}" target/package/*.crate
