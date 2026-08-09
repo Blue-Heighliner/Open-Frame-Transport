@@ -18,12 +18,12 @@ mod send_handle;
 mod stream;
 mod wire;
 
-pub use connection::{Connection, DeliveryStatus, Tag};
+pub use connection::{Connection, DeliveryStatus, DeliveryStatusHandler, Tag};
 pub use connector::connect;
 pub use error::OftError;
 pub use identity::Identity;
 pub use listener::{host, Listener};
 pub use options::{ConnectionOptions, ConnectionValidationCallback, OwnedIdentity, PeerOptions};
-pub use peer::Peer;
+pub use peer::{Peer, PeerReceivedHandler};
 pub use security_mode::SecurityMode;
 pub use send_handle::{SendFailure, SendHandle};

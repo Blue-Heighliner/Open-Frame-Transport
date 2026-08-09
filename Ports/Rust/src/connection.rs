@@ -59,12 +59,20 @@ pub enum DeliveryStatus {
     Cancelled,
 }
 
+/// The callback shape shared by `Connection::set_delivery_status_handler` and
+/// `Peer::set_delivery_status_handler`.
+pub type DeliveryStatusHandler = Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>;
+
 /// Raises `status` on `shared`'s delivery-status handler with `tag`, if `tag` is `Some`. A free
 /// function rather than an `Engine` method so it can be called with a `&PendingMessage` borrowed
 /// from `Engine::in_progress` without conflicting with a concurrent `&Engine` borrow.
 fn raise_delivery_status(shared: &Shared, tag: &Option<Tag>, status: DeliveryStatus) {
     if let Some(tag) = tag {
-        if let Some(handler) = shared.delivery_status_handler.lock().unwrap().as_ref() {
+        // Cloned out from under the lock before calling it: `std::sync::Mutex` isn't reentrant,
+        // so holding it across the call would deadlock a handler that reassigns itself (or any
+        // other handler on this same connection) from within its own invocation.
+        let handler = shared.delivery_status_handler.lock().unwrap().clone();
+        if let Some(handler) = handler {
             handler(tag, status);
         }
     }
@@ -104,7 +112,7 @@ pub(crate) struct Shared {
     last_received_at: Mutex<SystemTime>,
     received_slot: BufferedSlot<Vec<u8>>,
     disconnected_slot: BufferedSlot<Option<String>>,
-    delivery_status_handler: Mutex<Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>>,
+    delivery_status_handler: Mutex<Option<DeliveryStatusHandler>>,
     closed: AtomicBool,
     has_pending_data: AtomicBool,
     work_tx: Mutex<Option<Sender<Work>>>,
@@ -162,7 +170,7 @@ impl Connection {
     /// through. Deliberately *not* buffered, unlike `received_handler`/`disconnected_handler` - see
     /// `Docs/Architecture.md`'s own note on why that's safe (it can only ever be triggered by the
     /// caller's own `send()` call).
-    pub fn set_delivery_status_handler(&self, handler: Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>) {
+    pub fn set_delivery_status_handler(&self, handler: Option<DeliveryStatusHandler>) {
         *self.shared.delivery_status_handler.lock().unwrap() = handler;
     }
 
@@ -297,6 +305,10 @@ pub(crate) fn spawn(stream: Stream, identity: Identity, max_packet_data_size: us
     Connection { shared }
 }
 
+/// The outcome, `SendHandle` completion, and tag to raise once a message's most recently sent
+/// packet is acknowledged - see `Engine::awaiting_completion`.
+type AwaitingCompletion = (Result<(), SendFailure>, Arc<Completion>, Option<Tag>);
+
 struct Engine {
     stream: Stream,
     shared: Arc<Shared>,
@@ -320,7 +332,7 @@ struct Engine {
     /// `Unit`, a multi-packet message's final `Completion` chunk, or a `Cancellation`) is actually
     /// acknowledged by a `Receipt` - a message only counts as delivered once acknowledged
     /// (Docs/OFT.md §4.1), not merely once its bytes are written to the socket.
-    awaiting_completion: Option<(Result<(), SendFailure>, Arc<Completion>, Option<Tag>)>,
+    awaiting_completion: Option<AwaitingCompletion>,
     next_poll_send: Instant,
     last_inbound_activity: Instant,
     next_rekey: Option<Instant>,
@@ -420,18 +432,18 @@ impl Engine {
                 }
             }
 
-            if let Some(next_rekey) = self.next_rekey {
-                if Instant::now() >= next_rekey {
-                    let _ = self.stream.refresh_traffic_keys();
-                    self.next_rekey = self.rekey_interval.map(|interval| Instant::now() + interval);
-                }
+            if let Some(next_rekey) = self.next_rekey
+                && Instant::now() >= next_rekey
+            {
+                let _ = self.stream.refresh_traffic_keys();
+                self.next_rekey = self.rekey_interval.map(|interval| Instant::now() + interval);
             }
 
-            if !self.outstanding_turn {
-                if let Err(err) = self.try_send_next() {
-                    self.teardown(Some(err.to_string()));
-                    return;
-                }
+            if !self.outstanding_turn
+                && let Err(err) = self.try_send_next()
+            {
+                self.teardown(Some(err.to_string()));
+                return;
             }
         }
     }
@@ -590,13 +602,12 @@ impl Engine {
     /// Does not update `previous_send` itself - the caller does that once it knows whether the send
     /// that follows finishes the message.
     fn raise_sending_interrupted_resumed(&mut self, chosen_id: u64) {
-        if let Some(previous_id) = self.previous_send {
-            if previous_id != chosen_id {
-                if let Some(previous) = self.in_progress.get_mut(&previous_id) {
-                    previous.was_interrupted = true;
-                    raise_delivery_status(&self.shared, &previous.tag, DeliveryStatus::Interrupted);
-                }
-            }
+        if let Some(previous_id) = self.previous_send
+            && previous_id != chosen_id
+            && let Some(previous) = self.in_progress.get_mut(&previous_id)
+        {
+            previous.was_interrupted = true;
+            raise_delivery_status(&self.shared, &previous.tag, DeliveryStatus::Interrupted);
         }
 
         let message = self.in_progress.get_mut(&chosen_id).unwrap();

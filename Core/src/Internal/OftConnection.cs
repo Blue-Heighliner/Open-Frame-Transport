@@ -667,6 +667,7 @@ internal sealed class OftConnection : IOftConnection
 
     private void RequestCancellation(PendingOutboundMessage message)
     {
+        bool cancelledImmediately = false;
         lock (this.outboundLock)
         {
             if (!message.Started && this.outboundQueues.TryGetValue(message.Priority, out Queue<PendingOutboundMessage>? queue) && queue.Contains(message))
@@ -675,14 +676,26 @@ internal sealed class OftConnection : IOftConnection
                 this.outboundQueues[message.Priority] = rebuilt;
                 message.Owner?.Dispose();
                 message.CompletionSource.TrySetCanceled(message.CancellationToken);
-                this.RaiseDeliveryStatus(message, OftDeliveryStatus.Cancelled);
-                return;
+                cancelledImmediately = true;
             }
-
-            message.CancelRequested = true;
+            else
+            {
+                message.CancelRequested = true;
+            }
         }
 
-        this.sendSignal.Release();
+        if (cancelledImmediately)
+        {
+            // Raised outside the lock, like every other DeliveryStatusHandler call site - a
+            // callback that calls back into this connection (e.g. Send()) would otherwise recurse
+            // into this same lock (harmlessly, since Monitor is reentrant, but needlessly holding
+            // it across arbitrary caller code is worth avoiding regardless).
+            this.RaiseDeliveryStatus(message, OftDeliveryStatus.Cancelled);
+        }
+        else
+        {
+            this.sendSignal.Release();
+        }
     }
 
     private async Task ReceiveLoop()

@@ -62,8 +62,8 @@ describes.
 ## Other-language ports
 
 - [`Ports/Java`](Ports/Java/), [`Ports/C`](Ports/C/), and [`Ports/Rust`](Ports/Rust/) are
-  independent implementations of the same protocol. Their `OftServer`/`OftClient`/`OftPeer` APIs
-  should align with the C# reference implementation (and each other) as much as is practical: same
+  independent implementations of the same protocol. Their connector/hoster/listener/connection/peer
+  APIs should align with the C# reference implementation (and each other) as much as is practical: same
   method names and semantics, same option/property shapes, adapted only where the target
   language's idioms genuinely require it (e.g. events vs. listener interfaces vs. callbacks,
   `Task`/`CompletableFuture`/blocking calls, `record`/Java `record`/plain `struct`). When one

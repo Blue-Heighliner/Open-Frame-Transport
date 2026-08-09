@@ -80,7 +80,7 @@ impl Default for ConnectionOptions {
 }
 
 /// Options for a `Peer`, covering both its outbound and inbound connections at once.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct PeerOptions {
     pub connection: ConnectionOptions,
 
@@ -100,17 +100,6 @@ pub struct PeerOptions {
     /// connections (by when they were established) are disconnected first, skipping any with
     /// pending data. `0` = default (16).
     pub max_connection_count: usize,
-}
-
-impl Default for PeerOptions {
-    fn default() -> Self {
-        PeerOptions {
-            connection: ConnectionOptions::default(),
-            idle_timeout: None,
-            max_connection_lifetime: None,
-            max_connection_count: 0,
-        }
-    }
 }
 
 impl Deref for PeerOptions {

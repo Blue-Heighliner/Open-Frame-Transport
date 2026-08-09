@@ -197,8 +197,8 @@ pub(crate) fn build_server_config(
 fn native_root_store() -> Result<RootCertStore, OftError> {
     let mut store = RootCertStore::empty();
     let native = rustls_native_certs::load_native_certs();
-    for err in native.errors {
-        return Err(OftError::Io(io::Error::new(io::ErrorKind::Other, err.to_string())));
+    if let Some(err) = native.errors.into_iter().next() {
+        return Err(OftError::Io(io::Error::other(err.to_string())));
     }
     for cert in native.certs {
         let _ = store.add(cert);

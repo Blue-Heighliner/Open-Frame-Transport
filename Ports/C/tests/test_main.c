@@ -700,7 +700,7 @@ static void test_send_large_message_split_and_reassembled(void) {
 
 static void test_send_one_byte_over_packet_size_split_with_minimal_final_chunk(void) {
     /* The smallest possible split: one full Data chunk plus a 1-byte Completion chunk. This is the
-     * boundary case the Completion-carries-the-proto3-default-control-value design (README.md §4)
+     * boundary case the Completion-carries-the-proto3-default-control-value design (Docs/OFT.md §4)
      * depends on - a Completion packet's data must never be empty, and this is as close to empty as
      * a real one can get. */
     test_pair pair;

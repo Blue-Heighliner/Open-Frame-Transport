@@ -84,26 +84,21 @@ pub fn host(bind_host: &str, bind_port: u16, options: Option<ConnectionOptions>)
 
     let accept_shared = shared.clone();
     let handle = thread::spawn(move || {
-        loop {
-            match tcp.accept() {
-                Ok((sock, _addr)) => {
-                    if accept_shared.closed.load(Ordering::SeqCst) {
-                        break;
-                    }
-
-                    let options = options.clone();
-                    let server_config = server_config.clone();
-                    let shared_for_conn = accept_shared.clone();
-                    thread::spawn(move || {
-                        if let Ok(connection) = accept_one(sock, &options, server_config) {
-                            shared_for_conn.connected_slot.raise(connection);
-                        }
-                        // A handshake/hail failure just drops the connection silently, matching
-                        // every other port's own accept-loop behavior.
-                    });
-                }
-                Err(_) => break,
+        while let Ok((sock, _addr)) = tcp.accept() {
+            if accept_shared.closed.load(Ordering::SeqCst) {
+                break;
             }
+
+            let options = options.clone();
+            let server_config = server_config.clone();
+            let shared_for_conn = accept_shared.clone();
+            thread::spawn(move || {
+                if let Ok(connection) = accept_one(sock, &options, server_config) {
+                    shared_for_conn.connected_slot.raise(connection);
+                }
+                // A handshake/hail failure just drops the connection silently, matching
+                // every other port's own accept-loop behavior.
+            });
         }
     });
 

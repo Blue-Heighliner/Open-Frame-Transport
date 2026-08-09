@@ -759,20 +759,26 @@ final class DefaultOftConnection implements OftConnection {
     }
 
     private void requestCancellation(PendingMessage message) {
+        boolean cancelledImmediately;
         synchronized (this.outboundLock) {
-            if (!message.started) {
-                Deque<PendingMessage> queue = this.outboundQueues.get(message.priority);
-                if (queue != null && queue.remove(message)) {
-                    message.future.completeExceptionally(new CancellationException("Message was cancelled."));
-                    raiseDeliveryStatus(message, OftDeliveryStatus.CANCELLED);
-                    return;
-                }
+            Deque<PendingMessage> queue = this.outboundQueues.get(message.priority);
+            cancelledImmediately = !message.started && queue != null && queue.remove(message);
+            if (cancelledImmediately) {
+                message.future.completeExceptionally(new CancellationException("Message was cancelled."));
+            } else {
+                message.cancelRequested = true;
             }
-
-            message.cancelRequested = true;
         }
 
-        this.sendSignal.release();
+        // Raised outside the lock, like every other delivery-status call site - a callback that
+        // calls back into this connection (e.g. send()) would otherwise recurse into this same
+        // lock (harmlessly, since Java's intrinsic locks are reentrant, but needlessly holding it
+        // across arbitrary caller code is worth avoiding regardless).
+        if (cancelledImmediately) {
+            raiseDeliveryStatus(message, OftDeliveryStatus.CANCELLED);
+        } else {
+            this.sendSignal.release();
+        }
     }
 
     private void handlePacket(Packet packet) throws IOException {

@@ -1,5 +1,5 @@
 use crate::buffered_slot::BufferedSlot;
-use crate::connection::{Connection, DeliveryStatus, Tag};
+use crate::connection::{Connection, DeliveryStatusHandler, Tag};
 use crate::connector::connect;
 use crate::error::OftError;
 use crate::identity::Identity;
@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+
+/// The callback shape for `Peer::set_received_handler`.
+pub type PeerReceivedHandler = Arc<dyn Fn(Identity, Vec<u8>) + Send + Sync>;
 
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
 const DEFAULT_MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
@@ -44,7 +47,7 @@ struct Shared {
     inbound: Mutex<Vec<Arc<TrackedConnection>>>,
     listener: Mutex<Option<Listener>>,
     received_slot: BufferedSlot<(Identity, Vec<u8>)>,
-    delivery_status_handler: Mutex<Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>>,
+    delivery_status_handler: Mutex<Option<DeliveryStatusHandler>>,
     closed: AtomicBool,
     eviction_stop: Arc<(Mutex<bool>, Condvar)>,
     eviction_thread: Mutex<Option<JoinHandle<()>>>,
@@ -115,7 +118,7 @@ impl Peer {
     /// Assigns the (single) callback invoked for every message received on any connection this
     /// peer holds, both inbound and outbound. `identity` is only for identifying which connection
     /// a message arrived on. Same buffering guarantee as `Connection::set_received_handler`.
-    pub fn set_received_handler(&self, handler: Option<Arc<dyn Fn(Identity, Vec<u8>) + Send + Sync>>) {
+    pub fn set_received_handler(&self, handler: Option<PeerReceivedHandler>) {
         let wrapped = handler.map(|handler| {
             let wrapped: Arc<dyn Fn((Identity, Vec<u8>)) + Send + Sync> = Arc::new(move |(identity, data)| handler(identity, data));
             wrapped
@@ -130,7 +133,7 @@ impl Peer {
     /// already knows, since it's the same caller that made the `send()` call this is reporting on.
     /// Not buffered - see `Connection::set_delivery_status_handler`'s own documentation for why
     /// that's safe.
-    pub fn set_delivery_status_handler(&self, handler: Option<Arc<dyn Fn(&Tag, DeliveryStatus) + Send + Sync>>) {
+    pub fn set_delivery_status_handler(&self, handler: Option<DeliveryStatusHandler>) {
         *self.shared.delivery_status_handler.lock().unwrap() = handler;
     }
 
@@ -172,12 +175,12 @@ impl Peer {
     /// Sends a message to `host:port`, reusing a cached connection if one already exists, or
     /// creating and caching a new one otherwise. `tag`, if present, is referenced later via
     /// `delivery_status_handler` as this send passes through each `DeliveryStatus`.
-    pub fn send(&self, host_: &str, port: u16, data: Vec<u8>, priority: u32, tag: Option<Tag>) -> Result<SendHandle, OftError> {
+    pub fn send(&self, host: &str, port: u16, data: Vec<u8>, priority: u32, tag: Option<Tag>) -> Result<SendHandle, OftError> {
         if self.shared.closed.load(Ordering::SeqCst) {
             return Err(OftError::Disconnected);
         }
 
-        let tracked = self.get_or_connect(host_, port)?;
+        let tracked = self.get_or_connect(host, port)?;
         Ok(tracked.connection.send(data, priority, tag))
     }
 
@@ -248,18 +251,18 @@ impl Peer {
         self.shared.outbound.lock().unwrap().len() + self.shared.inbound.lock().unwrap().len()
     }
 
-    fn get_or_connect(&self, host_: &str, port: u16) -> Result<Arc<TrackedConnection>, OftError> {
+    fn get_or_connect(&self, host: &str, port: u16) -> Result<Arc<TrackedConnection>, OftError> {
         // Held across the entire find-or-connect sequence, including the blocking connect() call
         // itself - this serializes all outbound connection establishment through this peer
         // (whether to the same or different hosts), trading a little parallelism for a simpler,
         // still-correct implementation (the same documented tradeoff the C port makes).
         let mut outbound = self.shared.outbound.lock().unwrap();
-        let key = (host_.to_string(), port);
+        let key = (host.to_string(), port);
         if let Some(tracked) = outbound.get(&key) {
             return Ok(tracked.clone());
         }
 
-        let connection = connect(host_, port, Some(self.shared.connection_options.clone()))?;
+        let connection = connect(host, port, Some(self.shared.connection_options.clone()))?;
         let tracked = Arc::new(TrackedConnection {
             connection,
             pending_data_cleared_at: Mutex::new(None),
@@ -282,7 +285,11 @@ fn wire_tracking(shared: &Arc<Shared>, tracked: Arc<TrackedConnection>) {
 
     let delivery_status_shared = shared.clone();
     tracked.connection.set_delivery_status_handler(Some(Arc::new(move |tag, status| {
-        if let Some(handler) = delivery_status_shared.delivery_status_handler.lock().unwrap().as_ref() {
+        // Cloned out from under the lock before calling it - see `Connection`'s own
+        // `raise_delivery_status` for why holding a `std::sync::Mutex` across the call would risk
+        // a deadlock.
+        let handler = delivery_status_shared.delivery_status_handler.lock().unwrap().clone();
+        if let Some(handler) = handler {
             handler(tag, status);
         }
     })));

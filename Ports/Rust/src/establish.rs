@@ -31,10 +31,10 @@ pub(crate) fn exchange_hail(stream: &mut Stream, options: &ConnectionOptions) ->
         info: peer_hail.info,
     };
 
-    if let Some(validation) = &options.connection_validation {
-        if !validation(&identity) {
-            return Err(OftError::ValidationRejected("rejected by connection_validation".to_string()));
-        }
+    if let Some(validation) = &options.connection_validation
+        && !validation(&identity)
+    {
+        return Err(OftError::ValidationRejected("rejected by connection_validation".to_string()));
     }
 
     Ok(identity)
