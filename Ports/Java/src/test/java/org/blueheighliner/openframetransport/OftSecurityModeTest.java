@@ -40,7 +40,7 @@ final class OftSecurityModeTest {
                 .sslContext(TestCertificates.createServerContext())
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), options)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), options))) {
             assertNotNull(listener);
         }
     }
@@ -64,7 +64,7 @@ final class OftSecurityModeTest {
                 .sslContext(TestCertificates.createPeerContext())
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             CompletableFuture<OftConnection> serverConnectionFuture = new CompletableFuture<>();
             listener.setConnectedHandler(serverConnectionFuture::complete);
 
@@ -74,8 +74,8 @@ final class OftSecurityModeTest {
                     .sslContext(TestCertificates.createPeerContext())
                     .build();
 
-            OftConnection clientConnection = OftConnector.create()
-                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions);
+            OftConnection clientConnection = OftTestHarness.await(OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions));
             OftConnection serverConnection = serverConnectionFuture.get(10, TimeUnit.SECONDS);
 
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);

@@ -249,7 +249,7 @@ final class OftConnectionTest {
                 .securityMode(OftSecurityMode.DUAL_AUTHENTICATION)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
                     .sslContext(TestCertificates.createClientContext())
@@ -257,7 +257,7 @@ final class OftConnectionTest {
                     .build();
 
             OftConnector connector = OftConnector.create();
-            assertThrows(Exception.class, () -> connector.connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions));
+            assertThrows(Exception.class, () -> OftTestHarness.await(connector.connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)));
         }
     }
 
@@ -287,7 +287,7 @@ final class OftConnectionTest {
                 .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
                     .sslContext(TestCertificates.createClientContext())
@@ -299,8 +299,8 @@ final class OftConnectionTest {
                     })
                     .build();
 
-            try (OftConnection clientConnection = OftConnector.create()
-                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+            try (OftConnection clientConnection = OftTestHarness.await(OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions))) {
                 OftIdentity identity = observedIdentity.get(10, TimeUnit.SECONDS);
                 java.security.cert.Certificate[] chain = observedChain.get(10, TimeUnit.SECONDS);
 
@@ -321,7 +321,7 @@ final class OftConnectionTest {
                 .securityMode(OftSecurityMode.TRUSTED)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
                     .securityMode(OftSecurityMode.TRUSTED)
@@ -332,8 +332,8 @@ final class OftConnectionTest {
                     })
                     .build();
 
-            try (OftConnection clientConnection = OftConnector.create()
-                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+            try (OftConnection clientConnection = OftTestHarness.await(OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions))) {
                 assertNull(observedChain.get(10, TimeUnit.SECONDS));
                 assertNull(observedSession.get(10, TimeUnit.SECONDS));
             }
@@ -347,15 +347,15 @@ final class OftConnectionTest {
                 .securityMode(OftSecurityMode.SECURE)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
                     .securityMode(OftSecurityMode.SECURE)
                     .connectionValidation((identity, certificateChain, session) -> false)
                     .build();
 
-            assertThrows(IOException.class, () -> OftConnector.create()
-                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions));
+            assertThrows(IOException.class, () -> OftTestHarness.await(OftConnector.create()
+                    .connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)));
         }
     }
 
@@ -520,7 +520,7 @@ final class OftConnectionTest {
 
     @Test
     void establishAsClient_dualAuthenticationWithoutSslContext_throws() throws Exception {
-        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0))) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0)))) {
             OftConnectOptions options = OftConnectOptions.builder()
                     .info("client")
                     .securityMode(OftSecurityMode.DUAL_AUTHENTICATION)
@@ -541,7 +541,7 @@ final class OftConnectionTest {
                 .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new java.net.InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
                     .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)

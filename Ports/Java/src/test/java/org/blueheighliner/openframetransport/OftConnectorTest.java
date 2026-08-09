@@ -21,7 +21,7 @@ final class OftConnectorTest {
                 .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             // Queued as early as structurally possible - before this connection's own send loop
             // even exists yet (see OftListener#setConnectedHandler's contract) - so it's flushed as
             // the very first thing once the listener starts processing this connection, immediately
@@ -35,8 +35,8 @@ final class OftConnectorTest {
                     .securityMode(OftSecurityMode.SERVER_AUTHENTICATION)
                     .build();
 
-            OftConnection connection = OftConnector.create().connect(
-                    "127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions);
+            OftConnection connection = OftTestHarness.await(OftConnector.create().connect(
+                    "127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions));
 
             // Assigning a callback after connect() returns is safe precisely because it's backed by
             // BufferedHandlerSlot: nothing raised before this assignment is lost, so this isn't a
@@ -51,10 +51,10 @@ final class OftConnectorTest {
 
     @Test
     void connect_noOptions_receivedNeverMissesAMessageSentImmediately() throws Exception {
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0))) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0)))) {
             listener.setConnectedHandler(connection -> connection.send("immediate".getBytes(), 0, null));
 
-            OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort());
+            OftConnection connection = OftTestHarness.await(OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort()));
 
             CompletableFuture<byte[]> received = new CompletableFuture<>();
             connection.setReceivedHandler(received::complete);
@@ -66,8 +66,8 @@ final class OftConnectorTest {
 
     @Test
     void connect_noOptions_usesDefaults() throws Exception {
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0))) {
-            try (OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort())) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0)))) {
+            try (OftConnection connection = OftTestHarness.await(OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort()))) {
                 assertEquals("", connection.getIdentity().info());
             }
         }
@@ -76,6 +76,6 @@ final class OftConnectorTest {
     @Test
     void connect_nothingListening_throws() throws Exception {
         int freePort = OftTestHarness.reserveFreePort();
-        assertThrows(Exception.class, () -> OftConnector.create().connect("127.0.0.1", freePort));
+        assertThrows(Exception.class, () -> OftTestHarness.await(OftConnector.create().connect("127.0.0.1", freePort)));
     }
 }

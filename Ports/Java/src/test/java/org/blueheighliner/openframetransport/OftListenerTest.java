@@ -17,14 +17,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class OftListenerTest {
     @Test
     void close_calledTwice_isIdempotent() throws Exception {
-        OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0));
+        OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0)));
         listener.close();
         listener.close();
     }
 
     @Test
     void handler_reassignedToNull_stopsReceivingNotifications() throws Exception {
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0))) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0)))) {
             AtomicInteger invocationCount = new AtomicInteger();
             listener.setConnectedHandler(c -> invocationCount.incrementAndGet());
             listener.setConnectedHandler(null);
@@ -33,7 +33,7 @@ final class OftListenerTest {
             listener.setConnectedHandler(accepted::complete);
 
             OftConnectOptions connectOptions = OftConnectOptions.builder().info("client").build();
-            try (OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+            try (OftConnection connection = OftTestHarness.await(OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions))) {
                 accepted.get(10, TimeUnit.SECONDS);
             }
 
@@ -43,8 +43,8 @@ final class OftListenerTest {
 
     @Test
     void handleAccepted_malformedClient_doesNotCrashListener() throws Exception {
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0),
-                OftHostOptions.builder().info("server").securityMode(OftSecurityMode.TRUSTED).build())) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0),
+                OftHostOptions.builder().info("server").securityMode(OftSecurityMode.TRUSTED).build()))) {
             CompletableFuture<OftConnection> accepted = new CompletableFuture<>();
             listener.setConnectedHandler(accepted::complete);
 
@@ -55,7 +55,7 @@ final class OftListenerTest {
 
             // The listener must still be usable afterward: a well-behaved client can still connect.
             OftConnectOptions connectOptions = OftConnectOptions.builder().info("client").securityMode(OftSecurityMode.TRUSTED).build();
-            try (OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+            try (OftConnection connection = OftTestHarness.await(OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions))) {
                 assertNotNull(accepted.get(10, TimeUnit.SECONDS));
             }
         }
@@ -63,14 +63,14 @@ final class OftListenerTest {
 
     @Test
     void handler_assignedAfterAcceptStillReceivesIt() throws Exception {
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0))) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0)))) {
             OftConnectOptions connectOptions = OftConnectOptions.builder().info("client").build();
 
             // No handler is assigned yet, so the accept below races against handleAccepted's own
             // thread with nothing here to synchronize on but a plain sleep - this is exactly the
             // scenario that would silently lose the connection notification without the connected
             // notification being backed by BufferedHandlerSlot.
-            try (OftConnection connection = OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions)) {
+            try (OftConnection connection = OftTestHarness.await(OftConnector.create().connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions))) {
                 Thread.sleep(200);
 
                 CompletableFuture<OftConnection> accepted = new CompletableFuture<>();
@@ -85,7 +85,7 @@ final class OftListenerTest {
     void host_withPort_listensOnAnyAddressAtTheGivenPort() throws Exception {
         int port = OftTestHarness.reserveFreePort();
 
-        try (OftListener listener = OftHoster.create().host(port)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(port))) {
             assertTrue(listener.getLocalEndpoint().getAddress().isAnyLocalAddress());
             assertEquals(port, listener.getLocalEndpoint().getPort());
         }

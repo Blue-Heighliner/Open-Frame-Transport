@@ -5,10 +5,11 @@ namespace BlueHeighliner.OpenFrameTransport;
 /// <see cref="IOftHoster"/>/<see cref="IOftListener"/> (for inbound connections) and
 /// <see cref="IOftConnector"/> (for outbound connections), never constructed directly.
 /// <see cref="IDisposable.Dispose"/> immediately terminates the connection and releases its
-/// resources, without waiting for its background work to finish; call <see cref="Disconnect"/>
-/// instead for a graceful, awaitable teardown that waits for it.
+/// resources, without waiting for its background work to finish; call
+/// <see cref="DisposeAsync"/> instead for a graceful, awaitable teardown that
+/// waits for it.
 /// </summary>
-public interface IOftConnection : IDisposable
+public interface IOftConnection : IDisposable, IAsyncDisposable
 {
     /// <summary>
     /// This connection's remote identity: its TCP endpoint, its TLS certificate (if any was
@@ -34,8 +35,8 @@ public interface IOftConnection : IDisposable
 
     /// <summary>
     /// Whether this connection is still connected: <see langword="true"/> until it closes, for any
-    /// reason — a local <see cref="Disconnect"/>/<see cref="IDisposable.Dispose"/> call, the remote
-    /// side disconnecting, or an unrecoverable error (e.g. a liveness timeout) — after which it is
+    /// reason — a local <see cref="DisposeAsync"/>/<see cref="IDisposable.Dispose"/>
+    /// call, the remote side disconnecting, or an unrecoverable error (e.g. a liveness timeout) — after which it is
     /// permanently <see langword="false"/>. <see cref="Send(ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>
     /// and <see cref="Rekey"/> both throw <see cref="OftDisconnectedException"/> once this is
     /// <see langword="false"/>.
@@ -68,8 +69,9 @@ public interface IOftConnection : IDisposable
 
     /// <summary>
     /// Called once, when this connection closes for any reason, with the exception that caused it to
-    /// close, or <see langword="null"/> if it closed cleanly (e.g. because <see cref="Disconnect"/>
-    /// was called). <see langword="null"/> if no callback is currently assigned. There is only ever
+    /// close, or <see langword="null"/> if it closed cleanly (e.g. because
+    /// <see cref="DisposeAsync"/> was called). <see langword="null"/> if no callback
+    /// is currently assigned. There is only ever
     /// one callback at a time — assigning a new value here always replaces any previous one, and the
     /// same buffering-until-first-non-null-assignment guarantee <see cref="ReceivedHandler"/> itself
     /// makes applies here too (see README.md).
@@ -165,5 +167,5 @@ public interface IOftConnection : IDisposable
     /// does not return until that background work has completely stopped.
     /// </summary>
     /// <returns>A task that completes once the connection has fully closed.</returns>
-    Task Disconnect();
+    new ValueTask DisposeAsync();
 }

@@ -45,10 +45,12 @@ covers the C#-specific API in detail, with examples.
   [OFT.md §4](OFT.md#4-packets)), `AcknowledgedHandler` is raised with the tag (`IOftConnection`) or the
   identity and tag (`IOftPeer`). A `null` tag never raises `AcknowledgedHandler`, and neither does a
   cancelled send.
-- `IOftConnection`/`IOftListener`/`IOftPeer` implement `IDisposable`, not `IAsyncDisposable`:
-  `Dispose()` immediately terminates whatever it's called on and releases its resources, without
-  waiting for any background work to finish. Each has its own separate `async` method for a graceful,
-  awaitable teardown instead — see [Disposal vs. graceful teardown](#disposal-vs-graceful-teardown).
+- `IOftConnection`/`IOftPeer` implement both `IDisposable` and `IAsyncDisposable`: `Dispose()`
+  immediately terminates whatever it's called on and releases its resources, without waiting for any
+  background work to finish; `DisposeAsync()` instead waits for that work to fully stop before
+  returning, for a graceful teardown — see
+  [Disposal vs. graceful teardown](#disposal-vs-graceful-teardown). `IOftListener` implements only
+  `IDisposable` — closing a listener has no in-flight work worth a graceful alternative for.
 - `IOftConnection.IsConnected`/`IOftPeer.IsConnected` — `true` until permanently disconnected, after
   which `Send`/`Rekey` throw `OftDisconnectedException`. See
   [Disposal vs. graceful teardown](#disposal-vs-graceful-teardown) for the full state machine and
@@ -185,27 +187,32 @@ disposing it returns the underlying memory to its pool exactly like `IOftConnect
 
 ## Disposal vs. graceful teardown
 
-`IOftConnection`, `IOftListener`, and `IOftPeer` all implement `IDisposable`, not
-`IAsyncDisposable`: `Dispose()` immediately terminates whatever it's called on — cancelling background
-work, releasing sockets and other resources — without waiting for that background work to actually
-finish running, which happens shortly afterward on its own. `IOftConnection`/`IOftPeer` additionally
-expose their own `async Disconnect()` method for a graceful, awaitable teardown that does wait; both
-`Dispose()` and `Disconnect()` immediately and synchronously put their target into a permanently
-disconnected state (`IsConnected` becomes `false`) before any of that background work actually
-finishes, not just once it does:
+`IOftConnection` and `IOftPeer` implement both `IDisposable` and `IAsyncDisposable`. `Dispose()`
+immediately terminates whatever it's called on — cancelling background work, releasing sockets and
+other resources — without waiting for that background work to actually finish running, which happens
+shortly afterward on its own. `DisposeAsync()` waits for that work to actually finish before
+returning, for a graceful teardown. Both `Dispose()` and `DisposeAsync()` immediately and
+synchronously put their target into a permanently disconnected state (`IsConnected` becomes `false`)
+before any of that background work actually finishes, not just once it does:
 
 ```csharp
 // Immediate: IsConnected is already false by the time this returns; background work stops shortly after.
 connection.Dispose();
 
 // Graceful: also immediate about IsConnected, but doesn't return until background work has fully stopped.
-await connection.Disconnect();
+await connection.DisposeAsync();
 ```
 
-`IOftListener` has no separate graceful-teardown method — stopping a listener has no in-flight work of
-its own to wait for, so `Dispose()` alone is already a complete, immediate teardown.
+Since both implement `IAsyncDisposable`, `await using` also works for the graceful form:
 
-`IOftPeer.Disconnect()`/`Dispose()` follow the same immediate-vs-graceful split as
+```csharp
+await using IOftConnection connection = await connector.Connect("127.0.0.1", 5000);
+```
+
+`IOftListener` implements only `IDisposable` — stopping a listener has no in-flight work of its own to
+wait for, so `Dispose()` alone is already a complete, immediate teardown.
+
+`IOftPeer.DisposeAsync()`/`Dispose()` follow the same immediate-vs-graceful split as
 `IOftConnection`, but at the peer level: both stop listening (if applicable), disconnect every
 connection the peer currently holds, and permanently set `IsConnected` to `false` — after which every
 other member throws (`Listen`/`StopListening`/`Drop` throw `ObjectDisposedException`; `Send`/`Rekey` throw
@@ -214,14 +221,14 @@ was never disconnected locally but simply lost its last connection). Both are id
 either again after the first is a no-op.
 
 `IOftPeer.Drop()` is different: it disconnects every connection the peer currently holds - the same
-work `Disconnect()`/`Dispose()` do - but leaves the peer itself usable, `IsConnected` still `true`.
+work `DisposeAsync()`/`Dispose()` do - but leaves the peer itself usable, `IsConnected` still `true`.
 Use `Drop()` to force every cached connection to be re-established from scratch (e.g. after a network
-change) without tearing the peer down; use `Disconnect()`/`Dispose()` to actually retire the peer.
+change) without tearing the peer down; use `DisposeAsync()`/`Dispose()` to actually retire the peer.
 
 ```csharp
 await peer.Drop(); // Forces reconnection on the next Send; the peer itself remains usable.
 
-await peer.Disconnect(); // Permanently retires the peer; every member but IsConnected now throws.
+await peer.DisposeAsync(); // Permanently retires the peer; every member but IsConnected now throws.
 ```
 
 ## Cancellation

@@ -47,6 +47,9 @@ blocking call style); this document covers the Java-specific API in detail, with
   the identity and tag (`OftPeer`). A `null` tag never raises it, and neither does a cancelled send.
 - `OftSendHandle` — returned by `send`, exposes `completion()` (a `CompletableFuture<Void>`) and
   `cancel()`.
+- `OftConnector.connect`/`OftHoster.host` return `CompletableFuture<OftConnection>`/
+  `CompletableFuture<OftListener>` rather than blocking the caller — see
+  [Async-capable APIs](#async-capable-apis) below.
 - `OftConnection extends AutoCloseable`: `close()` closes the connection and waits for its
   background threads to finish, for a graceful teardown; `disconnect()` closes it immediately without
   waiting. `OftListener`/`OftPeer` are likewise `AutoCloseable` — see
@@ -71,7 +74,7 @@ OftHostOptions hostOptions = OftHostOptions.builder()
         .securityMode(OftSecurityMode.SECURE) // no certificate needed for this example
         .build();
 
-OftListener listener = OftHoster.create().host(new InetSocketAddress("0.0.0.0", 5000), hostOptions);
+OftListener listener = OftHoster.create().host(new InetSocketAddress("0.0.0.0", 5000), hostOptions).get();
 listener.setConnectedHandler(connection -> {
     connection.setReceivedHandler(data -> {
         System.out.println("Received: " + new String(data));
@@ -84,13 +87,37 @@ OftConnectOptions connectOptions = OftConnectOptions.builder()
         .securityMode(OftSecurityMode.SECURE)
         .build();
 
-OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000, connectOptions);
+OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000, connectOptions).get();
 connection.send("hello".getBytes(), /* priority */ 0, /* tag */ null);
 ```
 
 `options` is optional on both `connect` and `host` — the no-options overloads
 (`connect(host, port)`/`host(listenEndpoint)`) use defaults (`SECURE`, empty `info`, 1 KiB max
 packet size, 1s/5s poll interval/timeout).
+
+## Async-capable APIs
+
+`OftConnector.connect`/`OftHoster.host` return `CompletableFuture<OftConnection>`/
+`CompletableFuture<OftListener>` rather than blocking the calling thread. `.get()` (as in every
+example above) blocks and unwraps the result for callers that just want the old, directly-blocking
+behavior; a caller that wants genuine async composition can `.thenAccept`/`.thenCompose`/etc.
+instead. The dial, TLS handshake, and hail exchange all run on a dedicated background thread per
+call (`OftBlocking`, an internal helper) rather than the JDK's common `ForkJoinPool` — this mirrors
+the C# reference implementation's own use of `TaskCreationOptions.LongRunning` for exactly the same
+reason (see `Core/src/Internal/OftConnection.cs`'s own comment on it): this work has no truly
+non-blocking variant in the JDK APIs this port uses, so running it on a shared pool would tie up one
+of that pool's threads for the operation's entire (potentially seconds-long) duration.
+
+`OftPeer.listen()`/`.stopListening()`/`.drop()` are `CompletableFuture<Void>` for the same
+future-proofing reason, even though `stopListening()`/`drop()` complete their (currently fast,
+synchronous) work before the future is even returned. `OftPeer.close()` and
+`OftConnection`/`OftListener`/`OftPeer`'s own `close()` stay plain, blocking `void` methods: all
+three types implement `AutoCloseable`, whose `close()` must return `void` to support
+try-with-resources, so there's no way to make that one method future-returning without giving up
+try-with-resources support entirely. Argument-validation failures (e.g. a missing `sslContext`
+under `DUAL_AUTHENTICATION`) are still thrown synchronously, immediately, rather than deferred to
+the returned future — only failures that actually require dialing/binding (a refused connection, a
+failed TLS handshake, a rejected `ConnectionValidation`) surface through it.
 
 ## Remote identity
 
@@ -127,7 +154,7 @@ peer.setReceivedHandler((identity, data) -> System.out.println(
         "Received from " + identity.endpoint() + ": " + new String(data)));
 
 // Optional: also accept inbound connections into the same pool.
-peer.listen(new InetSocketAddress("0.0.0.0", 5001));
+peer.listen(new InetSocketAddress("0.0.0.0", 5001)).get();
 
 // Sending to a host:port transparently reuses a cached connection or creates and caches a new one.
 peer.send("127.0.0.1", 5001, "hello".getBytes(), /* priority */ 0, /* tag */ null);

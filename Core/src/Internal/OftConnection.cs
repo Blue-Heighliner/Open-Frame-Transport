@@ -357,7 +357,7 @@ internal sealed class OftConnection : IOftConnection
     public void Dispose() => this.Close(null);
 
     /// <inheritdoc />
-    public async Task Disconnect()
+    public async ValueTask DisposeAsync()
     {
         this.Close(null);
 
@@ -783,7 +783,7 @@ internal sealed class OftConnection : IOftConnection
     /// releases every resource it owns, and notifies <see cref="DisconnectedHandler"/> — but does not
     /// wait for the background work it just cancelled (the receive and send loops) to actually finish
     /// running, which happens shortly afterward on their own. <see cref="Dispose"/> and
-    /// <see cref="Disconnect"/> both call this; <see cref="Disconnect"/> additionally awaits that
+    /// <see cref="DisposeAsync"/> both call this; <see cref="DisposeAsync"/> additionally awaits that
     /// background work's completion afterward, for a fully graceful teardown.
     /// </summary>
     private void Close(Exception? exception)

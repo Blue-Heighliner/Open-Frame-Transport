@@ -58,7 +58,7 @@ final class TrustedModeTest {
                 .securityMode(OftSecurityMode.TRUSTED)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), options)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), options))) {
             assertNotNull(listener);
         }
     }
@@ -70,7 +70,7 @@ final class TrustedModeTest {
                 .securityMode(OftSecurityMode.SECURE)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), options)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), options))) {
             assertNotNull(listener);
         }
     }
@@ -89,7 +89,7 @@ final class TrustedModeTest {
                 .securityMode(OftSecurityMode.TRUSTED)
                 .build();
 
-        try (OftListener listener = OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), hostOptions)) {
+        try (OftListener listener = OftTestHarness.await(OftHoster.create().host(new InetSocketAddress("127.0.0.1", 0), hostOptions))) {
             CompletableFuture<OftConnection> serverConnectionFuture = new CompletableFuture<>();
             listener.setConnectedHandler(serverConnectionFuture::complete);
 

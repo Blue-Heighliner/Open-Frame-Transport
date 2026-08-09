@@ -22,7 +22,7 @@ public sealed class OftConnectionTests
         Task task2 = pair.ClientConnection.Send("b"u8.ToArray());
         Task task3 = pair.ClientConnection.Send("c"u8.ToArray());
 
-        await pair.ClientConnection.Disconnect();
+        await pair.ClientConnection.DisposeAsync();
 
         await Assert.ThrowsAnyAsync<Exception>(() => task1);
         await Assert.ThrowsAnyAsync<Exception>(() => task2);
@@ -41,7 +41,7 @@ public sealed class OftConnectionTests
     public async Task Send_AfterDisconnect_Throws()
     {
         using OftPair pair = await OftTestHarness.Establish();
-        await pair.ClientConnection.Disconnect();
+        await pair.ClientConnection.DisposeAsync();
 
         await Assert.ThrowsAsync<OftDisconnectedException>(() => pair.ClientConnection.Send("hi"u8.ToArray()));
     }
@@ -51,15 +51,15 @@ public sealed class OftConnectionTests
     {
         using OftPair pair = await OftTestHarness.Establish();
 
-        await pair.ClientConnection.Disconnect();
-        await pair.ClientConnection.Disconnect();
+        await pair.ClientConnection.DisposeAsync();
+        await pair.ClientConnection.DisposeAsync();
     }
 
     [Fact]
     public async Task Rekey_AfterDisconnect_Throws()
     {
         using OftPair pair = await OftTestHarness.Establish();
-        await pair.ClientConnection.Disconnect();
+        await pair.ClientConnection.DisposeAsync();
 
         await Assert.ThrowsAsync<OftDisconnectedException>(() => pair.ClientConnection.Rekey());
     }
@@ -71,7 +71,7 @@ public sealed class OftConnectionTests
 
         Assert.True(pair.ClientConnection.IsConnected);
 
-        await pair.ClientConnection.Disconnect();
+        await pair.ClientConnection.DisposeAsync();
 
         Assert.False(pair.ClientConnection.IsConnected);
     }
@@ -84,7 +84,7 @@ public sealed class OftConnectionTests
         TaskCompletionSource<bool> disconnectedSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
         pair.ClientConnection.DisconnectedHandler = _ => disconnectedSource.TrySetResult(true);
 
-        await pair.ServerConnection.Disconnect();
+        await pair.ServerConnection.DisposeAsync();
         await disconnectedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
         Assert.False(pair.ClientConnection.IsConnected);
@@ -120,7 +120,7 @@ public sealed class OftConnectionTests
         pair.ServerConnection.DisconnectedHandler = _ => invocationCount++;
         pair.ServerConnection.DisconnectedHandler = null;
 
-        await pair.ServerConnection.Disconnect();
+        await pair.ServerConnection.DisposeAsync();
 
         Assert.Equal(0, invocationCount);
     }

@@ -132,7 +132,7 @@ final class OftPeerTest {
                 .build());
 
         try {
-            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+            OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
             OftConnectOptions connectOptions = OftConnectOptions.builder()
                     .info("client")
@@ -141,7 +141,7 @@ final class OftPeerTest {
                     .build();
 
             OftConnector connector = OftConnector.create();
-            OftConnection connection = connector.connect("127.0.0.1", listeningPeer.getLocalEndpoint().getPort(), connectOptions);
+            OftConnection connection = OftTestHarness.await(connector.connect("127.0.0.1", listeningPeer.getLocalEndpoint().getPort(), connectOptions));
             try {
                 CompletableFuture<Void> disconnectedFuture = new CompletableFuture<>();
                 connection.setDisconnectedHandler(exception -> disconnectedFuture.complete(null));
@@ -170,7 +170,7 @@ final class OftPeerTest {
     @Test
     void received_deliversForInboundConnections() throws Exception {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
-            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+            OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
             BlockingQueue<byte[]> received = new ArrayBlockingQueue<>(1);
             listeningPeer.setReceivedHandler((identity, data) -> received.add(data));
@@ -186,7 +186,7 @@ final class OftPeerTest {
     @Test
     void send_withTag_raisesAcknowledgedHandlerWithIdentityAndTag() throws Exception {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
-            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+            OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
             Object tag = new Object();
             CompletableFuture<OftIdentity> acknowledgedIdentity = new CompletableFuture<>();
@@ -207,7 +207,7 @@ final class OftPeerTest {
     @Test
     void send_withoutTag_neverRaisesAcknowledgedHandler() throws Exception {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
-            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+            OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
             java.util.concurrent.atomic.AtomicBoolean acknowledgedHandlerRaised = new java.util.concurrent.atomic.AtomicBoolean();
             caller.setAcknowledgedHandler((identity, tag) -> acknowledgedHandlerRaised.set(true));
@@ -304,7 +304,7 @@ final class OftPeerTest {
     @Test
     void rekey_rekeysOutboundAndInboundConnections() throws Exception {
         try (OftPeer listeningPeer = createListeningPeer("listener"); OftPeer caller = createOutboundOnlyPeer("caller")) {
-            listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0));
+            OftTestHarness.await(listeningPeer.listen(new InetSocketAddress("127.0.0.1", 0)));
 
             // Assigned before any message is ever sent: ReceivedHandler is backed by
             // BufferedHandlerSlot, so assigning here rather than after the "hello" send below

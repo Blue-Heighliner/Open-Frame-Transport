@@ -300,6 +300,7 @@ dependencies = [
 name = "oft"
 version = "0.1.0"
 dependencies = [
+ "pollster",
  "rcgen",
  "rustls",
  "rustls-native-certs",
@@ -343,6 +344,12 @@ name = "pkg-config"
 version = "0.3.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
+
+[[package]]
+name = "pollster"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc6355899e1c9462875b6757c79f3caa011a1fdae12bbb1a2e72dd1f234f8336"
 
 [[package]]
 name = "powerfmt"

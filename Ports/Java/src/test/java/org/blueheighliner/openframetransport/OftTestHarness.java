@@ -7,6 +7,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
@@ -17,6 +18,26 @@ final class OftTestHarness {
     static final Duration DEFAULT_TIMEOUT = Duration.ofSeconds(10);
 
     private OftTestHarness() {
+    }
+
+    /**
+     * Blocks for {@code future} to complete, unwrapping {@link ExecutionException} to rethrow its
+     * cause directly (as an {@link Exception}, matching every test method's own {@code throws
+     * Exception}) - so an {@code assertThrows(SomeException.class, ...)} written against the old,
+     * directly-blocking {@code connect()}/{@code host()} APIs still sees the same exception type
+     * now that those return a {@link CompletableFuture} instead.
+     */
+    static <T> T await(CompletableFuture<T> future) throws Exception {
+        try {
+            return future.get(DEFAULT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+        } catch (ExecutionException e) {
+            Throwable cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+
+            throw e;
+        }
     }
 
     record Pair(OftListener listener, OftConnection serverConnection, OftConnection clientConnection) implements AutoCloseable {
@@ -50,7 +71,7 @@ final class OftTestHarness {
                 .build();
 
         OftHoster hoster = OftHoster.create();
-        OftListener listener = hoster.host(new InetSocketAddress("127.0.0.1", 0), hostOptions);
+        OftListener listener = await(hoster.host(new InetSocketAddress("127.0.0.1", 0), hostOptions));
         CompletableFuture<OftConnection> serverConnectionFuture = new CompletableFuture<>();
         listener.setConnectedHandler(serverConnectionFuture::complete);
 
@@ -65,7 +86,7 @@ final class OftTestHarness {
                 .build();
 
         OftConnector connector = OftConnector.create();
-        OftConnection clientConnection = connector.connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions);
+        OftConnection clientConnection = await(connector.connect("127.0.0.1", listener.getLocalEndpoint().getPort(), connectOptions));
         OftConnection serverConnection = serverConnectionFuture.get(DEFAULT_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
 
         return new Pair(listener, serverConnection, clientConnection);
@@ -120,8 +141,8 @@ final class OftTestHarness {
             listener.setConnectedHandler(this::onConnected);
         }
 
-        static TrackedListener start(InetSocketAddress listenEndpoint, OftHostOptions options) throws IOException {
-            return new TrackedListener(OftHoster.create().host(listenEndpoint, options));
+        static TrackedListener start(InetSocketAddress listenEndpoint, OftHostOptions options) throws Exception {
+            return new TrackedListener(await(OftHoster.create().host(listenEndpoint, options)));
         }
 
         InetSocketAddress getLocalEndpoint() {

@@ -100,12 +100,18 @@ public interface OftPeer extends AutoCloseable {
 
     /**
      * Starts listening for inbound connections. A peer that never calls this only ever makes
-     * outbound connections.
+     * outbound connections. Binding runs on a dedicated background thread (see
+     * {@link OftHoster#host(InetSocketAddress, OftHostOptions)}), not the calling thread.
      *
      * @param listenEndpoint the local endpoint to listen for incoming TCP connections on
-     * @throws IllegalStateException {@link #isConnected()} is {@code false}
+     * @return a future that completes once this peer is listening, or completes exceptionally if
+     * binding fails
+     * @throws IllegalStateException {@link #isConnected()} is {@code false} - thrown synchronously
+     *                                rather than deferred to the returned future, since it's an
+     *                                immediate state check rather than something that requires
+     *                                binding
      */
-    void listen(InetSocketAddress listenEndpoint) throws IOException;
+    CompletableFuture<Void> listen(InetSocketAddress listenEndpoint);
 
     /**
      * Stops listening for new inbound connections. Already-established connections are left open.
@@ -113,9 +119,10 @@ public interface OftPeer extends AutoCloseable {
      * {@code oft_peer_stop_listening()}: that name is reserved here, as in both, for
      * {@link AutoCloseable#close()}'s full-teardown semantics (see {@link #close()}).
      *
+     * @return a future that completes once this peer has stopped listening
      * @throws IllegalStateException {@link #isConnected()} is {@code false}
      */
-    void stopListening();
+    CompletableFuture<Void> stopListening();
 
     /**
      * Sends a message to {@code host}:{@code port}, reusing a cached connection if one already
@@ -151,9 +158,10 @@ public interface OftPeer extends AutoCloseable {
      * creates and caches a new outbound connection as usual, and, if listening, new inbound
      * connections keep being accepted.
      *
+     * @return a future that completes once every held connection's teardown has been requested
      * @throws IllegalStateException {@link #isConnected()} is {@code false}
      */
-    void drop();
+    CompletableFuture<Void> drop();
 
     /**
      * Permanently puts this peer itself into a disconnected state: stops listening (if applicable)

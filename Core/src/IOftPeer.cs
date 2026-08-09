@@ -19,22 +19,24 @@ namespace BlueHeighliner.OpenFrameTransport;
 /// shorter either is configured to be. There is no way to enumerate or
 /// look up an individual connection this peer holds;
 /// <see cref="Rekey"/> and <see cref="Drop"/> act on all of them at once.
-/// <see cref="Disconnect"/> and <see cref="IDisposable.Dispose"/> both permanently put this peer
-/// itself into a disconnected state — unlike <see cref="Drop"/>, which only disconnects this peer's
-/// currently held connections and leaves the peer itself usable — after which
-/// <see cref="IsConnected"/> is permanently <see langword="false"/> and every other member below
-/// throws: <see cref="Listen"/>, <see cref="StopListening"/>, and <see cref="Drop"/> throw
+/// <see cref="DisposeAsync"/> and <see cref="IDisposable.Dispose"/> both permanently
+/// put this peer itself into a disconnected state — unlike <see cref="Drop"/>, which only
+/// disconnects this peer's currently held connections and leaves the peer itself usable — after
+/// which <see cref="IsConnected"/> is permanently <see langword="false"/> and every other member
+/// below throws: <see cref="Listen"/>, <see cref="StopListening"/>, and <see cref="Drop"/> throw
 /// <see cref="ObjectDisposedException"/>, while <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/>
 /// and <see cref="Rekey"/> throw <see cref="OftDisconnectedException"/>. <see cref="IDisposable.Dispose"/>
 /// does this immediately, without waiting for any background work to finish; call
-/// <see cref="Disconnect"/> instead for a graceful, awaitable teardown that waits for it.
+/// <see cref="DisposeAsync"/> instead for a graceful, awaitable teardown that waits
+/// for it.
 /// </summary>
-public interface IOftPeer : IDisposable
+public interface IOftPeer : IDisposable, IAsyncDisposable
 {
     /// <summary>
-    /// Whether this peer is still connected: <see langword="true"/> until <see cref="Disconnect"/>
-    /// or <see cref="IDisposable.Dispose"/> is called, after which it is permanently
-    /// <see langword="false"/>. Unlike <see cref="IOftConnection.IsConnected"/>, this is unaffected
+    /// Whether this peer is still connected: <see langword="true"/> until
+    /// <see cref="DisposeAsync"/> or <see cref="IDisposable.Dispose"/> is called,
+    /// after which it is permanently <see langword="false"/>. Unlike
+    /// <see cref="IOftConnection.IsConnected"/>, this is unaffected
     /// by any individual connection this peer holds disconnecting (locally via <see cref="Drop"/> or
     /// remotely) — connection lifecycle is this peer's own implementation detail (see
     /// <see cref="ReceivedHandler"/>'s own doc comment).
@@ -158,8 +160,8 @@ public interface IOftPeer : IDisposable
 
     /// <summary>
     /// Disconnects every connection this peer currently holds, both outbound and inbound. Unlike
-    /// <see cref="Disconnect"/>, this peer itself is left usable afterward - a subsequent
-    /// <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/> call creates and
+    /// <see cref="DisposeAsync"/>, this peer itself is left usable afterward - a
+    /// subsequent <see cref="Send(string, int, ReadOnlyMemory{byte}, int, object?, CancellationToken)"/> call creates and
     /// caches a new outbound connection as usual, and, if listening, new inbound connections keep
     /// being accepted.
     /// </summary>
@@ -177,5 +179,5 @@ public interface IOftPeer : IDisposable
     /// completely stopped. Safe to call more than once; every call after the first is a no-op.
     /// </summary>
     /// <returns>A task that completes once the peer has fully disconnected.</returns>
-    Task Disconnect();
+    new ValueTask DisposeAsync();
 }

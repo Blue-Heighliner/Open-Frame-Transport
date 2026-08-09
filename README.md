@@ -103,11 +103,11 @@ await peer.Send("127.0.0.1", 5001, Encoding.UTF8.GetBytes("hello"));
 import org.blueheighliner.openframetransport.*;
 
 // Server
-OftListener listener = OftHoster.create().host(5000);
+OftListener listener = OftHoster.create().host(5000).get();
 listener.setConnectedHandler(connection -> connection.setReceivedHandler(data -> System.out.println(new String(data))));
 
 // Client
-OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000);
+OftConnection connection = OftConnector.create().connect("127.0.0.1", 5000).get();
 connection.send("hello".getBytes(), 0, null);
 ```
 
@@ -119,7 +119,7 @@ import org.blueheighliner.openframetransport.*;
 OftPeer peer = OftPeer.create(OftPeerOptions.builder().build());
 peer.setReceivedHandler((identity, data) -> System.out.println(new String(data)));
 
-peer.listen(new InetSocketAddress("0.0.0.0", 5001)); // optional: also accept inbound connections
+peer.listen(new InetSocketAddress("0.0.0.0", 5001)).get(); // optional: also accept inbound connections
 peer.send("127.0.0.1", 5001, "hello".getBytes(), 0, null);
 ```
 

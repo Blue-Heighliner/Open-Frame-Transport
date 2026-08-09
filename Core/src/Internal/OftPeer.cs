@@ -199,11 +199,11 @@ internal sealed class OftPeer : IOftPeer
     public Task Drop()
     {
         ObjectDisposedException.ThrowIf(this.disconnected, this);
-        return Task.WhenAll(this.GetTrackedConnections().Select(connection => connection.Disconnect()));
+        return Task.WhenAll(this.GetTrackedConnections().Select(connection => connection.DisposeAsync().AsTask()));
     }
 
     /// <inheritdoc />
-    public async Task Disconnect()
+    public async ValueTask DisposeAsync()
     {
         if (!this.TryBeginDisconnect())
         {
@@ -221,7 +221,7 @@ internal sealed class OftPeer : IOftPeer
 
         currentListener?.Dispose();
 
-        await Task.WhenAll(this.GetTrackedConnections().Select(connection => connection.Disconnect())).ConfigureAwait(false);
+        await Task.WhenAll(this.GetTrackedConnections().Select(connection => connection.DisposeAsync().AsTask())).ConfigureAwait(false);
 
         this.receivedSlot.DisposeBuffered();
     }
@@ -230,7 +230,7 @@ internal sealed class OftPeer : IOftPeer
     /// Immediately and synchronously puts this peer into a disconnected state: stops listening (if
     /// applicable), immediately terminates every connection it currently holds without waiting for
     /// any of their background work to finish, and releases every other resource it owns. Call
-    /// <see cref="Disconnect"/> instead for a graceful, awaitable teardown.
+    /// <see cref="DisposeAsync"/> instead for a graceful, awaitable teardown.
     /// </summary>
     public void Dispose()
     {
@@ -260,7 +260,7 @@ internal sealed class OftPeer : IOftPeer
 
     /// <summary>
     /// Atomically transitions this peer into a disconnected state exactly once: returns
-    /// <see langword="true"/> the first time this is called (by either <see cref="Disconnect"/> or
+    /// <see langword="true"/> the first time this is called (by either <see cref="DisposeAsync"/> or
     /// <see cref="Dispose"/>), and <see langword="false"/> every time after, for both of them - so
     /// whichever is called first performs the actual teardown, and any subsequent call to either is
     /// a no-op.
@@ -450,7 +450,7 @@ internal sealed class OftPeer : IOftPeer
 
         foreach (IOftConnection connection in toDisconnect)
         {
-            _ = connection.Disconnect();
+            _ = connection.DisposeAsync();
         }
     }
 }

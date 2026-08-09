@@ -1,7 +1,7 @@
 package org.blueheighliner.openframetransport;
 
-import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Hosts a listener on a TCP endpoint for inbound OFT connections. Stateless: a single instance can
@@ -14,34 +14,45 @@ public interface OftHoster {
     }
 
     /**
-     * Starts listening on {@code listenEndpoint} using default options.
+     * Starts listening on {@code listenEndpoint} using default options. Binding, and (for
+     * {@link OftSecurityMode#SECURE}) generating the listener's ephemeral identity, run on a
+     * dedicated background thread (see {@link OftBlocking}), not the calling thread.
      *
      * @param listenEndpoint the local endpoint to listen for incoming TCP connections on
-     * @return the new listener
+     * @return a future that completes with the new listener, or completes exceptionally if binding
+     * fails
      */
-    OftListener host(InetSocketAddress listenEndpoint) throws IOException;
+    CompletableFuture<OftListener> host(InetSocketAddress listenEndpoint);
 
     /**
      * Starts listening on {@code listenEndpoint}, accepting every connection with {@code options}.
+     * Binding, and (for {@link OftSecurityMode#SECURE}) generating the listener's ephemeral
+     * identity, run on a dedicated background thread (see {@link OftBlocking}), not the calling
+     * thread.
      *
      * @param listenEndpoint the local endpoint to listen for incoming TCP connections on
      * @param options        the options used to accept every connection
-     * @return the new listener
+     * @return a future that completes with the new listener, or completes exceptionally if binding
+     * fails
      * @throws IllegalArgumentException {@code options.sslContext()} is {@code null} and
      *                                   {@code options.securityMode()} is
      *                                   {@link OftSecurityMode#SERVER_AUTHENTICATION} or
-     *                                   {@link OftSecurityMode#DUAL_AUTHENTICATION}
+     *                                   {@link OftSecurityMode#DUAL_AUTHENTICATION} - thrown
+     *                                   synchronously rather than deferred to the returned future,
+     *                                   since it's an immediate argument-validation failure rather
+     *                                   than something that requires binding
      */
-    OftListener host(InetSocketAddress listenEndpoint, OftHostOptions options) throws IOException;
+    CompletableFuture<OftListener> host(InetSocketAddress listenEndpoint, OftHostOptions options);
 
     /**
      * Starts listening on {@code port}, on any local address, using default options. Equivalent to
      * calling {@link #host(InetSocketAddress)} with {@code new InetSocketAddress(port)}.
      *
      * @param port the local port to listen for incoming TCP connections on
-     * @return the new listener
+     * @return a future that completes with the new listener, or completes exceptionally if binding
+     * fails
      */
-    default OftListener host(int port) throws IOException {
+    default CompletableFuture<OftListener> host(int port) {
         return this.host(new InetSocketAddress(port));
     }
 
@@ -52,13 +63,17 @@ public interface OftHoster {
      *
      * @param port    the local port to listen for incoming TCP connections on
      * @param options the options used to accept every connection
-     * @return the new listener
+     * @return a future that completes with the new listener, or completes exceptionally if binding
+     * fails
      * @throws IllegalArgumentException {@code options.sslContext()} is {@code null} and
      *                                   {@code options.securityMode()} is
      *                                   {@link OftSecurityMode#SERVER_AUTHENTICATION} or
-     *                                   {@link OftSecurityMode#DUAL_AUTHENTICATION}
+     *                                   {@link OftSecurityMode#DUAL_AUTHENTICATION} - thrown
+     *                                   synchronously rather than deferred to the returned future,
+     *                                   since it's an immediate argument-validation failure rather
+     *                                   than something that requires binding
      */
-    default OftListener host(int port, OftHostOptions options) throws IOException {
+    default CompletableFuture<OftListener> host(int port, OftHostOptions options) {
         return this.host(new InetSocketAddress(port), options);
     }
 }

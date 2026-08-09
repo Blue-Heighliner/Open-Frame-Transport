@@ -9,3 +9,11 @@ rustls = "0.23.43"
 rustls-native-certs = "0.8.4"
 rustls-pemfile = "2.2.0"
 rustls-pki-types = "1.15.1"
+
+[dev-dependencies]
+# Only used by tests that exercise SendHandle's Future impl (see tests/async_send.rs): the crate
+# itself stays runtime-agnostic and brings in no async executor of its own (see
+# SendHandle's own doc comment on why) - pollster is a minimal, single-purpose "block on one
+# future" executor, not a full async runtime, used here only to prove `.await` works without
+# pulling tokio into a test.
+pollster = "1.0.1"

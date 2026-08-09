@@ -107,7 +107,7 @@ public sealed class ProtocolViolationTests
 
             await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
 
-            await serverConnection.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+            await serverConnection.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
         }
     }
 

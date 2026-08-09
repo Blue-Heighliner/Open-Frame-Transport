@@ -354,7 +354,7 @@ public sealed class OftPeerTests
     public async Task Drop_AfterDisconnect_Throws()
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
 
         await Assert.ThrowsAsync<ObjectDisposedException>(() => peer.Drop());
     }
@@ -371,7 +371,7 @@ public sealed class OftPeerTests
     {
         IOftPeer peer = CreatePeer();
 
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
 
         Assert.False(peer.IsConnected);
     }
@@ -396,7 +396,7 @@ public sealed class OftPeerTests
             }
         };
 
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
 
         await closedSource.Task.WaitAsync(OftTestHarness.DefaultTimeout);
         Assert.Empty(remoteListener.Connections);
@@ -406,22 +406,22 @@ public sealed class OftPeerTests
     public async Task Disconnect_NoConnections_CompletesImmediately()
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
     }
 
     [Fact]
     public async Task Disconnect_CalledTwice_IsIdempotent()
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
     }
 
     [Fact]
     public async Task Disconnect_ThenDispose_IsIdempotent()
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
         peer.Dispose();
     }
 
@@ -432,7 +432,7 @@ public sealed class OftPeerTests
     public async Task MemberCalledAfterDisconnect_ThrowsObjectDisposedException(string memberName)
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
 
         Func<Task> call = memberName switch
         {
@@ -449,7 +449,7 @@ public sealed class OftPeerTests
     public async Task RekeyCalledAfterDisconnect_ThrowsOftDisconnectedException()
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
 
         await Assert.ThrowsAsync<OftDisconnectedException>(() => peer.Rekey());
     }
@@ -458,7 +458,7 @@ public sealed class OftPeerTests
     public async Task SendCalledAfterDisconnect_ThrowsOftDisconnectedException()
     {
         IOftPeer peer = CreatePeer();
-        await peer.Disconnect().WaitAsync(OftTestHarness.DefaultTimeout);
+        await peer.DisposeAsync().AsTask().WaitAsync(OftTestHarness.DefaultTimeout);
 
         await Assert.ThrowsAsync<OftDisconnectedException>(() => peer.Send("127.0.0.1", 12345, "hi"u8.ToArray()));
     }

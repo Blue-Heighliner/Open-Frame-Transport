@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -150,12 +151,20 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     @Override
-    public synchronized void listen(InetSocketAddress listenEndpoint) throws IOException {
+    public CompletableFuture<Void> listen(InetSocketAddress listenEndpoint) {
         if (this.disposed) {
             throw new IllegalStateException("This peer is no longer connected.");
         }
 
-        OftListener newListener = this.hoster.host(listenEndpoint, this.hostOptions);
+        return this.hoster.host(listenEndpoint, this.hostOptions).thenAccept(this::onListening);
+    }
+
+    private synchronized void onListening(OftListener newListener) {
+        if (this.disposed) {
+            newListener.close();
+            throw new IllegalStateException("This peer is no longer connected.");
+        }
+
         newListener.setConnectedHandler(connection -> {
             this.inboundConnections.add(connection);
             trackConnection(connection, this.inboundConnections::remove);
@@ -164,12 +173,13 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     @Override
-    public synchronized void stopListening() {
+    public synchronized CompletableFuture<Void> stopListening() {
         if (this.disposed) {
             throw new IllegalStateException("This peer is no longer connected.");
         }
 
         closeListener();
+        return CompletableFuture.completedFuture(null);
     }
 
     private void closeListener() {
@@ -203,7 +213,7 @@ final class DefaultOftPeer implements OftPeer {
     }
 
     @Override
-    public void drop() {
+    public CompletableFuture<Void> drop() {
         if (this.disposed) {
             throw new IllegalStateException("This peer is no longer connected.");
         }
@@ -211,6 +221,8 @@ final class DefaultOftPeer implements OftPeer {
         for (OftConnection connection : getTrackedConnections()) {
             connection.disconnect();
         }
+
+        return CompletableFuture.completedFuture(null);
     }
 
     @Override
@@ -248,12 +260,19 @@ final class DefaultOftPeer implements OftPeer {
                     // concurrent send() on the same host/port from ever observing a connection that
                     // isn't wired up yet - unrelated to message loss (received/disconnected
                     // notifications are buffered, see BufferedHandlerSlot), just atomicity of this
-                    // map's contents.
-                    OftConnection connection = this.connector.connect(host, port, this.connectOptions);
+                    // map's contents. Blocks on the connect future here, since this method's own
+                    // contract (like every other port's peer send()) is synchronous - the future
+                    // itself still runs the actual dial/handshake on its own dedicated thread (see
+                    // OftBlocking), not this one.
+                    OftConnection connection = this.connector.connect(host, port, this.connectOptions).get();
                     trackConnection(connection, tracked -> this.outboundConnections.remove(key, tracked));
                     return connection;
-                } catch (IOException e) {
-                    throw new UncheckedConnectException(e);
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    throw new UncheckedConnectException(cause instanceof IOException ioException ? ioException : new IOException(cause));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new UncheckedConnectException(new IOException(e));
                 }
             });
         } catch (UncheckedConnectException e) {

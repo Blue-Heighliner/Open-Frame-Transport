@@ -177,6 +177,28 @@ match handle.wait() {
 handle.cancel();
 ```
 
+`SendHandle` also implements `std::future::Future<Output = Result<(), SendFailure>>`, so it can be
+`.await`ed directly under whatever async executor an application already uses instead of calling
+`wait()`:
+
+```rust
+// Under any executor - tokio, async-std, pollster, ... - this crate itself brings in none of its
+// own (see "Concurrency model" below).
+let handle = connection.send(payload, 0, None);
+handle.await?;
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+This is the only part of the public API with a genuine `Future` impl: `connect()`/`host()`/
+`Peer::listen()`/etc. all stay ordinary blocking calls, since offering an async variant of those
+would mean either bundling a specific executor into this crate (which it otherwise avoids
+entirely) or requiring every existing blocking caller to bring one just to call `connect()` at all.
+`SendHandle` doesn't have that problem: its underlying `Completion` is a plain condvar-guarded state
+machine already, so adding a `Waker` slot to the same state and waking it from `Completion::complete`
+(called from the connection's own I/O thread, see "Concurrency model" below) was enough to support
+both a blocking and an async caller off the exact same completion state, with no executor of its own
+required either way.
+
 ## Rekeying
 
 ```rust
