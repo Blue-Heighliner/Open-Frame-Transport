@@ -227,6 +227,9 @@ configuration, cancellation, rekeying, memory ownership, and more.
 - [`Tests/`](Tests) — C# test suite; each port also has its own tests (`Ports/Java/src/test`,
   `Ports/C/tests`, `Ports/Rust/tests`).
 - [`Docs/`](Docs) — protocol specification, architecture, and per-language API reference.
+- [`.github/workflows/`](.github/workflows) — per-port CI (build/test on every push and PR) and
+  release-triggered publishing: C#/Java to GitHub Packages (NuGet/Maven), C/Rust as release assets
+  (a tarball and a `.crate` archive, respectively — GitHub Packages has no registry type for either).
 
 See [`AGENTS.md`](AGENTS.md) for the coding conventions used throughout the implementation,
 including the policy that all ports' APIs stay aligned as much as practical.
